@@ -45,6 +45,15 @@ struct Params {
     // the parent's center direction and merge it with the pre-averaged
     // children.
     per_direction_levels: u32,
+    // 0 = lights and occluders, 1 = room with thin diffuse walls, a
+    // spotlight outside its entrance and more lights around the outside.
+    scene_id: u32,
+    // Diffuse bounces. The reference path-traces this many; the cascades
+    // run bounces + 1 passes per frame, see bounce_iteration.
+    bounces: u32,
+    // Cascade pass within this frame. Pass 0 is direct light only; pass
+    // k > 0 lights diffuse surfaces from pass k-1's cascade 0 (bounce_src).
+    bounce_iteration: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -54,14 +63,20 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> cascade_dst: array<vec2<u32>>;
 // rgb = summed radiance, a = number of rays summed.
 @group(0) @binding(3) var<storage, read_write> reference: array<vec4<f32>>;
-// Per pixel: (squared rgb error, squared reference, empty-space mask,
-// reference ray count). Read back on the CPU for the relative RMSE.
+// Two vec4s per pixel, read back on the CPU:
+// [2i]   (squared rgb error, squared reference, signed error summed over
+//         rgb, reference ray count; negated for pixels inside shapes, which
+//         are excluded)
+// [2i+1] (reference summed over rgb, cascades summed over rgb, 0, 0)
 @group(0) @binding(4) var<storage, read_write> error: array<vec4<f32>>;
 @group(0) @binding(5) var display: texture_storage_2d<rgba8unorm, write>;
 // rgb = summed resolved cascades, a = frame count (rc_accumulate only).
 @group(0) @binding(6) var<storage, read_write> rc_history: array<vec4<f32>>;
+// Cascade 0 of the previous bounce pass, same packed layout as the cascades.
+@group(0) @binding(7) var<storage, read> bounce_src: array<vec2<u32>>;
 
 const TAU: f32 = 6.28318530718;
+const PI: f32 = 3.14159265359;
 const HIT_EPS: f32 = 0.05;
 const MAX_STEPS: u32 = 256u;
 
@@ -70,6 +85,10 @@ const MAX_STEPS: u32 = 256u;
 struct SceneSample {
     dist: f32,
     emission: vec3<f32>,
+    // 1 = emission restricted to the spotlight cone (see spot_factor).
+    spot: f32,
+    // Lambertian reflectance; 0 for lights and black occluders.
+    albedo: vec3<f32>,
 }
 
 fn sd_circle(p: vec2<f32>, center: vec2<f32>, radius: f32) -> f32 {
@@ -83,14 +102,42 @@ fn sd_box(p: vec2<f32>, center: vec2<f32>, half_size: vec2<f32>) -> f32 {
 
 fn closer(a: SceneSample, dist: f32, emission: vec3<f32>) -> SceneSample {
     if dist < a.dist {
-        return SceneSample(dist, emission);
+        return SceneSample(dist, emission, 0.0, vec3(0.0));
     }
     return a;
 }
 
+fn closer_spot(a: SceneSample, dist: f32, emission: vec3<f32>) -> SceneSample {
+    if dist < a.dist {
+        return SceneSample(dist, emission, 1.0, vec3(0.0));
+    }
+    return a;
+}
+
+fn closer_diffuse(a: SceneSample, dist: f32, albedo: vec3<f32>) -> SceneSample {
+    if dist < a.dist {
+        return SceneSample(dist, vec3(0.0), 0.0, albedo);
+    }
+    return a;
+}
+
+// Spotlight: axis along +x, 45 degree half-angle, 4 degree soft edge.
+const SPOT_AXIS: vec2<f32> = vec2(1.0, 0.0);
+const SPOT_COS_OUTER: f32 = 0.6593; // cos(49 deg)
+const SPOT_COS_INNER: f32 = 0.7431; // cos(42 deg)
+
+// A ray travelling along `ray_dir` sees light the spot emitted along
+// -ray_dir. Applied at the hit, so cascades and reference share it exactly.
+fn spot_factor(ray_dir: vec2<f32>) -> f32 {
+    return smoothstep(SPOT_COS_OUTER, SPOT_COS_INNER, dot(-ray_dir, SPOT_AXIS));
+}
+
 // Pixel units, y down. Emitters also occlude; zero emission = black occluder.
 fn scene(p: vec2<f32>) -> SceneSample {
-    var s = SceneSample(1e9, vec3(0.0));
+    if params.scene_id == 1u {
+        return room_scene(p);
+    }
+    var s = SceneSample(1e9, vec3(0.0), 0.0, vec3(0.0));
     // Lights.
     s = closer(s, sd_circle(p, params.light_pos, 22.0), vec3(8.0, 4.5, 1.5));
     s = closer(s, sd_circle(p, vec2(420.0, 100.0), 14.0), vec3(1.5, 3.5, 10.0));
@@ -105,9 +152,50 @@ fn scene(p: vec2<f32>) -> SceneSample {
     return s;
 }
 
-// Radiance along [t0, t1] of a ray; a = 1 if it hit nothing. Rays that leave
-// the canvas never re-enter it (it's convex), so they miss.
-fn trace(origin: vec2<f32>, dir: vec2<f32>, t0: f32, t1: f32) -> vec4<f32> {
+const WALL_ALBEDO: vec3<f32> = vec3(0.8, 0.75, 0.7);
+
+// A 280x280 room (wall centers x 180..460, y 140..420) with 2px diffuse
+// walls, thinner than the probe spacing at s0 = 2, and one 28px entrance in
+// the left wall at y 262..290. The spotlight sits outside, up and left of
+// the entrance, aimed along +x at the wall above it: only the lower edge of
+// its cone reaches through the entrance, as a diagonal beam. Three more
+// lights sit outside the other walls and light only their outer faces, so
+// any of their color on an inner face is light that crossed a wall. Keep in
+// sync with ROOM_INTERIOR on the Rust side.
+fn room_scene(p: vec2<f32>) -> SceneSample {
+    var s = SceneSample(1e9, vec3(0.0), 0.0, vec3(0.0));
+    s = closer_spot(s, sd_circle(p, params.light_pos, 10.0), vec3(14.0, 9.0, 4.0));
+    s = closer(s, sd_circle(p, vec2(330.0, 70.0), 9.0), vec3(2.0, 4.0, 12.0));
+    s = closer(s, sd_circle(p, vec2(490.0, 200.0), 7.0), vec3(9.0, 2.0, 7.0));
+    s = closer(s, sd_circle(p, vec2(400.0, 470.0), 8.0), vec3(2.0, 9.0, 3.0));
+    s = closer_diffuse(s, sd_box(p, vec2(320.0, 140.0), vec2(141.0, 1.0)), WALL_ALBEDO);
+    s = closer_diffuse(s, sd_box(p, vec2(320.0, 420.0), vec2(141.0, 1.0)), WALL_ALBEDO);
+    s = closer_diffuse(s, sd_box(p, vec2(460.0, 280.0), vec2(1.0, 141.0)), WALL_ALBEDO);
+    // Left wall, split by the entrance.
+    s = closer_diffuse(s, sd_box(p, vec2(180.0, 200.5), vec2(1.0, 61.5)), WALL_ALBEDO);
+    s = closer_diffuse(s, sd_box(p, vec2(180.0, 355.5), vec2(1.0, 65.5)), WALL_ALBEDO);
+    return s;
+}
+
+fn scene_normal(p: vec2<f32>) -> vec2<f32> {
+    let h = vec2(0.5, 0.0);
+    return normalize(vec2(
+        scene(p + h.xy).dist - scene(p - h.xy).dist,
+        scene(p + h.yx).dist - scene(p - h.yx).dist,
+    ));
+}
+
+struct Hit {
+    hit: bool,
+    pos: vec2<f32>,
+    // Already restricted by the spotlight cone for this ray's direction.
+    emission: vec3<f32>,
+    albedo: vec3<f32>,
+}
+
+// First surface along [t0, t1]. Rays that leave the canvas never re-enter
+// it (it's convex), so they miss.
+fn trace_hit(origin: vec2<f32>, dir: vec2<f32>, t0: f32, t1: f32) -> Hit {
     let bounds = vec2<f32>(params.size);
     var t = t0;
     for (var i = 0u; i < MAX_STEPS; i++) {
@@ -117,20 +205,82 @@ fn trace(origin: vec2<f32>, dir: vec2<f32>, t0: f32, t1: f32) -> vec4<f32> {
         }
         let s = scene(p);
         if s.dist < HIT_EPS {
-            return vec4(s.emission, 0.0);
+            let emission = s.emission * select(1.0, spot_factor(dir), s.spot > 0.0);
+            return Hit(true, p, emission, s.albedo);
         }
         t += s.dist;
         if t >= t1 {
             break;
         }
     }
-    return vec4(0.0, 0.0, 0.0, 1.0);
+    return Hit(false, vec2(0.0), vec3(0.0), vec3(0.0));
+}
+
+// Radiance along [t0, t1] of a ray for the cascades; a = 1 if it hit
+// nothing. Diffuse hits add bounce light from the previous pass.
+fn trace(origin: vec2<f32>, dir: vec2<f32>, t0: f32, t1: f32) -> vec4<f32> {
+    let h = trace_hit(origin, dir, t0, t1);
+    if !h.hit {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    var radiance = h.emission;
+    if params.bounce_iteration > 0u && any(h.albedo > vec3(0.0)) {
+        radiance += h.albedo * bounce_radiance(h.pos);
+    }
+    return vec4(radiance, 0.0);
 }
 
 fn trace_segment(a: vec2<f32>, b: vec2<f32>) -> vec4<f32> {
     let seg = b - a;
     let len = length(seg);
     return trace(a, seg / len, 0.0, len);
+}
+
+// -------------------------------------------------------------- bounces
+
+// 2D Lambertian: L_out = (albedo / 2) * integral of L_in cos(theta) over
+// the half-circle around the normal. With uniform L_in that's albedo * L_in,
+// which is also what the reference's cosine-sampled estimator gives.
+// This returns L_out / albedo from the previous pass's cascade-0 probes.
+//
+// Only probes in empty space on the normal's side of the surface count. A
+// 2px wall is thinner than 2px probe spacing, so the plain bilinear
+// footprint straddles it and would light the inner face with the outer
+// face's light. With no valid probe the bounce is dropped: missing coverage
+// loses energy rather than leaking it.
+fn bounce_radiance(pos: vec2<f32>) -> vec3<f32> {
+    let n = scene_normal(pos);
+    let probes = bilinear(pos, 0u);
+    var sum = vec3(0.0);
+    var weight = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        let probe = bilinear_probe(probes, k, 0u);
+        let center = (vec2<f32>(probe) + 0.5) * probe_spacing(0u);
+        if scene(center).dist > 0.0 && dot(center - pos, n) > 0.0 {
+            sum += probes.weights[k] * cosine_weighted(probe, n);
+            weight += probes.weights[k];
+        }
+    }
+    return select(vec3(0.0), sum / weight, weight > 0.0);
+}
+
+// (1/2) * integral of L_in cos over the half-circle around n, from one
+// cascade-0 probe's 4 arc-averaged rays. Each arc's cosine weight is exact:
+// sin(hi) - sin(lo) over the part of the arc inside [-90, 90] degrees.
+fn cosine_weighted(probe: vec2<u32>, n: vec2<f32>) -> vec3<f32> {
+    let normal_angle = atan2(n.y, n.x);
+    let base = (probe.y * probe_grid(0u).x + probe.x) * 4u;
+    var sum = vec3(0.0);
+    for (var i = 0u; i < 4u; i++) {
+        let d = (f32(i) + 0.5) * TAU / 4.0 + params.ray_rotation - normal_angle;
+        let offset = d - TAU * floor((d + PI) / TAU);
+        let lo = max(offset - TAU / 8.0, -PI / 2.0);
+        let hi = min(offset + TAU / 8.0, PI / 2.0);
+        let v = bounce_src[base + i];
+        let radiance = vec4(unpack2x16float(v.x), unpack2x16float(v.y)).rgb;
+        sum += select(0.0, sin(hi) - sin(lo), hi > lo) * radiance;
+    }
+    return 0.5 * sum;
 }
 
 // ------------------------------------------------------------- cascades
@@ -305,10 +455,33 @@ fn reference_accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     let center = vec2<f32>(id.xy) + 0.5;
     let jitter = f32(pcg(id.x + pcg(id.y + pcg(params.ref_frame)))) / 4294967296.0;
 
+    var rng = pcg(id.x ^ pcg(id.y ^ pcg(params.ref_frame + 0x9e3779b9u)));
     var sum = vec3(0.0);
     for (var k = 0u; k < params.ref_rays; k++) {
         let angle = (f32(k) + jitter) * TAU / f32(params.ref_rays);
-        sum += trace(center, vec2(cos(angle), sin(angle)), 0.0, 1e6).rgb;
+        var origin = center;
+        var dir = vec2(cos(angle), sin(angle));
+        var throughput = vec3(1.0);
+        // Path trace up to `bounces` diffuse bounces, with cosine-weighted
+        // directions (pdf cos/2 in 2D), so each bounce's estimator is
+        // albedo * L_in, matching bounce_radiance.
+        for (var bounce = 0u; bounce <= params.bounces; bounce++) {
+            let h = trace_hit(origin, dir, 0.0, 1e6);
+            if !h.hit {
+                break;
+            }
+            sum += throughput * h.emission;
+            if bounce == params.bounces || all(h.albedo == vec3(0.0)) {
+                break;
+            }
+            throughput *= h.albedo;
+            let n = scene_normal(h.pos);
+            rng = pcg(rng);
+            let theta = asin(2.0 * f32(rng) / 4294967296.0 - 1.0);
+            dir = cos(theta) * n + sin(theta) * vec2(-n.y, n.x);
+            // HIT_EPS is 0.05; start clear of the surface.
+            origin = h.pos + n * 0.1;
+        }
     }
 
     let previous = select(reference[i], vec4(0.0), params.ref_frame == 0u);
@@ -366,11 +539,12 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     // Error is only meaningful in empty space; inside shapes both sides
     // just report the shape's own emission.
     let empty = pixel_empty;
-    error[i] = select(
-        vec4(0.0, 0.0, 0.0, acc.a),
-        vec4(dot(e, e), dot(ref_value, ref_value), 1.0, acc.a),
+    error[2u * i] = select(
+        vec4(0.0, 0.0, 0.0, -acc.a),
+        vec4(dot(e, e), dot(ref_value, ref_value), e.r + e.g + e.b, acc.a),
         empty,
     );
+    error[2u * i + 1u] = vec4(dot(ref_value, vec3(1.0)), dot(rc, vec3(1.0)), 0.0, 0.0);
 
     var shown: vec3<f32>;
     switch params.view_mode {
