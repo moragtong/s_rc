@@ -3,7 +3,7 @@
 // for a miss, which is what gets compared against Mitsuba's depth.
 // Tiers, sampling and hit thresholds come from clipmap_sample.wgsl.
 
-#import s_rc::clipmap_sample::{Clipmap, march, sample_tier, tier_at}
+#import s_rc::clipmap_sample::{Clipmap, hit_eps, march, sample_tier, tier_at}
 
 struct View {
     camera: vec3<f32>,
@@ -76,13 +76,11 @@ fn normal_at(p: vec3<f32>, t: u32) -> vec3<f32> {
 
 // --------------------------------------------------------- direct light
 
-// Fraction of a sphere light visible from `start`: hard shadow rays to 16
-// points spread over the light's disk as seen from there (a fixed
-// sunflower pattern, area-uniform), each using the clipmap's conservative
-// hit rule. An SDF cone-occlusion estimate was tried first and let faint
-// light through walls into fully shadowed regions: it only measures how
-// closely one central ray passes geometry, so it can't be made
-// conservative.
+// Reference: fraction of a sphere light visible from `start` from hard
+// shadow rays to 16 points spread over the light's disk as seen from there
+// (a fixed sunflower pattern, area-uniform), each using the clipmap's
+// conservative hit rule. 16x the cost of shadow_aaltonen, for the same
+// accuracy against Mitsuba (see SHADOW_METHOD).
 const SHADOW_RAYS: u32 = 16u;
 
 fn shadow_visibility(start: vec3<f32>, light: Light) -> f32 {
@@ -105,6 +103,57 @@ fn shadow_visibility(start: vec3<f32>, light: Light) -> f32 {
     return f32(visible) / f32(SHADOW_RAYS);
 }
 
+// Aaltonen's estimator (GDC 2018, "Claybook"; as in Quilez's soft shadows
+// article): along a shadow ray to the light's center, triangulate from the
+// previous and current step distances where the ray passes closest to the
+// occluder, instead of only testing at step points, and compare that
+// clearance with the light's angular size (k = 1 / tan(angular radius)).
+// In coarse tiers, distances are to the surface dilated by the tier's hit
+// threshold (the conservative surface every hard hit uses; raw distances let
+// light through walls thinner than the voxel).
+fn shadow_aaltonen(start: vec3<f32>, light: Light) -> f32 {
+    let toward = light.center - start;
+    let len = length(toward);
+    let dir = toward / len;
+    let span = len - light.radius;
+    let k = sqrt(max(len * len - light.radius * light.radius, 0.0)) / light.radius;
+    var res = 1.0;
+    var previous = 1e20;
+    var t = 0.0;
+    for (var i = 0u; i < 256u && t < span; i++) {
+        let p = start + dir * t;
+        let tier = tier_at(clipmap(), p);
+        if tier == 3u {
+            break;
+        }
+        let raw = sample_at(p, tier);
+        // Dilate only in coarse tiers, where thin walls would otherwise
+        // vanish; in tier 0 the dilated surface makes a shadow ray leaving
+        // a wall at a grazing angle shadow that wall itself.
+        let h = raw - select(0.0, hit_eps(clipmap(), tier), tier > 0u);
+        if h <= 0.0 {
+            return 0.0;
+        }
+        let y = h * h / (2.0 * previous);
+        let d = sqrt(max(h * h - y * y, 0.0));
+        res = min(res, k * d / max(t - y, 1e-4));
+        previous = h;
+        t += max(raw, 0.01);
+    }
+    res = clamp(res, 0.0, 1.0);
+    return res * res * (3.0 - 2.0 * res);
+}
+
+// 0 = 16 disk shadow rays (reference), 1 = Aaltonen's estimator.
+// Fixed camera inside the room vs Mitsuba (1024 spp):
+// - 16 rays: rel. RMSE 13.9%, +3.0%; the only pixels lit where Mitsuba is
+//   dark are within 11 px of its lit region (penumbra edges);
+// - Aaltonen, dilated in coarse tiers only: 14.1%, -2.4%, none; one march;
+// - Aaltonen dilated in tier 0 too: 23.6%, -9.5%, banded self-shadowing;
+// - Quilez's earlier symmetric-penumbra variant (no triangulation): leaked
+//   faint light into fully shadowed regions.
+const SHADOW_METHOD: u32 = 1u;
+
 // Direct irradiance at p (normal n) from the sphere lights: a uniformly
 // emitting sphere of angular radius alpha above the horizon gives
 // radiance * pi * sin^2(alpha) * cos(theta), times its visible fraction
@@ -122,7 +171,8 @@ fn direct_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
             continue;
         }
         let sin_alpha = light.radius / dist;
-        e += light.radiance * PI * sin_alpha * sin_alpha * cos_theta * shadow_visibility(start, light);
+        let visible = select(shadow_visibility(start, light), shadow_aaltonen(start, light), SHADOW_METHOD == 1u);
+        e += light.radiance * PI * sin_alpha * sin_alpha * cos_theta * visible;
     }
     return e;
 }
