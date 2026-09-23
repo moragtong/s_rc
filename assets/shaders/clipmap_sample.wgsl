@@ -112,3 +112,63 @@ fn march(
     }
     return March(false, t, tier, steps);
 }
+
+// Soft visibility of the sun (a distant disk of cone factor
+// k = 1 / tan(angular radius)) from `start` along unit `dir`: Aaltonen's
+// estimator (GDC 2018, as in Quilez's soft shadows article), which
+// triangulates the closest approach between steps. Validated against
+// Mitsuba with sphere lights (sdf_view.wgsl's history): one march matched
+// 16 disk shadow rays. In coarse tiers, distances are to the surface
+// dilated by the tier's hit threshold, the conservative surface every hard
+// hit uses (raw distances let light through walls thinner than the voxel);
+// not in tier 0, where dilation made shadow rays leaving a wall at grazing
+// angles shadow the wall itself.
+const DILATION_RAMP: f32 = 0.1;
+
+fn sun_visibility(
+    clipmap: Clipmap,
+    tier0: texture_3d<f32>,
+    tier1: texture_3d<f32>,
+    tier2: texture_3d<f32>,
+    s: sampler,
+    start: vec3<f32>,
+    dir: vec3<f32>,
+    k: f32,
+) -> f32 {
+    var res = 1.0;
+    // Radius of the previous step's empty sphere, i.e. the step taken.
+    var previous = 1e20;
+    var t = 0.0;
+    for (var i = 0u; i < MAX_STEPS; i++) {
+        let p = start + dir * t;
+        let tier = tier_at(clipmap, p);
+        if tier == OUTSIDE {
+            break;
+        }
+        let raw = sample_tier(clipmap, tier0, tier1, tier2, s, p, tier);
+        // Dilation catches thin walls along the ray, not the surface it
+        // leaves: ramped in with distance travelled (full tier-1 dilation
+        // from 2.5 m), a ray starting near a surface isn't shadowed by it
+        // the moment it crosses into a coarse tier. Surfaces lit at under
+        // ~6 degrees still self-shadow, where cos is ~0.1 anyway.
+        let dilation = min(select(0.0, hit_eps(clipmap, tier), tier > 0u), DILATION_RAMP * t);
+        if raw <= dilation {
+            return 0.0;
+        }
+        // The triangulation assumes consecutive empty spheres overlap: the
+        // step equals the previous sphere's radius, which keeps y <= raw.
+        // So it runs on raw distances and the step actually taken, and the
+        // dilation comes off the resulting clearance. (Triangulating the
+        // dilated distance against raw-sized steps let y overshoot it once
+        // a ray entered a coarse tier, zeroing the clearance: every sun ray
+        // that left tier 0 read as fully shadowed.)
+        let y = min(raw * raw / (2.0 * previous), raw);
+        let d = sqrt(raw * raw - y * y) - dilation;
+        res = min(res, k * d / max(t - y, 1e-4));
+        let step = max(raw, MIN_STEP);
+        previous = step;
+        t += step;
+    }
+    res = clamp(res, 0.0, 1.0);
+    return res * res * (3.0 - 2.0 * res);
+}

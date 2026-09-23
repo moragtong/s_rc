@@ -7,9 +7,10 @@
 //!
 //! Units are meters, Y up. The room's interior spans x, z in [-4, 4] and y
 //! in [0, 3], closed by walls, a ceiling and a ground slab, with one doorway
-//! in the -X wall. A spotlight outside, up and to the side of the doorway,
-//! aims at the wall beside it, so only its cone edge enters the room. Three
-//! point lights sit outside the other walls.
+//! in the -X wall. The only light is a sun (no sky yet), low in the -X sky,
+//! so it lights the outside and shines in through the doorway at an angle
+//! onto the floor. Everything else inside the room is lit only by light
+//! bouncing off that sunlit patch: the test of the cascades' indirect light.
 
 use bevy::prelude::*;
 
@@ -36,25 +37,20 @@ impl SceneBox {
     }
 }
 
-/// A small emissive sphere. `radiance` is its surface radiance (linear RGB).
+/// A sun: a distant disk light.
 #[derive(Clone, Copy, Debug)]
-pub struct SphereLight {
-    pub center: Vec3,
-    pub radius: f32,
-    pub radiance: Vec3,
-    /// Some for the spotlight: emission only within a cone around `dir`.
-    pub spot: Option<Spot>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Spot {
-    pub dir: Vec3,
-    pub half_angle: f32,
+pub struct Sun {
+    /// Unit vector from the scene toward the sun.
+    pub toward: Vec3,
+    /// Irradiance on a surface facing the sun (linear RGB).
+    pub irradiance: Vec3,
+    /// Angular radius of the sun's disk; the real sun's is ~0.27 degrees.
+    pub angular_radius: f32,
 }
 
 pub struct Scene3d {
     pub boxes: Vec<SceneBox>,
-    pub lights: Vec<SphereLight>,
+    pub sun: Sun,
 }
 
 impl Scene3d {
@@ -90,20 +86,14 @@ impl Scene3d {
             albedo: wall,
         });
 
-        let lights = vec![
-            // Aimed along +X at the wall beside the doorway; the doorway is
-            // ~42 degrees off-axis, just inside the 45 degree cone.
-            SphereLight {
-                center: Vec3::new(-6.0, 1.6, -1.8),
-                radius: 0.15,
-                radiance: Vec3::new(140.0, 90.0, 40.0),
-                spot: Some(Spot { dir: Vec3::X, half_angle: 45f32.to_radians() }),
-            },
-            SphereLight { center: Vec3::new(0.0, 2.0, -6.0), radius: 0.15, radiance: Vec3::new(20.0, 40.0, 120.0), spot: None },
-            SphereLight { center: Vec3::new(6.0, 1.5, 1.0), radius: 0.15, radiance: Vec3::new(90.0, 20.0, 70.0), spot: None },
-            SphereLight { center: Vec3::new(1.0, 1.0, 6.0), radius: 0.15, radiance: Vec3::new(20.0, 90.0, 30.0), spot: None },
-        ];
-        Self { boxes, lights }
+        // Low in the -X sky and a little toward -Z, so it shines in through
+        // the doorway at an angle onto the floor.
+        let sun = Sun {
+            toward: Vec3::new(-1.0, 0.75, -0.35).normalize(),
+            irradiance: Vec3::new(3.0, 2.85, 2.6),
+            angular_radius: 0.27f32.to_radians(),
+        };
+        Self { boxes, sun }
     }
 }
 
@@ -122,7 +112,7 @@ pub struct ExportCamera {
 }
 
 impl Scene3d {
-    /// JSON for `tools/mitsuba_depth.py`: boxes, lights and the camera.
+    /// JSON for the Mitsuba tools: boxes, the sun and the camera.
     pub fn export_json(&self, camera: &ExportCamera) -> String {
         let v = |v: Vec3| format!("[{}, {}, {}]", v.x, v.y, v.z);
         let boxes: Vec<String> = self
@@ -130,28 +120,19 @@ impl Scene3d {
             .iter()
             .map(|b| format!("{{\"center\": {}, \"half_size\": {}, \"albedo\": {}}}", v(b.center), v(b.half_size), v(b.albedo)))
             .collect();
-        let lights: Vec<String> = self
-            .lights
-            .iter()
-            .map(|l| {
-                let spot = l.spot.map_or("null".to_string(), |s| {
-                    format!("{{\"dir\": {}, \"half_angle_degrees\": {}}}", v(s.dir), s.half_angle.to_degrees())
-                });
-                format!(
-                    "{{\"center\": {}, \"radius\": {}, \"radiance\": {}, \"spot\": {spot}}}",
-                    v(l.center),
-                    l.radius,
-                    v(l.radiance)
-                )
-            })
-            .collect();
+        let sun = format!(
+            "{{\"toward\": {}, \"irradiance\": {}, \"angular_radius_degrees\": {}}}",
+            v(self.sun.toward),
+            v(self.sun.irradiance),
+            self.sun.angular_radius.to_degrees()
+        );
         let tiers: Vec<String> = camera
             .tiers
             .iter()
             .map(|(o, voxel, res)| format!("{{\"origin\": [{}, {}, {}], \"voxel\": {voxel}, \"resolution\": {res}}}", o.x, o.y, o.z))
             .collect();
         format!(
-            "{{\n  \"camera\": {{\"position\": {}, \"forward\": {}, \"up\": {}, \"fov_y_degrees\": {}, \"width\": {}, \"height\": {}}},\n  \"clipmap\": [{}],\n  \"boxes\": [\n    {}\n  ],\n  \"lights\": [\n    {}\n  ]\n}}\n",
+            "{{\n  \"camera\": {{\"position\": {}, \"forward\": {}, \"up\": {}, \"fov_y_degrees\": {}, \"width\": {}, \"height\": {}}},\n  \"clipmap\": [{}],\n  \"boxes\": [\n    {}\n  ],\n  \"sun\": {sun}\n}}\n",
             v(camera.position),
             v(camera.forward),
             v(camera.up),
@@ -160,7 +141,6 @@ impl Scene3d {
             camera.height,
             tiers.join(", "),
             boxes.join(",\n    "),
-            lights.join(",\n    ")
         )
     }
 }
@@ -169,8 +149,9 @@ impl Scene3d {
 #[derive(Component, Clone, Copy)]
 pub struct SceneBoxMesh;
 
-/// Spawns the scene for the raster view: one mesh per box, and each light
-/// as an emissive sphere plus a Bevy light so the raster preview is lit.
+/// Spawns the scene for the raster view: one mesh per box (the clipmap bakes
+/// these and takes each one's albedo from its material), and a Bevy
+/// directional light for the sun so the raster preview is lit.
 pub fn spawn(
     scene: &Scene3d,
     commands: &mut Commands,
@@ -185,42 +166,14 @@ pub fn spawn(
             SceneBoxMesh,
         ));
     }
-    for light in &scene.lights {
-        let color = Color::linear_rgb(light.radiance.x, light.radiance.y, light.radiance.z);
-        commands.spawn((
-            Mesh3d(meshes.add(Sphere::new(light.radius))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::BLACK,
-                emissive: color.to_linear(),
-                ..default()
-            })),
-            Transform::from_translation(light.center),
-        ));
-        let normalized = (light.radiance / light.radiance.max_element()).extend(1.0);
-        let light_color = Color::linear_rgba(normalized.x, normalized.y, normalized.z, 1.0);
-        match light.spot {
-            Some(spot) => commands.spawn((
-                SpotLight {
-                    color: light_color,
-                    intensity: 2_000_000.0,
-                    range: 30.0,
-                    outer_angle: spot.half_angle,
-                    inner_angle: spot.half_angle * 0.9,
-                    shadow_maps_enabled: true,
-                    ..default()
-                },
-                Transform::from_translation(light.center).looking_to(spot.dir, Vec3::Y),
-            )),
-            None => commands.spawn((
-                PointLight {
-                    color: light_color,
-                    intensity: 400_000.0,
-                    range: 30.0,
-                    shadow_maps_enabled: true,
-                    ..default()
-                },
-                Transform::from_translation(light.center),
-            )),
-        };
-    }
+    let color = scene.sun.irradiance / scene.sun.irradiance.max_element();
+    commands.spawn((
+        DirectionalLight {
+            color: Color::linear_rgb(color.x, color.y, color.z),
+            illuminance: 20_000.0,
+            shadow_maps_enabled: true,
+            ..default()
+        },
+        Transform::default().looking_to(-scene.sun.toward, Vec3::Y),
+    ));
 }

@@ -11,9 +11,10 @@
 // - Probes live in camera-centred windows, mapped toroidally; tracing caches
 //   each segment's hit, re-marching only probes that entered their window,
 //   and gathering evaluates lighting at the cached hits every frame.
-// Direct light only for now: surfaces emit nothing, lights are spheres
-// intersected analytically (they'd vanish in coarse clipmap tiers), and the
-// spotlight's cone is ignored.
+// The cascades carry indirect light: a ray that hits a surface sees the
+// light leaving it, which is the clipmap's unshadowed color times its sun
+// visibility (the shadow clipmap), sampled at the hit. Direct sunlight at
+// the shading point itself is computed there, not by the cascades.
 
 #import s_rc::clipmap_sample::{Clipmap, OUTSIDE, march, sample_tier, tier_at}
 
@@ -22,7 +23,6 @@ struct Params {
     camera: vec3<f32>,
     cascade: u32,
     cascade_count: u32,
-    light_count: u32,
     spacing0: f32,
     interval0: f32,
     octa_side0: u32,
@@ -39,32 +39,32 @@ struct Params {
     child_angle_base: u32,
 }
 
-struct Light {
-    center: vec3<f32>,
-    radius: f32,
-    radiance: vec3<f32>,
-}
-
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var tier0: texture_3d<f32>;
 @group(0) @binding(2) var tier1: texture_3d<f32>;
 @group(0) @binding(3) var tier2: texture_3d<f32>;
 @group(0) @binding(4) var clipmap_sampler: sampler;
-@group(0) @binding(5) var<storage, read> lights: array<Light>;
+// The clipmap's unshadowed surface color and sun visibility, per tier.
+@group(0) @binding(5) var color0: texture_3d<f32>;
+@group(0) @binding(6) var color1: texture_3d<f32>;
+@group(0) @binding(7) var color2: texture_3d<f32>;
+@group(0) @binding(8) var shadow0: texture_3d<f32>;
+@group(0) @binding(9) var shadow1: texture_3d<f32>;
+@group(0) @binding(10) var shadow2: texture_3d<f32>;
 // Cascade n+1's radiance (read) and cascade n's (written): rgba16float
 // packed in two u32s.
-@group(0) @binding(6) var<storage, read> cascade_src: array<vec2<u32>>;
-@group(0) @binding(7) var<storage, read_write> cascade_dst: array<vec2<u32>>;
+@group(0) @binding(11) var<storage, read> cascade_src: array<vec2<u32>>;
+@group(0) @binding(12) var<storage, read_write> cascade_dst: array<vec2<u32>>;
 // Cached hit fractions, two unorm16 per word (1.0 = miss).
-@group(0) @binding(8) var<storage, read_write> hits: array<u32>;
+@group(0) @binding(13) var<storage, read_write> hits: array<u32>;
 // Which world probe each slot's cached hits belong to (0 = none).
-@group(0) @binding(9) var<storage, read_write> tags: array<u32>;
-@group(0) @binding(10) var<storage, read_write> remarched: array<atomic<u32>>;
+@group(0) @binding(14) var<storage, read_write> tags: array<u32>;
+@group(0) @binding(15) var<storage, read_write> remarched: array<atomic<u32>>;
 // Solid angle of every octahedral cell, all cascades concatenated.
-@group(0) @binding(11) var<storage, read> solid_angles: array<f32>;
+@group(0) @binding(16) var<storage, read> solid_angles: array<f32>;
 // Per slot (indexed like tags): bit k set if trilinear child k is reachable,
 // i.e. in empty space with a clear straight line from this probe.
-@group(0) @binding(12) var<storage, read_write> child_masks: array<u32>;
+@group(0) @binding(17) var<storage, read_write> child_masks: array<u32>;
 
 // ------------------------------------------------------------ geometry
 
@@ -186,34 +186,41 @@ fn segment(n: u32, world: vec3<i32>, ray: u32, k: u32) -> Segment {
     return Segment(a, center + dir * range.y);
 }
 
-fn hit_sphere(o: vec3<f32>, d: vec3<f32>, light: Light) -> f32 {
-    let oc = o - light.center;
-    let b = dot(oc, d);
-    let c = dot(oc, oc) - light.radius * light.radius;
-    if c < 0.0 {
-        return 0.0; // starts inside
-    }
-    let disc = b * b - c;
-    if disc < 0.0 || b > 0.0 {
-        return 1e9;
-    }
-    return -b - sqrt(disc);
-}
-
-// First hit along the segment (clipmap or light), as a fraction of it.
+// First hit along the segment, as a fraction of it.
 fn march_fraction(seg: Segment) -> f32 {
     let delta = seg.b - seg.a;
     let len = length(delta);
-    let dir = delta / len;
-    let m = march(params.clipmap, tier0, tier1, tier2, clipmap_sampler, seg.a, dir, len);
-    var t = select(1e9, m.t, m.hit);
-    for (var i = 0u; i < params.light_count; i++) {
-        t = min(t, hit_sphere(seg.a, dir, lights[i]));
-    }
-    if t >= len {
+    let m = march(params.clipmap, tier0, tier1, tier2, clipmap_sampler, seg.a, delta / len, len);
+    if !m.hit || m.t >= len {
         return 1.0;
     }
-    return min(t / len, 65534.0 / 65535.0);
+    return min(m.t / len, 65534.0 / 65535.0);
+}
+
+// Light leaving the surface hit at p by a ray travelling along dir: color *
+// sun visibility, from the finest tier holding p. Looked up half a voxel
+// back along the ray, so the trilinear footprint stays on the side the ray
+// sees (voxels inside geometry carry no color; see clipmap_compose.wgsl).
+fn surface_radiance(hit: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
+    let hit_tier = tier_at(params.clipmap, hit);
+    let p = hit - dir * 0.5 * params.clipmap.voxels[min(hit_tier, 2u)];
+    let tier = tier_at(params.clipmap, p);
+    let uvw = p / (params.clipmap.voxels[min(tier, 2u)] * f32(params.clipmap.resolution));
+    switch tier {
+        case 0u: {
+            return textureSampleLevel(color0, clipmap_sampler, uvw, 0.0).rgb
+                * textureSampleLevel(shadow0, clipmap_sampler, uvw, 0.0).r;
+        }
+        case 1u: {
+            return textureSampleLevel(color1, clipmap_sampler, uvw, 0.0).rgb
+                * textureSampleLevel(shadow1, clipmap_sampler, uvw, 0.0).r;
+        }
+        case 2u: {
+            return textureSampleLevel(color2, clipmap_sampler, uvw, 0.0).rgb
+                * textureSampleLevel(shadow2, clipmap_sampler, uvw, 0.0).r;
+        }
+        default: { return vec3(0.0); }
+    }
 }
 
 fn hit_word(ray_slot: u32, n: u32, k: u32) -> u32 {
@@ -221,24 +228,14 @@ fn hit_word(ray_slot: u32, n: u32, k: u32) -> u32 {
 }
 
 // Radiance and visibility along a cached segment. Lighting is evaluated at
-// gather time: a hit on a light sees its radiance, a hit on a surface sees
-// nothing yet (direct light only).
+// gather time from the clipmap's color and shadow at the hit.
 fn cached_near(ray_slot: u32, n: u32, k: u32, seg: Segment) -> vec4<f32> {
     let fractions = unpack2x16unorm(hits[hit_word(ray_slot, n, k)]);
     let fraction = select(fractions.x, fractions.y, k % 2u == 1u);
     if fraction >= 1.0 {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
-    let pos = mix(seg.a, seg.b, fraction);
-    for (var i = 0u; i < params.light_count; i++) {
-        // The cached fraction is unorm16 of the segment (up to ~0.2 mm over a
-        // 12 m segment) and the sphere hit is f32: allow 1 cm, far more than
-        // that error and far less than any surface's distance from a light.
-        if distance(pos, lights[i].center) <= lights[i].radius + 0.01 {
-            return vec4(lights[i].radiance, 0.0);
-        }
-    }
-    return vec4(0.0);
+    return vec4(surface_radiance(mix(seg.a, seg.b, fraction), normalize(seg.b - seg.a)), 0.0);
 }
 
 // --------------------------------------------------------------- passes

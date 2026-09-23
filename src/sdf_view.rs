@@ -2,7 +2,7 @@
 //! fixed 800x450 and shows the result full-window.
 //!
 //! Controls: `V` toggles the view, `N` cycles normals / tier / step count /
-//! analytic direct light / light carried by the 3D cascades, `X` exports the scene, camera and traced
+//! lighting (direct sun + indirect from the 3D cascades) / indirect only, `X` exports the scene, camera and traced
 //! depth to `target/rc3d/` for `tools/mitsuba_depth.py` to compare against
 //! Mitsuba (and in lighting mode, the linear radiance image for
 //! `tools/mitsuba_compare.py`).
@@ -22,6 +22,7 @@ use bevy::{
             binding_types::{sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_3d, texture_storage_2d, uniform_buffer},
             *,
         },
+        diagnostic::RecordDiagnostics,
         renderer::{RenderContext, RenderDevice, RenderQueue},
         storage::{GpuShaderBuffer, ShaderBuffer},
         texture::GpuImage,
@@ -30,13 +31,14 @@ use bevy::{
 
 use crate::cascades3d::layout::{Layout, SPACING0};
 use crate::cascades3d::{Cascades3dGpu, Cascades3dRenderSystems, LIGHTING_MODE};
-use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, RESOLUTION, TIER_VOXEL, TIERS};
+use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, RESOLUTION, SunLight, TIER_VOXEL, TIERS};
 use crate::scene3d::Scene3d;
 
 pub const WIDTH: u32 = 800;
 pub const HEIGHT: u32 = 450;
 const SHADER: &str = "shaders/sdf_view.wgsl";
 const EXPORT_DIR: &str = "target/rc3d";
+pub const TRACE_SPAN: &str = "sdf_view";
 
 pub struct SdfViewPlugin;
 
@@ -66,7 +68,9 @@ pub struct SdfViewUniform {
     c0_radius: f32,
     c0_tag_base: u32,
     spacing0: f32,
-    light_count: u32,
+    sun_toward: Vec3,
+    sun_k: f32,
+    sun_irradiance: Vec3,
 }
 
 /// Marks the full-window UI node showing the traced image.
@@ -130,7 +134,7 @@ fn sdf_view_input(
         view.enabled = !view.enabled;
     }
     if keys.just_pressed(KeyCode::KeyN) {
-        view.mode = (view.mode + 1) % 5;
+        view.mode = (view.mode + 1) % 9;
     }
     if keys.just_pressed(KeyCode::KeyX) {
         // The trace only runs while the view is on.
@@ -158,16 +162,15 @@ fn fov_y(projection: &Projection) -> f32 {
 fn update_sdf_view_uniform(
     mut view: ResMut<SdfView>,
     state: Res<ClipmapState>,
-    scene: Option<Res<SceneResource>>,
+    sun: Option<Res<SunLight>>,
     camera: Query<(&GlobalTransform, &Projection), With<ClipmapCamera>>,
 ) {
-    let Ok((transform, projection)) = camera.single() else { return };
+    let (Ok((transform, projection)), Some(sun)) = (camera.single(), sun) else { return };
     let tan = (fov_y(projection) / 2.0).tan();
     let aspect = WIDTH as f32 / HEIGHT as f32;
     let origins = std::array::from_fn(|t| state.origins[t].unwrap_or_default().extend(0));
     let mode = view.mode;
     let c0 = Layout::new().cascades[0];
-    let scene_lights = scene.map_or(0, |s| s.0.lights.len().min(crate::cascades3d::MAX_LIGHTS) as u32);
     view.uniform = SdfViewUniform {
         camera: transform.translation(),
         width: WIDTH,
@@ -183,7 +186,9 @@ fn update_sdf_view_uniform(
         c0_radius: c0.radius,
         c0_tag_base: c0.tag_base,
         spacing0: SPACING0,
-        light_count: scene_lights,
+        sun_toward: sun.toward,
+        sun_k: sun.k,
+        sun_irradiance: sun.irradiance,
     };
 }
 
@@ -285,7 +290,11 @@ fn init_sdf_view_pipeline(mut commands: Commands, asset_server: Res<AssetServer>
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_sized(false, std::num::NonZero::new((WIDTH * HEIGHT * 16) as u64)),
-                storage_buffer_read_only_sized(false, None),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
             ),
         ),
     );
@@ -346,14 +355,22 @@ fn trace_sdf_view(
             cascades.tags.as_entire_buffer_binding(),
             cascades.shading_subsamples.as_entire_buffer_binding(),
             radiance.buffer.as_entire_buffer_binding(),
-            cascades.lights.as_entire_buffer_binding(),
+            &textures.albedo[0],
+            &textures.albedo[1],
+            &textures.albedo[2],
+            &textures.shadow[0],
+            &textures.color[0],
         )),
     );
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
     let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
         label: Some("sdf_view"),
         timestamp_writes: None,
     });
+    let span = diagnostics.pass_span(&mut pass, TRACE_SPAN);
     pass.set_pipeline(compute);
     pass.set_bind_group(0, &bind_group, &[]);
     pass.dispatch_workgroups(WIDTH.div_ceil(8), HEIGHT.div_ceil(8), 1);
+    span.end(&mut pass);
 }

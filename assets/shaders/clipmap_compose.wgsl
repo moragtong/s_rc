@@ -1,5 +1,9 @@
 // Recomposes one region of one clipmap tier from the baked per-mesh SDF
 // grids: min over instances of each grid's trilinearly sampled distance.
+// Near surfaces it also writes the nearest instance's albedo and the
+// unshadowed surface color, albedo / pi * sun irradiance * cos, with the
+// normal from that instance's own grid (sharper than the composed field's).
+// Sun visibility is a separate pass (clipmap_shadow.wgsl).
 // World voxel v is stored in texel v mod resolution (toroidal).
 
 struct Instance {
@@ -8,6 +12,7 @@ struct Instance {
     voxel: f32,
     dims: vec3<u32>,
     offset: u32,
+    albedo: vec4<f32>,
 }
 
 struct ComposeParams {
@@ -15,13 +20,23 @@ struct ComposeParams {
     instance_count: u32,
     region_size: vec3<u32>,
     resolution: u32,
+    sun_toward: vec3<f32>,
     voxel: f32,
+    sun_irradiance: vec3<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: ComposeParams;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
 @group(0) @binding(2) var<storage, read> values: array<f32>;
 @group(0) @binding(3) var tier: texture_storage_3d<r16float, write>;
+@group(0) @binding(4) var albedo_out: texture_storage_3d<rgba8unorm, write>;
+@group(0) @binding(5) var color_out: texture_storage_3d<rgba16float, write>;
+
+const PI: f32 = 3.14159265359;
+// Voxels within this many voxels of a surface get albedo and color: enough
+// that trilinear lookups at hit points (within half a voxel of the
+// surface) only mix voxels that have them.
+const SURFACE_BAND: f32 = 1.5;
 
 fn grid_value(inst: Instance, cell: vec3<i32>) -> f32 {
     let c = vec3<u32>(clamp(cell, vec3(0), vec3<i32>(inst.dims) - 1));
@@ -58,10 +73,40 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
     let pos = (vec3<f32>(v) + 0.5) * params.voxel;
 
     var d = 1e4;
+    var nearest = 0u;
     for (var i = 0u; i < params.instance_count; i++) {
         let inst = instances[i];
         let local = (inst.world_to_local * vec4(pos, 1.0)).xyz;
-        d = min(d, sample_instance(inst, local));
+        let di = sample_instance(inst, local);
+        if di < d {
+            d = di;
+            nearest = i;
+        }
     }
     textureStore(tier, texel, vec4(d, 0.0, 0.0, 0.0));
+
+    var albedo = vec3(0.0);
+    var color = vec3(0.0);
+    if abs(d) < SURFACE_BAND * params.voxel {
+        let inst = instances[nearest];
+        let local = (inst.world_to_local * vec4(pos, 1.0)).xyz;
+        let e = 0.5 * inst.voxel;
+        let local_normal = vec3(
+            sample_instance(inst, local + vec3(e, 0.0, 0.0)) - sample_instance(inst, local - vec3(e, 0.0, 0.0)),
+            sample_instance(inst, local + vec3(0.0, e, 0.0)) - sample_instance(inst, local - vec3(0.0, e, 0.0)),
+            sample_instance(inst, local + vec3(0.0, 0.0, e)) - sample_instance(inst, local - vec3(0.0, 0.0, e)),
+        );
+        // Normals transform by the inverse transpose of local_to_world,
+        // i.e. the transpose of world_to_local.
+        let n = normalize((transpose(inst.world_to_local) * vec4(local_normal, 0.0)).xyz);
+        albedo = inst.albedo.rgb;
+        // Only voxels in empty space carry a face's light. Inside a wall, the
+        // nearest face may be the other side's (e.g. the sunlit outside), and
+        // a lookup at the inner face would blend that in: a leak.
+        if d >= 0.0 {
+            color = albedo / PI * params.sun_irradiance * max(dot(n, params.sun_toward), 0.0);
+        }
+    }
+    textureStore(albedo_out, texel, vec4(albedo, 1.0));
+    textureStore(color_out, texel, vec4(color, 1.0));
 }

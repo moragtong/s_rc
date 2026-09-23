@@ -8,6 +8,16 @@
 //! the GPU, from the per-mesh SDF grids baked by `sdf_bake` (Lumen-style
 //! mesh distance fields). Everything else stays as it was.
 //!
+//! Besides distance, each tier holds, for voxels near surfaces:
+//! - albedo, from the nearest mesh's material;
+//! - unshadowed surface color: albedo / pi * sun irradiance * cos, with the
+//!   normal from the nearest mesh's own baked grid;
+//! - sun visibility: the shadow clipmap (Aaltonen's estimator, marched once
+//!   per voxel when its region is composed).
+//! Radiance leaving a surface is color * visibility. Keeping visibility
+//! separate is what lets it be re-marched on its own (time of day,
+//! double-buffered) without touching the rest.
+//!
 //! `K` throws the clipmap away and recomposes every tier, for checking
 //! that the scrolled result matches a fresh one.
 
@@ -20,9 +30,10 @@ use bevy::{
         Render, RenderApp, RenderStartup, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_resource::{
-            binding_types::{storage_buffer_read_only, texture_storage_3d, uniform_buffer},
+            binding_types::{sampler, storage_buffer_read_only, texture_3d, texture_storage_3d, uniform_buffer},
             *,
         },
+        diagnostic::RecordDiagnostics,
         renderer::{RenderContext, RenderDevice, RenderQueue},
     },
 };
@@ -34,10 +45,16 @@ pub const TIERS: usize = 3;
 pub const RESOLUTION: i32 = 128;
 pub const TIER_VOXEL: [f32; TIERS] = [0.125, 0.5, 2.0];
 pub const FORMAT: TextureFormat = TextureFormat::R16Float;
+pub const ALBEDO_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
+pub const COLOR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
+pub const SHADOW_FORMAT: TextureFormat = TextureFormat::R16Float;
 /// Per-mesh bake resolution: half the finest tier's voxel.
 const BAKE_VOXEL: f32 = 0.0625;
 const BAKE_PADDING: u32 = 3;
 const COMPOSE_SHADER: &str = "shaders/clipmap_compose.wgsl";
+const SHADOW_SHADER: &str = "shaders/clipmap_shadow.wgsl";
+const COMPOSE_SPAN: &str = "clipmap_compose";
+const SHADOW_SPAN: &str = "clipmap_shadow";
 /// Shared tracing code (`s_rc::clipmap_sample`), imported by every shader
 /// that traces the clipmap; must stay loaded for those imports to resolve.
 const SAMPLE_SHADER: &str = "shaders/clipmap_sample.wgsl";
@@ -55,6 +72,34 @@ pub struct ClipmapSystems;
 /// Render-world clipmap composition; tracing the clipmap goes after it.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClipmapRenderSystems;
+
+/// The sun, as the clipmap and everything shading from it need it.
+#[derive(Resource, Clone, Copy, ExtractResource)]
+pub struct SunLight {
+    /// Unit vector toward the sun.
+    pub toward: Vec3,
+    pub irradiance: Vec3,
+    /// Cone factor for soft shadows: 1 / tan(angular radius).
+    pub k: f32,
+}
+
+/// The clipmap's tier windows at this frame, as the shaders' `Clipmap`.
+#[derive(ShaderType, Clone, Copy, Default)]
+pub struct ClipmapUniform {
+    pub origins: [IVec4; TIERS],
+    pub voxels: Vec4,
+    pub resolution: u32,
+}
+
+impl ClipmapUniform {
+    pub fn from_state(state: &ClipmapState) -> Self {
+        Self {
+            origins: std::array::from_fn(|t| state.origins[t].unwrap_or_default().extend(0)),
+            voxels: Vec4::new(TIER_VOXEL[0], TIER_VOXEL[1], TIER_VOXEL[2], 0.0),
+            resolution: RESOLUTION as u32,
+        }
+    }
+}
 
 /// The camera the clipmap follows.
 #[derive(Component)]
@@ -74,6 +119,8 @@ pub struct GpuInstance {
     pub voxel: f32,
     pub dims: UVec3,
     pub offset: u32,
+    /// Linear albedo in rgb.
+    pub albedo: Vec4,
 }
 
 /// An axis-aligned block of world voxels (in one tier's voxel units).
@@ -147,6 +194,7 @@ impl Plugin for ClipmapPlugin {
             .add_plugins((
                 ExtractResourcePlugin::<SdfScene>::default(),
                 ExtractResourcePlugin::<ClipmapState>::default(),
+                ExtractResourcePlugin::<SunLight>::default(),
             ))
             .add_systems(
                 PostUpdate,
@@ -174,8 +222,9 @@ impl Plugin for ClipmapPlugin {
 fn bake_scene(
     mut commands: Commands,
     existing: Option<Res<SdfScene>>,
-    boxes: Query<(&Mesh3d, &GlobalTransform), With<SceneBoxMesh>>,
+    boxes: Query<(&Mesh3d, &MeshMaterial3d<StandardMaterial>, &GlobalTransform), With<SceneBoxMesh>>,
     meshes: Res<Assets<Mesh>>,
+    materials: Res<Assets<StandardMaterial>>,
 ) {
     if existing.is_some() || boxes.is_empty() {
         return;
@@ -183,8 +232,9 @@ fn bake_scene(
     let started = std::time::Instant::now();
     let cache = Path::new("target/sdf_cache");
     let mut scene = SdfScene { instances: Vec::new(), values: Vec::new() };
-    for (mesh, transform) in &boxes {
-        let Some(mesh) = meshes.get(&mesh.0) else { return };
+    for (mesh, material, transform) in &boxes {
+        let (Some(mesh), Some(material)) = (meshes.get(&mesh.0), materials.get(&material.0)) else { return };
+        let albedo = material.base_color.to_linear();
         let grid: SdfGrid = match sdf_bake::mesh_triangles(mesh)
             .and_then(|(p, i)| sdf_bake::bake_cached(&p, &i, BAKE_VOXEL, BAKE_PADDING, cache))
         {
@@ -200,6 +250,7 @@ fn bake_scene(
             voxel: grid.voxel,
             dims: grid.dims,
             offset: scene.values.len() as u32,
+            albedo: Vec4::new(albedo.red, albedo.green, albedo.blue, 0.0),
         });
         scene.values.extend_from_slice(&grid.values);
     }
@@ -257,10 +308,14 @@ fn log_clipmap_updates(time: Res<Time>, mut timer: Local<Option<Timer>>, mut sta
 
 // ---------------------------------------------------------------- render
 
-/// The tier textures, shared with the SDF view.
+/// The tier textures, shared with everything that traces or shades from the
+/// clipmap.
 #[derive(Resource)]
 pub struct ClipmapTextures {
     pub views: [TextureView; TIERS],
+    pub albedo: [TextureView; TIERS],
+    pub color: [TextureView; TIERS],
+    pub shadow: [TextureView; TIERS],
     pub sampler: Sampler,
 }
 
@@ -270,14 +325,31 @@ struct ComposeParams {
     instance_count: u32,
     region_size: UVec3,
     resolution: u32,
+    sun_toward: Vec3,
     voxel: f32,
+    sun_irradiance: Vec3,
+}
+
+#[derive(ShaderType, Clone, Copy)]
+struct ShadowParams {
+    clipmap: ClipmapUniform,
+    region_min: IVec3,
+    tier: u32,
+    region_size: UVec3,
+    sun_k: f32,
+    sun_toward: Vec3,
 }
 
 #[derive(Resource)]
 struct ComposeGpu {
-    layout: BindGroupLayoutDescriptor,
-    pipeline: CachedComputePipelineId,
-    storage_views: [TextureView; TIERS],
+    compose_layout: BindGroupLayoutDescriptor,
+    compose: CachedComputePipelineId,
+    shadow_layout: BindGroupLayoutDescriptor,
+    shadow: CachedComputePipelineId,
+    storage: [TextureView; TIERS],
+    albedo_storage: [TextureView; TIERS],
+    color_storage: [TextureView; TIERS],
+    shadow_storage: [TextureView; TIERS],
 }
 
 #[derive(Resource)]
@@ -287,30 +359,38 @@ struct SdfSceneBuffers {
     instance_count: u32,
 }
 
+fn tier_textures(render_device: &RenderDevice, name: &str, format: TextureFormat) -> [TextureView; TIERS] {
+    std::array::from_fn(|tier| {
+        render_device
+            .create_texture(&TextureDescriptor {
+                label: Some(&format!("clipmap_{name}_{tier}")),
+                size: Extent3d {
+                    width: RESOLUTION as u32,
+                    height: RESOLUTION as u32,
+                    depth_or_array_layers: RESOLUTION as u32,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D3,
+                format,
+                usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&TextureViewDescriptor::default())
+    })
+}
+
 fn init_clipmap_gpu(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let textures: [Texture; TIERS] = std::array::from_fn(|tier| {
-        render_device.create_texture(&TextureDescriptor {
-            label: Some(&format!("clipmap_tier_{tier}")),
-            size: Extent3d {
-                width: RESOLUTION as u32,
-                height: RESOLUTION as u32,
-                depth_or_array_layers: RESOLUTION as u32,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D3,
-            format: FORMAT,
-            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        })
-    });
-    let views: [TextureView; TIERS] = std::array::from_fn(|t| textures[t].create_view(&TextureViewDescriptor::default()));
-    let sampler = render_device.create_sampler(&SamplerDescriptor {
+    let views = tier_textures(&render_device, "sdf", FORMAT);
+    let albedo = tier_textures(&render_device, "albedo", ALBEDO_FORMAT);
+    let color = tier_textures(&render_device, "color", COLOR_FORMAT);
+    let shadow = tier_textures(&render_device, "shadow", SHADOW_FORMAT);
+    let linear_repeat = render_device.create_sampler(&SamplerDescriptor {
         label: Some("clipmap_sampler"),
         address_mode_u: AddressMode::Repeat,
         address_mode_v: AddressMode::Repeat,
@@ -320,7 +400,7 @@ fn init_clipmap_gpu(
         ..default()
     });
 
-    let layout = BindGroupLayoutDescriptor::new(
+    let compose_layout = BindGroupLayoutDescriptor::new(
         "clipmap_compose_layout",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
@@ -329,19 +409,48 @@ fn init_clipmap_gpu(
                 storage_buffer_read_only::<GpuInstance>(false),
                 storage_buffer_read_only::<f32>(false),
                 texture_storage_3d(FORMAT, StorageTextureAccess::WriteOnly),
+                texture_storage_3d(ALBEDO_FORMAT, StorageTextureAccess::WriteOnly),
+                texture_storage_3d(COLOR_FORMAT, StorageTextureAccess::WriteOnly),
             ),
         ),
     );
-    let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("clipmap_compose".into()),
-        layout: vec![layout.clone()],
-        shader: asset_server.load(COMPOSE_SHADER),
-        entry_point: Some("compose".into()),
-        ..default()
-    });
+    let shadow_layout = BindGroupLayoutDescriptor::new(
+        "clipmap_shadow_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                uniform_buffer::<ShadowParams>(true),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                texture_storage_3d(SHADOW_FORMAT, StorageTextureAccess::WriteOnly),
+            ),
+        ),
+    );
+    let pipeline = |label: &'static str, layout: &BindGroupLayoutDescriptor, shader: &'static str, entry: &'static str| {
+        pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+            label: Some(label.into()),
+            layout: vec![layout.clone()],
+            shader: asset_server.load(shader),
+            entry_point: Some(entry.into()),
+            ..default()
+        })
+    };
+    let compose = pipeline("clipmap_compose", &compose_layout, COMPOSE_SHADER, "compose");
+    let shadow_pipeline = pipeline("clipmap_shadow", &shadow_layout, SHADOW_SHADER, "shadow");
 
-    commands.insert_resource(ComposeGpu { layout, pipeline, storage_views: views.clone() });
-    commands.insert_resource(ClipmapTextures { views, sampler });
+    commands.insert_resource(ComposeGpu {
+        compose_layout,
+        compose,
+        shadow_layout,
+        shadow: shadow_pipeline,
+        storage: views.clone(),
+        albedo_storage: albedo.clone(),
+        color_storage: color.clone(),
+        shadow_storage: shadow.clone(),
+    });
+    commands.insert_resource(ClipmapTextures { views, albedo, color, shadow, sampler: linear_repeat });
 }
 
 fn upload_sdf_scene(
@@ -379,19 +488,34 @@ fn bytemuck_f32(values: &[f32]) -> &[u8] {
 #[allow(clippy::too_many_arguments)]
 fn compose_clipmap(
     state: Res<ClipmapState>,
+    sun: Option<Res<SunLight>>,
     compose: Option<Res<ComposeGpu>>,
     buffers: Option<Res<SdfSceneBuffers>>,
+    textures: Option<Res<ClipmapTextures>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    mut params: Local<DynamicUniformBuffer<ComposeParams>>,
+    mut compose_params: Local<DynamicUniformBuffer<ComposeParams>>,
+    mut shadow_params: Local<DynamicUniformBuffer<ShadowParams>>,
     mut composed_generation: Local<Option<u32>>,
     mut ctx: RenderContext,
 ) {
-    let (Some(compose), Some(buffers)) = (compose, buffers) else { return };
-    let Some(pipeline) = pipeline_cache.get_compute_pipeline(compose.pipeline) else { return };
+    let (Some(sun), Some(compose), Some(buffers), Some(textures)) = (sun, compose, buffers, textures) else {
+        return;
+    };
+    for id in [compose.compose, compose.shadow] {
+        if let CachedPipelineState::Err(e) = pipeline_cache.get_compute_pipeline_state(id) {
+            error_once!("clipmap pipeline failed: {e}");
+        }
+    }
+    let (Some(compose_pipeline), Some(shadow_pipeline)) = (
+        pipeline_cache.get_compute_pipeline(compose.compose),
+        pipeline_cache.get_compute_pipeline(compose.shadow),
+    ) else {
+        return;
+    };
     // Until a full window has been composed for this generation (e.g. the
-    // pipeline was still compiling when the main world asked for it), the
+    // pipelines were still compiling when the main world asked for it), the
     // incremental regions aren't enough: compose whole windows instead.
     let full = *composed_generation != Some(state.generation);
     let regions: [Vec<Region>; TIERS] = std::array::from_fn(|tier| match (full, state.origins[tier]) {
@@ -405,46 +529,95 @@ fn compose_clipmap(
         *composed_generation = Some(state.generation);
     }
 
-    params.clear();
+    compose_params.clear();
+    shadow_params.clear();
+    let clipmap = ClipmapUniform::from_state(&state);
     let mut jobs = Vec::new();
     for tier in 0..TIERS {
         for region in &regions[tier] {
-            let offset = params.push(&ComposeParams {
+            let compose_offset = compose_params.push(&ComposeParams {
                 region_min: region.min,
                 instance_count: buffers.instance_count,
                 region_size: region.size,
                 resolution: RESOLUTION as u32,
+                sun_toward: sun.toward,
                 voxel: TIER_VOXEL[tier],
+                sun_irradiance: sun.irradiance,
             });
-            jobs.push((tier, *region, offset));
+            let shadow_offset = shadow_params.push(&ShadowParams {
+                clipmap,
+                region_min: region.min,
+                tier: tier as u32,
+                region_size: region.size,
+                sun_k: sun.k,
+                sun_toward: sun.toward,
+            });
+            jobs.push((tier, *region, compose_offset, shadow_offset));
         }
     }
-    params.write_buffer(&render_device, &render_queue);
-    let Some(params_binding) = params.binding() else { return };
+    compose_params.write_buffer(&render_device, &render_queue);
+    shadow_params.write_buffer(&render_device, &render_queue);
+    let (Some(compose_binding), Some(shadow_binding)) = (compose_params.binding(), shadow_params.binding()) else {
+        return;
+    };
 
-    let layout = pipeline_cache.get_bind_group_layout(&compose.layout);
-    let bind_groups: [BindGroup; TIERS] = std::array::from_fn(|tier| {
+    let compose_layout = pipeline_cache.get_bind_group_layout(&compose.compose_layout);
+    let compose_groups: [BindGroup; TIERS] = std::array::from_fn(|tier| {
         render_device.create_bind_group(
             "clipmap_compose",
-            &layout,
+            &compose_layout,
             &BindGroupEntries::sequential((
-                params_binding.clone(),
+                compose_binding.clone(),
                 buffers.instances.as_entire_buffer_binding(),
                 buffers.values.as_entire_buffer_binding(),
-                &compose.storage_views[tier],
+                &compose.storage[tier],
+                &compose.albedo_storage[tier],
+                &compose.color_storage[tier],
+            )),
+        )
+    });
+    let shadow_layout = pipeline_cache.get_bind_group_layout(&compose.shadow_layout);
+    let shadow_groups: [BindGroup; TIERS] = std::array::from_fn(|tier| {
+        render_device.create_bind_group(
+            "clipmap_shadow",
+            &shadow_layout,
+            &BindGroupEntries::sequential((
+                shadow_binding.clone(),
+                &textures.views[0],
+                &textures.views[1],
+                &textures.views[2],
+                &textures.sampler,
+                &compose.shadow_storage[tier],
             )),
         )
     });
 
-    let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
-        label: Some("clipmap_compose"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    for (tier, region, offset) in jobs {
-        pass.set_bind_group(0, &bind_groups[tier], &[offset]);
-        let groups = region.size.map(|s| s.div_ceil(4));
-        pass.dispatch_workgroups(groups.x, groups.y, groups.z);
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+    let descriptor = ComputePassDescriptor { label: Some("clipmap"), timestamp_writes: None };
+    // Geometry (and color) for every region first, then shadows: a shadow
+    // march reads the geometry around it, which may be in another region.
+    {
+        let mut pass = ctx.command_encoder().begin_compute_pass(&descriptor);
+        let span = diagnostics.pass_span(&mut pass, COMPOSE_SPAN);
+        pass.set_pipeline(compose_pipeline);
+        for (tier, region, offset, _) in &jobs {
+            pass.set_bind_group(0, &compose_groups[*tier], &[*offset]);
+            let groups = region.size.map(|s| s.div_ceil(4));
+            pass.dispatch_workgroups(groups.x, groups.y, groups.z);
+        }
+        span.end(&mut pass);
+    }
+    {
+        let mut pass = ctx.command_encoder().begin_compute_pass(&descriptor);
+        let span = diagnostics.pass_span(&mut pass, SHADOW_SPAN);
+        pass.set_pipeline(shadow_pipeline);
+        for (tier, region, _, offset) in &jobs {
+            pass.set_bind_group(0, &shadow_groups[*tier], &[*offset]);
+            let groups = region.size.map(|s| s.div_ceil(4));
+            pass.dispatch_workgroups(groups.x, groups.y, groups.z);
+        }
+        span.end(&mut pass);
     }
 }
 

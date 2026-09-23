@@ -12,8 +12,10 @@ pub const OCTA_SIDE0: u32 = 4;
 /// End of cascade 0's interval, m; cascade n covers
 /// [INTERVAL0 * 2^(n-1), INTERVAL0 * 2^n] (cascade 0 from 0).
 pub const INTERVAL0: f32 = 1.5;
-/// Cascade-0 probes exist within this distance of the camera.
-pub const RADIUS0: f32 = 8.0;
+/// Cascade-0 probes exist within this distance of the camera; pixels
+/// beyond it get no indirect light. 12 m covers the whole test room from
+/// anywhere inside it (8 m left its far corners black).
+pub const RADIUS0: f32 = 12.0;
 /// Sub-samples per axis of each cascade-0 direction cell, for exact cosine
 /// weighting when shading from 16 directions.
 pub const SHADE_SUBSAMPLES: u32 = 4;

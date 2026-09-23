@@ -1,9 +1,10 @@
 //! 3D radiance cascades over the SDF clipmap, in world space, in
 //! camera-centred windows (see layout.rs for the parameters and
-//! cascades3d.wgsl for the passes). Direct light only for now.
+//! cascades3d.wgsl for the passes). They carry indirect light: hits see the
+//! clipmap's surface color times its sun visibility.
 //!
-//! They run while the SDF view shows lighting (`N` to mode 3); `K` rebuilds
-//! the clipmap and also throws away the cached hits.
+//! They run while the SDF view shows lighting (`N` to modes 3 and 4); `K`
+//! rebuilds the clipmap and also throws away the cached hits.
 
 pub mod layout;
 
@@ -23,17 +24,15 @@ use bevy::{
     },
 };
 
-use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, RESOLUTION, TIER_VOXEL, TIERS};
-use crate::sdf_view::{SceneResource, SdfView};
+use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, ClipmapUniform};
+use crate::sdf_view::SdfView;
 use layout::{CASCADES, INTERVAL0, Layout, OCTA_SIDE0, SPACING0, octa_side, rays_per_probe};
 
 const SHADER: &str = "shaders/cascades3d.wgsl";
 const TRACE_SPAN: &str = "cascades3d_trace";
-pub const MAX_LIGHTS: usize = 16;
+
 /// First SDF view mode that shows lighting (exports radiance).
 pub const LIGHTING_MODE: u32 = 3;
-/// SDF view mode that shows light carried by the cascades (and runs them).
-pub const CASCADE_MODE: u32 = 4;
 
 pub struct Cascades3dPlugin;
 
@@ -42,37 +41,12 @@ pub struct Cascades3dPlugin;
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Cascades3dRenderSystems;
 
-#[derive(ShaderType, Clone, Copy, Default)]
-pub struct ClipmapUniform {
-    pub origins: [IVec4; TIERS],
-    pub voxels: Vec4,
-    pub resolution: u32,
-}
-
-impl ClipmapUniform {
-    pub fn from_state(state: &ClipmapState) -> Self {
-        Self {
-            origins: std::array::from_fn(|t| state.origins[t].unwrap_or_default().extend(0)),
-            voxels: Vec4::new(TIER_VOXEL[0], TIER_VOXEL[1], TIER_VOXEL[2], 0.0),
-            resolution: RESOLUTION as u32,
-        }
-    }
-}
-
-#[derive(ShaderType, Clone, Copy, Default)]
-struct GpuLight {
-    center: Vec3,
-    radius: f32,
-    radiance: Vec3,
-}
-
 /// Per-frame inputs, extracted to the render world.
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct Cascades3dFrame {
     pub active: bool,
     pub camera: Vec3,
     pub clipmap: ClipmapUniform,
-    lights: Vec<GpuLight>,
     /// Follows the clipmap's generation: a rebuild also drops cached hits.
     pub generation: u32,
 }
@@ -101,25 +75,13 @@ fn update_frame(
     mut frame: ResMut<Cascades3dFrame>,
     view: Option<Res<SdfView>>,
     state: Res<ClipmapState>,
-    scene: Option<Res<SceneResource>>,
     camera: Query<&GlobalTransform, With<ClipmapCamera>>,
 ) {
     let (Some(view), Ok(camera)) = (view, camera.single()) else { return };
-    frame.active = view.enabled && view.mode == CASCADE_MODE;
+    frame.active = view.enabled && view.mode >= LIGHTING_MODE;
     frame.camera = camera.translation();
     frame.clipmap = ClipmapUniform::from_state(&state);
     frame.generation = state.generation;
-    if frame.lights.is_empty()
-        && let Some(scene) = scene
-    {
-        frame.lights = scene
-            .0
-            .lights
-            .iter()
-            .take(MAX_LIGHTS)
-            .map(|l| GpuLight { center: l.center, radius: l.radius, radiance: l.radiance })
-            .collect();
-    }
 }
 
 fn log_cascade_timings(time: Res<Time>, mut timer: Local<Option<Timer>>, frame: Res<Cascades3dFrame>, store: Res<DiagnosticsStore>) {
@@ -147,7 +109,6 @@ struct Params {
     camera: Vec3,
     cascade: u32,
     cascade_count: u32,
-    light_count: u32,
     spacing0: f32,
     interval0: f32,
     octa_side0: u32,
@@ -178,8 +139,6 @@ pub struct Cascades3dGpu {
     /// Per cascade-0 direction cell: sub-directions and solid angles, for
     /// cosine-weighted irradiance.
     pub shading_subsamples: Buffer,
-    /// The scene's lights; written once the scene is known.
-    pub lights: Buffer,
     angle_bases: Vec<u32>,
     bind_group_layout: BindGroupLayoutDescriptor,
     trace: CachedComputePipelineId,
@@ -239,7 +198,12 @@ fn init_cascades_gpu(
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
-                storage_buffer_read_only_sized(false, None),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
@@ -269,7 +233,6 @@ fn init_cascades_gpu(
         tags: storage(&render_device, "cascades3d_tags", layout.tag_words * 4),
         child_masks: storage(&render_device, "cascades3d_child_masks", layout.tag_words * 4),
         remarched: storage(&render_device, "cascades3d_remarched", CASCADES as u64 * 4),
-        lights: storage(&render_device, "cascades3d_lights", (MAX_LIGHTS * 32) as u64),
         solid_angles,
         shading_subsamples,
         angle_bases,
@@ -304,19 +267,9 @@ fn run_cascades(
     render_queue: Res<RenderQueue>,
     mut params: Local<DynamicUniformBuffer<Params>>,
     mut cleared_generation: Local<Option<u32>>,
-    mut uploaded_lights: Local<usize>,
     mut ctx: RenderContext,
 ) {
     let (Some(gpu), Some(textures)) = (gpu, textures) else { return };
-    if frame.lights.is_empty() {
-        return;
-    }
-    // The SDF view's direct-light mode reads the lights too, so upload them
-    // regardless of whether the cascades run.
-    if *uploaded_lights != frame.lights.len() {
-        render_queue.write_buffer(&gpu.lights, 0, &bytes_of(&frame.lights));
-        *uploaded_lights = frame.lights.len();
-    }
     if !frame.active {
         return;
     }
@@ -343,7 +296,6 @@ fn run_cascades(
                 camera: frame.camera,
                 cascade: n,
                 cascade_count: CASCADES,
-                light_count: frame.lights.len() as u32,
                 spacing0: SPACING0,
                 interval0: INTERVAL0,
                 octa_side0: OCTA_SIDE0,
@@ -373,7 +325,12 @@ fn run_cascades(
                 &textures.views[1],
                 &textures.views[2],
                 &textures.sampler,
-                gpu.lights.as_entire_buffer_binding(),
+                &textures.color[0],
+                &textures.color[1],
+                &textures.color[2],
+                &textures.shadow[0],
+                &textures.shadow[1],
+                &textures.shadow[2],
                 src.as_entire_buffer_binding(),
                 dst.as_entire_buffer_binding(),
                 gpu.hits.as_entire_buffer_binding(),

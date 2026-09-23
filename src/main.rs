@@ -31,6 +31,8 @@ fn main() {
             ClipmapPlugin,
             SdfViewPlugin,
             Cascades3dPlugin,
+            // GPU timestamp spans for every pass (render/<span>/elapsed_gpu).
+            bevy::render::diagnostic::RenderDiagnosticsPlugin,
         ))
         .add_systems(Startup, (setup_scene, log_adapter_info))
         .run();
@@ -46,6 +48,11 @@ fn setup_scene(
 ) {
     let scene = Scene3d::room(0.2);
     scene3d::spawn(&scene, &mut commands, &mut meshes, &mut materials);
+    commands.insert_resource(clipmap::SunLight {
+        toward: scene.sun.toward,
+        irradiance: scene.sun.irradiance,
+        k: 1.0 / scene.sun.angular_radius.tan(),
+    });
     commands.insert_resource(SceneResource(scene));
 
     commands.spawn((
