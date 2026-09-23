@@ -9,6 +9,11 @@
 //! - `B`: toggle plain bilinear merge vs. bilinear fix
 //! - `Up` / `Down`: double / halve the cascade-0 interval scale `b`
 //! - `P`: toggle cascade-0 probe spacing s0 between 1 and 2 px
+//! - `D`: cycle how many of the lowest cascades use the per-direction
+//!   merge (0-3, then all; see the cascade shader)
+//! - `J`: diagnostic: rotate all ray directions by a different angle each
+//!   frame and average the result over frames. Error that goes away is
+//!   aliasing from the fixed ray directions; error that stays is bias.
 //! - `R`: restart reference accumulation
 //! - Left-drag: move the warm light (restarts the reference)
 //!
@@ -44,10 +49,26 @@
 //! | rgba16f packed  | 1 px | 0.5    | ~15 ms       | 4.37%     |
 //! | rgba16f packed  | 2 px | 1      | ~4 ms        | 6.29%     |
 //!
-//! fp16 is free accuracy-wise. s0 = 2 is ~4x cheaper; its extra error is
-//! mostly blotchy halos ~40px around the lights (the small near-light ring
-//! at s0 = 1, grown). At s0 = 2 the resolve must skip cascade-0 probes that
-//! sit inside shapes, or every shape edge gets a halo (12.48% without).
+//! fp16 is free accuracy-wise. s0 = 2 is ~4x cheaper. At s0 = 2 the resolve
+//! must skip cascade-0 probes that sit inside shapes, or every shape edge
+//! gets a halo (12.48% without).
+//!
+//! The remaining near-light error was a bias, not aliasing: rotating all
+//! ray directions per frame and averaging (`J`) barely changed it. The
+//! cascades were too bright within a few px of the light's surface, from
+//! tracing each arc's near segment along its center only (see the cascade
+//! shader). Merging per child direction in the lowest cascades (`D`):
+//!
+//! | s0   | b   | per-direction levels | cascades GPU | rel. RMSE | 0-2px from light |
+//! |------|-----|----------------------|--------------|-----------|------------------|
+//! | 1 px | 0.5 | 0                    | ~14 ms       | 4.18%     | 16.1%            |
+//! | 1 px | 0.5 | 2                    | ~20 ms       | 2.74%     | 8.1%             |
+//! | 1 px | 0.5 | all                  | ~49 ms       | 2.64%     | 8.4%             |
+//! | 2 px | 1   | 0                    | ~3.6 ms      | 6.28%     | 19.1%            |
+//! | 2 px | 1   | 2 (default)          | ~5.5 ms      | 3.61%     | 7.2%             |
+//! | 2 px | 1   | 3                    | ~7.8 ms      | 3.50%     | 7.3%             |
+//!
+//! Higher levels cost the most (long rays x 4 traces) and help the least.
 //! A direction-first layout wasn't tried: its payoff is hardware-filtered
 //! probe blending, which the bilinear fix can't use (each neighbour is
 //! merged with its own near segment before weighting).
@@ -122,6 +143,12 @@ struct Rc2dSettings {
     light_pos: Vec2,
     /// log2 of the cascade-0 probe spacing s0 in px.
     probe0_log2: u32,
+    jitter: bool,
+    /// Cascades below this use the per-direction merge.
+    per_direction_levels: u32,
+    /// Frames averaged into the jittered history; like `ref_frame`, 0 means
+    /// overwrite. Reset whenever anything the cascades depend on changes.
+    rc_frame: u32,
 }
 
 impl Default for Rc2dSettings {
@@ -129,21 +156,47 @@ impl Default for Rc2dSettings {
         Self {
             view_mode: 0,
             bilinear_fix: true,
-            // Cascade 0 covers [0, 2px] at 1px probe spacing. Measured best
-            // for both merge modes on this scene; see the module docs.
-            base_interval: 0.5,
+            // With s0 = 2 px: cascade 0 covers [0, 4px]. Measured best at
+            // this spacing; see the module docs.
+            base_interval: 1.0,
             ref_frame: 0,
             reset_reference: true,
             ref_rays: 16,
             exposure: 2.0,
             diff_gain: 8.0,
             light_pos: Vec2::new(110.0, 400.0),
-            probe0_log2: 0,
+            probe0_log2: 1,
+            jitter: false,
+            per_direction_levels: 2,
+            rc_frame: 0,
         }
     }
 }
 
 impl Rc2dSettings {
+    /// Everything the cascades' output depends on; a change restarts the
+    /// jittered average.
+    fn cascade_key(&self) -> (u32, bool, u32, u32, [u32; 2], bool) {
+        (
+            self.base_interval.to_bits(),
+            self.bilinear_fix,
+            self.per_direction_levels,
+            self.probe0_log2,
+            [self.light_pos.x.to_bits(), self.light_pos.y.to_bits()],
+            self.jitter,
+        )
+    }
+
+    /// Per-frame rotation for the jitter diagnostic: a golden-ratio sequence
+    /// over [0, pi/2), cascade 0's ray spacing. Rotating by that full range
+    /// rotates every cascade's direction set uniformly.
+    fn ray_rotation(&self) -> f32 {
+        if !self.jitter {
+            return 0.0;
+        }
+        (self.rc_frame as f32 * 0.618_034).fract() * std::f32::consts::FRAC_PI_2
+    }
+
     /// Fewest cascades whose last interval end, b*4^N, reaches the canvas
     /// diagonal, so every ray can see the whole scene.
     fn cascade_count(&self) -> u32 {
@@ -160,6 +213,7 @@ struct Rc2dBuffers {
     cascade_b: Handle<ShaderBuffer>,
     reference: Handle<ShaderBuffer>,
     error: Handle<ShaderBuffer>,
+    rc_history: Handle<ShaderBuffer>,
     display: Handle<Image>,
 }
 
@@ -230,6 +284,7 @@ fn setup(
         cascade_b: buffer(CASCADE_ENTRIES * CASCADE_ENTRY_BYTES),
         reference: buffer(PIXELS * VEC4),
         error: buffer(PIXELS * VEC4),
+        rc_history: buffer(PIXELS * VEC4),
         display: display.clone(),
     });
 
@@ -279,11 +334,23 @@ fn input(
     if keys.just_pressed(KeyCode::KeyP) {
         settings.probe0_log2 ^= 1;
     }
+    if keys.just_pressed(KeyCode::KeyJ) {
+        settings.jitter = !settings.jitter;
+    }
+    if keys.just_pressed(KeyCode::KeyD) {
+        settings.per_direction_levels = match settings.per_direction_levels {
+            0..3 => settings.per_direction_levels + 1,
+            3 => MAX_CASCADES,
+            _ => 0,
+        };
+    }
     if settings.is_changed() && keys.get_just_pressed().next().is_some() {
         info!(
-            "view={} bilinear_fix={} s0={} b={} cascades={}",
+            "view={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={}",
             ["cascades", "reference", "difference"][settings.view_mode as usize],
             settings.bilinear_fix,
+            settings.per_direction_levels,
+            settings.jitter,
             1 << settings.probe0_log2,
             settings.base_interval,
             settings.cascade_count()
@@ -294,12 +361,22 @@ fn input(
 /// Runs after `input`, so a reset requested this frame is what gets
 /// extracted: `ref_frame == 0` tells the shader to overwrite. (Resetting
 /// `ref_frame` in `input` directly got incremented away before extraction.)
-fn advance_reference(mut settings: ResMut<Rc2dSettings>) {
+fn advance_reference(
+    mut settings: ResMut<Rc2dSettings>,
+    mut last_cascade_key: Local<Option<(u32, bool, u32, u32, [u32; 2], bool)>>,
+) {
     if settings.reset_reference {
         settings.ref_frame = 0;
         settings.reset_reference = false;
     } else {
         settings.ref_frame += 1;
+    }
+
+    let key = settings.cascade_key();
+    if last_cascade_key.replace(key) != Some(key) {
+        settings.rc_frame = 0;
+    } else {
+        settings.rc_frame += 1;
     }
 }
 
@@ -388,9 +465,11 @@ fn request_error_readback(
                     return;
                 }
                 info!(
-                    "relative RMSE {:.3}% over {pixels} px | bilinear_fix={} s0={} b={} cascades={} | reference {rays} rays/px",
+                    "relative RMSE {:.3}% over {pixels} px | bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={} | reference {rays} rays/px",
                     100.0 * (err / reference.max(f64::MIN_POSITIVE)).sqrt(),
                     settings.bilinear_fix,
+                    settings.per_direction_levels,
+                    settings.jitter,
                     1 << settings.probe0_log2,
                     settings.base_interval,
                     settings.cascade_count(),
@@ -415,6 +494,10 @@ struct Params {
     diff_gain: f32,
     light_pos: Vec2,
     probe0_log2: u32,
+    ray_rotation: f32,
+    rc_accumulate: u32,
+    rc_frame: u32,
+    per_direction_levels: u32,
 }
 
 #[derive(Resource)]
@@ -443,6 +526,7 @@ fn init_pipelines(
                 storage_buffer_sized(false, pixel_size),
                 storage_buffer_sized(false, pixel_size),
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+                storage_buffer_sized(false, pixel_size),
             ),
         ),
     );
@@ -488,11 +572,12 @@ fn run_rc2d(
     ) else {
         return;
     };
-    let (Some(a), Some(b), Some(reference), Some(error), Some(display)) = (
+    let (Some(a), Some(b), Some(reference), Some(error), Some(rc_history), Some(display)) = (
         gpu_buffers.get(&buffers.cascade_a),
         gpu_buffers.get(&buffers.cascade_b),
         gpu_buffers.get(&buffers.reference),
         gpu_buffers.get(&buffers.error),
+        gpu_buffers.get(&buffers.rc_history),
         gpu_images.get(&buffers.display),
     ) else {
         return;
@@ -512,6 +597,10 @@ fn run_rc2d(
         diff_gain: settings.diff_gain,
         light_pos: settings.light_pos,
         probe0_log2: settings.probe0_log2,
+        ray_rotation: settings.ray_rotation(),
+        rc_accumulate: settings.jitter as u32,
+        rc_frame: settings.rc_frame,
+        per_direction_levels: settings.per_direction_levels,
     };
     params.clear();
     // Offsets [0..cascade_count) are per-cascade; the last one is shared by
@@ -539,6 +628,7 @@ fn run_rc2d(
                 reference.buffer.as_entire_buffer_binding(),
                 error.buffer.as_entire_buffer_binding(),
                 &display.texture_view,
+                rc_history.buffer.as_entire_buffer_binding(),
             )),
         )
     };

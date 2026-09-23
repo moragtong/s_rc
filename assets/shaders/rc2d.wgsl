@@ -32,6 +32,19 @@ struct Params {
     light_pos: vec2<f32>,
     // log2 of the cascade-0 probe spacing s0 in px.
     probe0_log2: u32,
+    // Angle added to every ray of every cascade (radians). The same for all
+    // cascades, so child arcs still subdivide parent arcs exactly.
+    ray_rotation: f32,
+    // Diagnostic: 1 = average the resolved cascades over frames (each with
+    // a different ray_rotation) instead of showing only this frame.
+    rc_accumulate: u32,
+    // Frames in rc_history since the last reset; 0 = overwrite.
+    rc_frame: u32,
+    // Cascades n < this merge each of the 4 child directions with its own
+    // near segment and average after; the rest trace one near segment along
+    // the parent's center direction and merge it with the pre-averaged
+    // children.
+    per_direction_levels: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -45,6 +58,8 @@ struct Params {
 // reference ray count). Read back on the CPU for the relative RMSE.
 @group(0) @binding(4) var<storage, read_write> error: array<vec4<f32>>;
 @group(0) @binding(5) var display: texture_storage_2d<rgba8unorm, write>;
+// rgb = summed resolved cascades, a = frame count (rc_accumulate only).
+@group(0) @binding(6) var<storage, read_write> rc_history: array<vec4<f32>>;
 
 const TAU: f32 = 6.28318530718;
 const HIT_EPS: f32 = 0.05;
@@ -165,7 +180,7 @@ fn interval(n: u32) -> vec2<f32> {
 }
 
 fn ray_dir(ray: u32, count: u32) -> vec2<f32> {
-    let angle = (f32(ray) + 0.5) * TAU / f32(count);
+    let angle = (f32(ray) + 0.5) * TAU / f32(count) + params.ray_rotation;
     return vec2(cos(angle), sin(angle));
 }
 
@@ -191,6 +206,19 @@ fn probe_arc(probe: vec2<u32>, n: u32, ray: u32) -> vec4<f32> {
         + load_ray(base + 2u) + load_ray(base + 3u));
 }
 
+fn probe_ray(probe: vec2<u32>, n: u32, ray: u32) -> vec4<f32> {
+    return load_ray((probe.y * probe_grid(n).x + probe.x) * ray_count(n) + ray);
+}
+
+// Far field for one sub-direction: the child ray itself when merging per
+// direction, else the pre-averaged arc of the parent ray.
+fn child_value(probe: vec2<u32>, n1: u32, parent_ray: u32, child_ray: u32, per_direction: bool) -> vec4<f32> {
+    if per_direction {
+        return probe_ray(probe, n1, child_ray);
+    }
+    return probe_arc(probe, n1, parent_ray);
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn cascade(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = params.cascade;
@@ -213,30 +241,47 @@ fn cascade(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let children = bilinear(center, n + 1u);
+    let child_rays = ray_count(n + 1u);
 
+    // Per-direction merge: a stored ray covers an arc, and tracing its near
+    // segment only along the arc's center makes near visibility all-or-
+    // nothing for the whole arc. Next to a bright surface that's biased
+    // bright: directions that hit are always counted (a child interval that
+    // starts inside the surface reports its emission), and a center hit
+    // also claims the arc's directions that miss. Tracing each child
+    // direction separately and averaging after the merge removes that; an
+    // average of products isn't the product of averages.
+    let per_direction = n < params.per_direction_levels;
+    let sub_count = select(1u, 4u, per_direction);
     var result = vec4(0.0);
-    if params.merge_mode == 0u {
-        // Plain: one near segment, merged with the interpolated far field.
-        // Leaks: the 4 child probes can sit on the far side of an occluder
-        // the near segment never saw.
-        let near = trace(center, dir, range.x, range.y);
-        var far = vec4(0.0);
-        for (var k = 0u; k < 4u; k++) {
-            far += children.weights[k] * probe_arc(bilinear_probe(children, k, n + 1u), n + 1u, ray);
-        }
-        result = merge(near, far);
-    } else {
-        // Bilinear fix: trace from this probe's interval start to where each
-        // child probe's interval starts, so each near segment actually
-        // connects to the far field it's merged with.
-        let start = center + dir * range.x;
-        for (var k = 0u; k < 4u; k++) {
-            let c = bilinear_probe(children, k, n + 1u);
-            let child_start = (vec2<f32>(c) + 0.5) * probe_spacing(n + 1u) + dir * range.y;
-            let near = trace_segment(start, child_start);
-            result += children.weights[k] * merge(near, probe_arc(c, n + 1u, ray));
+    for (var j = 0u; j < sub_count; j++) {
+        let child_ray = ray * 4u + j;
+        let sub_dir = select(dir, ray_dir(child_ray, child_rays), per_direction);
+        if params.merge_mode == 0u {
+            // Plain: one near segment, merged with the interpolated far
+            // field. Leaks: the 4 child probes can sit on the far side of an
+            // occluder the near segment never saw.
+            let near = trace(center, sub_dir, range.x, range.y);
+            var far = vec4(0.0);
+            for (var k = 0u; k < 4u; k++) {
+                let c = bilinear_probe(children, k, n + 1u);
+                far += children.weights[k] * child_value(c, n + 1u, ray, child_ray, per_direction);
+            }
+            result += merge(near, far);
+        } else {
+            // Bilinear fix: trace from this probe's interval start to where
+            // each child probe's interval starts, so each near segment
+            // actually connects to the far field it's merged with.
+            let start = center + sub_dir * range.x;
+            for (var k = 0u; k < 4u; k++) {
+                let c = bilinear_probe(children, k, n + 1u);
+                let child_start = (vec2<f32>(c) + 0.5) * probe_spacing(n + 1u) + sub_dir * range.y;
+                let near = trace_segment(start, child_start);
+                result += children.weights[k] * merge(near, child_value(c, n + 1u, ray, child_ray, per_direction));
+            }
         }
     }
+    result /= f32(sub_count);
     store_ray(id.x, result);
 }
 
@@ -309,6 +354,11 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     // All 4 inside shapes (a gap thinner than the probe spacing): nothing
     // better to go on than the plain blend.
     rc = select(rc_all, rc / weight, weight > 0.0);
+    if params.rc_accumulate == 1u {
+        let history = select(rc_history[i], vec4(0.0), params.rc_frame == 0u) + vec4(rc, 1.0);
+        rc_history[i] = history;
+        rc = history.rgb / history.a;
+    }
     let acc = reference[i];
     let ref_value = acc.rgb / max(acc.a, 1.0);
     let e = rc - ref_value;
