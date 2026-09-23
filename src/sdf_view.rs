@@ -128,6 +128,8 @@ fn sdf_view_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut view: ResMut<SdfView>,
     mut node: Query<&mut Visibility, With<SdfViewNode>>,
+    mut meshes: Query<&mut Visibility, (With<crate::scene3d::SceneBoxMesh>, Without<SdfViewNode>)>,
+    mut lights: Query<&mut DirectionalLight>,
     mut commands: Commands,
     scene: Option<Res<SceneResource>>,
     state: Res<ClipmapState>,
@@ -148,6 +150,17 @@ fn sdf_view_input(
     }
     for mut visibility in &mut node {
         *visibility = if view.enabled { Visibility::Visible } else { Visibility::Hidden };
+    }
+    // The view covers the screen: don't also rasterize the scene (and its
+    // sun shadow map) underneath it. The SDF grid is baked already.
+    let scene_visibility = if view.enabled { Visibility::Hidden } else { Visibility::Inherited };
+    for mut visibility in &mut meshes {
+        visibility.set_if_neq(scene_visibility);
+    }
+    for mut light in &mut lights {
+        if light.shadow_maps_enabled == view.enabled {
+            light.shadow_maps_enabled = !view.enabled;
+        }
     }
 }
 
@@ -287,7 +300,6 @@ fn init_sdf_view_pipeline(mut commands: Commands, asset_server: Res<AssetServer>
                 storage_buffer_sized(false, std::num::NonZero::new((WIDTH * HEIGHT * 4) as u64)),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
-                storage_buffer_read_only_sized(false, None),
                 storage_buffer_sized(false, std::num::NonZero::new((WIDTH * HEIGHT * 16) as u64)),
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 texture_3d(TextureSampleType::Float { filterable: true }),
@@ -346,9 +358,8 @@ fn trace_sdf_view(
             &textures.sampler,
             &image.texture_view,
             depth.buffer.as_entire_buffer_binding(),
-            cascades.radiance_a.as_entire_buffer_binding(),
+            cascades.probe_sh.as_entire_buffer_binding(),
             cascades.tags.as_entire_buffer_binding(),
-            cascades.shading_subsamples.as_entire_buffer_binding(),
             radiance.buffer.as_entire_buffer_binding(),
             &textures.albedo,
             &textures.shadow,

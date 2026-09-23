@@ -41,20 +41,19 @@ struct View {
 @group(0) @binding(2) var clipmap_sampler: sampler;
 @group(0) @binding(3) var output: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var<storage, read_write> depth: array<f32>;
-// Cascade 0's radiance (16 directions per probe, rgba16float packed), its
-// slot tags, and per direction cell 16 sub-directions with solid angles.
-@group(0) @binding(5) var<storage, read> cascade0: array<vec2<u32>>;
+// Per cascade-0 probe, its irradiance as L2 spherical harmonics (9 rgb
+// coefficients in 7 vec4s, already cosine-convolved; cascades3d.wgsl's
+// project_sh), and the probes' slot tags.
+@group(0) @binding(5) var<storage, read> probe_sh: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read> tags: array<u32>;
-@group(0) @binding(7) var<storage, read> shading_subsamples: array<vec4<f32>>;
 // Linear radiance per pixel in lighting mode, for exporting.
-@group(0) @binding(8) var<storage, read_write> radiance_out: array<vec4<f32>>;
-@group(0) @binding(9) var albedo: texture_3d<f32>;
-@group(0) @binding(10) var shadow: texture_3d<f32>;
-@group(0) @binding(11) var color: texture_3d<f32>;
+@group(0) @binding(7) var<storage, read_write> radiance_out: array<vec4<f32>>;
+@group(0) @binding(8) var albedo: texture_3d<f32>;
+@group(0) @binding(9) var shadow: texture_3d<f32>;
+@group(0) @binding(10) var color: texture_3d<f32>;
 
 const PI: f32 = 3.14159265359;
-const C0_DIRECTIONS: u32 = 16u;
-const SUBSAMPLES_PER_DIRECTION: u32 = 16u;
+const SH_WORDS: u32 = 7u;
 
 fn clipmap() -> Clipmap {
     return Clipmap(view.origin, view.voxel, view.resolution);
@@ -126,21 +125,28 @@ fn c0_slot(world: vec3<i32>) -> u32 {
     return s.x + view.c0_window * (s.y + view.c0_window * s.z);
 }
 
-// Cosine-weighted irradiance at one cascade-0 probe for normal n, weighting
-// each direction cell by the cosine across its sub-directions.
+// Irradiance at one cascade-0 probe for normal n, from its L2 spherical
+// harmonics (clamped at 0: L2 can ring slightly negative).
 fn probe_irradiance(slot: u32, n: vec3<f32>) -> vec3<f32> {
-    var e = vec3(0.0);
-    for (var cell = 0u; cell < C0_DIRECTIONS; cell++) {
-        let v = cascade0[slot * C0_DIRECTIONS + cell];
-        let radiance = vec4(unpack2x16float(v.x), unpack2x16float(v.y)).rgb;
-        var weight = 0.0;
-        for (var i = 0u; i < SUBSAMPLES_PER_DIRECTION; i++) {
-            let sub = shading_subsamples[cell * SUBSAMPLES_PER_DIRECTION + i];
-            weight += max(dot(n, sub.xyz), 0.0) * sub.w;
-        }
-        e += radiance * weight;
+    var f: array<f32, 28>;
+    for (var w = 0u; w < SH_WORDS; w++) {
+        let v = probe_sh[slot * SH_WORDS + w];
+        f[w * 4u] = v.x;
+        f[w * 4u + 1u] = v.y;
+        f[w * 4u + 2u] = v.z;
+        f[w * 4u + 3u] = v.w;
     }
-    return e;
+    let y = array<f32, 9>(
+        0.282095,
+        0.488603 * n.y, 0.488603 * n.z, 0.488603 * n.x,
+        1.092548 * n.x * n.y, 1.092548 * n.y * n.z, 0.315392 * (3.0 * n.z * n.z - 1.0),
+        1.092548 * n.x * n.z, 0.546274 * (n.x * n.x - n.y * n.y),
+    );
+    var e = vec3(0.0);
+    for (var k = 0u; k < 9u; k++) {
+        e += vec3(f[k * 3u], f[k * 3u + 1u], f[k * 3u + 2u]) * y[k];
+    }
+    return max(e, vec3(0.0));
 }
 
 // Irradiance at surface point p with normal n: trilinear over the 8

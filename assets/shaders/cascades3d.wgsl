@@ -43,6 +43,10 @@ struct Params {
     child_angle_base: u32,
     // DEBUG: 1 = no far field.
     debug: u32,
+    // Frame counter: dirty flags hold the frame they were set in.
+    frame: u32,
+    // 1 = every live probe is dirty (e.g. the sun changed).
+    force: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -70,6 +74,18 @@ struct Params {
 @group(0) @binding(11) var<storage, read_write> child_masks: array<u32>;
 @group(0) @binding(12) var<storage, read_write> work_list: array<u32>;
 @group(0) @binding(13) var<storage, read_write> dispatch_args: array<u32>;
+// Cascade 0's direction cells as sub-directions with solid angles (16 per
+// cell), and per cascade-0 slot its irradiance as L2 spherical harmonics:
+// 9 rgb coefficients in 7 vec4s (27 floats and a pad).
+@group(0) @binding(14) var<storage, read> shading_subsamples: array<vec4<f32>>;
+@group(0) @binding(15) var<storage, read_write> probe_sh: array<vec4<f32>>;
+// Incremental gathering. Per slot (indexed like tags), the frame its probe
+// last changed: traced, or one of its children changed. Per cascade, this
+// frame's changed probes (count, then slots, indexed like tags), gathered
+// by indirect dispatch; the SH projection uses cascade 0's list.
+@group(0) @binding(16) var<storage, read_write> dirty: array<u32>;
+@group(0) @binding(17) var<storage, read_write> gather_count: array<atomic<u32>>;
+@group(0) @binding(18) var<storage, read_write> gather_list: array<u32>;
 
 // ------------------------------------------------------------ geometry
 
@@ -255,17 +271,66 @@ fn select_probes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_wor
     }
 }
 
-// One thread per cascade: indirect dispatch arguments for tracing its work
-// list, spread over y past 32768 workgroups like `dispatch_linear`.
-@compute @workgroup_size(1, 1, 1)
-fn write_args() {
-    let threads = atomicLoad(&work_count[params.pass_index]) * params.octa_side * params.octa_side;
+// Indirect dispatch arguments for `threads` threads in workgroups of 64,
+// spread over y past 32768 workgroups like `dispatch_linear`.
+fn store_args(base: u32, threads: u32) {
     let groups = (threads + 63u) / 64u;
-    let x = min(groups, 32768u);
-    let base = params.pass_index * 3u;
-    dispatch_args[base] = x;
+    dispatch_args[base] = min(groups, 32768u);
     dispatch_args[base + 1u] = select((groups + 32767u) / 32768u, 1u, groups <= 32768u);
     dispatch_args[base + 2u] = 1u;
+}
+
+// Dispatch argument layout: per cascade, trace at 3n, gather at 3(4 + n);
+// the SH projection at 3 * 8.
+const GATHER_ARGS: u32 = 12u;
+const SH_ARGS: u32 = 24u;
+
+// One thread per cascade: arguments for tracing its work list.
+@compute @workgroup_size(1, 1, 1)
+fn write_args() {
+    let rays = params.octa_side * params.octa_side;
+    store_args(params.pass_index * 3u, atomicLoad(&work_count[params.pass_index]) * rays);
+}
+
+// Per slot, top down (cascade n after n+1): a live probe changed this frame
+// if it was traced, or any trilinear child changed (its merge reads them;
+// children of live parents are always live, by the window radii). Changed
+// probes go on the gather list.
+@compute @workgroup_size(64, 1, 1)
+fn mark_dirty(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let slot = linear_index(gid, groups);
+    if slot >= params.window * params.window * params.window {
+        return;
+    }
+    let world = slot_world(slot, params.spacing, params.window);
+    if !probe_valid(world, params.spacing, params.radius) {
+        return;
+    }
+    var changed = params.force != 0u || dirty[params.tag_base + slot] == params.frame;
+    if !changed && has_children() {
+        let t = trilinear(probe_center(world, params.spacing), params.child_spacing);
+        for (var k = 0u; k < 8u; k++) {
+            let child_slot = world_slot(t.base + corner(k), params.child_window);
+            if dirty[params.child_tag_base + child_slot] == params.frame {
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        dirty[params.tag_base + slot] = params.frame;
+        gather_list[params.tag_base + atomicAdd(&gather_count[params.pass_index], 1u)] = slot;
+    }
+}
+
+// One thread per cascade, after its marking: arguments for gathering its
+// changed probes (and, for cascade 0, for projecting them to SH).
+@compute @workgroup_size(1, 1, 1)
+fn write_gather_args() {
+    let count = atomicLoad(&gather_count[params.pass_index]);
+    store_args(GATHER_ARGS + params.pass_index * 3u, count * params.octa_side * params.octa_side);
+    if params.pass_index == 0u {
+        store_args(SH_ARGS, count);
+    }
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -289,8 +354,11 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         }
         hits[hit_word(ray_slot, k)] = pack2x16unorm(vec2(first, second));
     }
-    if ray == 0u && has_children() {
-        child_masks[params.tag_base + slot] = reachable_children(world);
+    if ray == 0u {
+        dirty[params.tag_base + slot] = params.frame;
+        if has_children() {
+            child_masks[params.tag_base + slot] = reachable_children(world);
+        }
     }
 }
 
@@ -352,20 +420,20 @@ fn child_arc(child_slot: u32, ray: u32) -> vec4<f32> {
     return sum / weight;
 }
 
+// Over this frame's changed probes only (the gather list); the others keep
+// last frame's radiance, in this cascade's own buffer.
 @compute @workgroup_size(64, 1, 1)
 fn gather(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let id = vec3(linear_index(gid, groups), 0u, 0u);
+    let index = linear_index(gid, groups);
     let rays = params.octa_side * params.octa_side;
-    if id.x >= params.window * params.window * params.window * rays {
+    let entry = index / rays;
+    if entry >= atomicLoad(&gather_count[params.pass_index]) {
         return;
     }
-    let ray = id.x % rays;
-    let slot = id.x / rays;
+    let ray = index % rays;
+    let slot = gather_list[params.tag_base + entry];
+    let id = vec3(slot * rays + ray, 0u, 0u);
     let world = slot_world(slot, params.spacing, params.window);
-    if !probe_valid(world, params.spacing, params.radius) {
-        store_dst(id.x, vec4(0.0, 0.0, 0.0, 1.0));
-        return;
-    }
     if !has_children() {
         store_dst(id.x, cached_near(id.x, 0u, segment(world, ray, 0u)));
         return;
@@ -396,5 +464,56 @@ fn gather(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
         store_dst(id.x, result / total);
     } else {
         store_dst(id.x, merge(cached_near(id.x, 0u, segment(world, ray, 0u)), vec4(0.0, 0.0, 0.0, 1.0)));
+    }
+}
+
+// Real L2 spherical harmonics at unit direction d.
+fn sh9(d: vec3<f32>) -> array<f32, 9> {
+    return array<f32, 9>(
+        0.282095,
+        0.488603 * d.y, 0.488603 * d.z, 0.488603 * d.x,
+        1.092548 * d.x * d.y, 1.092548 * d.y * d.z, 0.315392 * (3.0 * d.z * d.z - 1.0),
+        1.092548 * d.x * d.z, 0.546274 * (d.x * d.x - d.y * d.y),
+    );
+}
+
+const SH_WORDS: u32 = 7u;
+const SUBSAMPLES_PER_DIRECTION: u32 = 16u;
+
+// After cascade 0's gather (cascade_dst holds it): per changed cascade-0 probe,
+// its radiance projected onto L2 spherical harmonics, the cells integrated
+// over their sub-directions, and convolved with the clamped cosine (Ramamoorthi
+// & Hanrahan: pi, 2pi/3, pi/4 per band), so shading evaluates irradiance
+// for any normal from 27 numbers instead of cosine-weighting 16 cells of 16
+// sub-directions per probe per pixel.
+@compute @workgroup_size(64, 1, 1)
+fn project_sh(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let entry = linear_index(gid, groups);
+    if entry >= atomicLoad(&gather_count[0]) {
+        return;
+    }
+    let slot = gather_list[params.tag_base + entry];
+    let rays = params.octa_side * params.octa_side;
+    var c: array<vec3<f32>, 9>;
+    for (var cell = 0u; cell < rays; cell++) {
+        let v = cascade_dst[slot * rays + cell];
+        let radiance = vec4(unpack2x16float(v.x), unpack2x16float(v.y)).rgb;
+        for (var i = 0u; i < SUBSAMPLES_PER_DIRECTION; i++) {
+            let sub = shading_subsamples[cell * SUBSAMPLES_PER_DIRECTION + i];
+            let y = sh9(sub.xyz);
+            for (var k = 0u; k < 9u; k++) {
+                c[k] += radiance * (y[k] * sub.w);
+            }
+        }
+    }
+    let band = array<f32, 9>(3.14159265, 2.0943951, 2.0943951, 2.0943951, 0.7853982, 0.7853982, 0.7853982, 0.7853982, 0.7853982);
+    var flat: array<f32, 28>;
+    for (var k = 0u; k < 9u; k++) {
+        flat[k * 3u] = c[k].x * band[k];
+        flat[k * 3u + 1u] = c[k].y * band[k];
+        flat[k * 3u + 2u] = c[k].z * band[k];
+    }
+    for (var w = 0u; w < SH_WORDS; w++) {
+        probe_sh[slot * SH_WORDS + w] = vec4(flat[w * 4u], flat[w * 4u + 1u], flat[w * 4u + 2u], flat[w * 4u + 3u]);
     }
 }
