@@ -15,16 +15,14 @@
 // light leaving it, which is the clipmap's unshadowed color times its sun
 // visibility (the shadow clipmap), sampled at the hit. Direct sunlight at
 // the shading point itself is computed there, not by the cascades.
-// Shading levels (layout.rs) run through the same passes: cascade 0 scaled
-// up, merging with a cascade whose directions are more than 4x finer.
 // Each dispatch describes its own probes and children in Params.
 
-#import s_rc::clipmap_sample::{Clipmap, OUTSIDE, march, sample_tier, tier_at}
+#import s_rc::clipmap_sample::{Clipmap, grid_uvw, in_grid, march, sample_sdf}
 
 struct Params {
     clipmap: Clipmap,
     camera: vec3<f32>,
-    // Cascades 0.., then shading levels 1.. (for the remarch counters).
+    // Cascade index (for the remarch counters).
     pass_index: u32,
     // Ray interval, m.
     interval: vec2<f32>,
@@ -38,8 +36,6 @@ struct Params {
     radius: f32,
     tag_base: u32,
     hit_base: u32,
-    // Where this pass's rays go in cascade_dst.
-    dst_base: u32,
     child_window: u32,
     child_radius: f32,
     child_tag_base: u32,
@@ -50,31 +46,25 @@ struct Params {
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var tier0: texture_3d<f32>;
-@group(0) @binding(2) var tier1: texture_3d<f32>;
-@group(0) @binding(3) var tier2: texture_3d<f32>;
-@group(0) @binding(4) var clipmap_sampler: sampler;
-// The clipmap's unshadowed surface color and sun visibility, per tier.
-@group(0) @binding(5) var color0: texture_3d<f32>;
-@group(0) @binding(6) var color1: texture_3d<f32>;
-@group(0) @binding(7) var color2: texture_3d<f32>;
-@group(0) @binding(8) var shadow0: texture_3d<f32>;
-@group(0) @binding(9) var shadow1: texture_3d<f32>;
-@group(0) @binding(10) var shadow2: texture_3d<f32>;
+@group(0) @binding(1) var sdf: texture_3d<f32>;
+@group(0) @binding(2) var clipmap_sampler: sampler;
+// The grid's unshadowed surface color and sun visibility.
+@group(0) @binding(3) var color: texture_3d<f32>;
+@group(0) @binding(4) var shadow: texture_3d<f32>;
 // The children's radiance (read) and this pass's (written): rgba16float
 // packed in two u32s.
-@group(0) @binding(11) var<storage, read> cascade_src: array<vec2<u32>>;
-@group(0) @binding(12) var<storage, read_write> cascade_dst: array<vec2<u32>>;
+@group(0) @binding(5) var<storage, read> cascade_src: array<vec2<u32>>;
+@group(0) @binding(6) var<storage, read_write> cascade_dst: array<vec2<u32>>;
 // Cached hit fractions, two unorm16 per word (1.0 = miss).
-@group(0) @binding(13) var<storage, read_write> hits: array<u32>;
+@group(0) @binding(7) var<storage, read_write> hits: array<u32>;
 // Which world probe each slot's cached hits belong to (0 = none).
-@group(0) @binding(14) var<storage, read_write> tags: array<u32>;
-@group(0) @binding(15) var<storage, read_write> remarched: array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read_write> tags: array<u32>;
+@group(0) @binding(9) var<storage, read_write> remarched: array<atomic<u32>>;
 // Solid angle of every octahedral cell, all cascades concatenated.
-@group(0) @binding(16) var<storage, read> solid_angles: array<f32>;
+@group(0) @binding(10) var<storage, read> solid_angles: array<f32>;
 // Per slot (indexed like tags): bit k set if trilinear child k is reachable,
 // i.e. in empty space with a clear straight line from this probe.
-@group(0) @binding(17) var<storage, read_write> child_masks: array<u32>;
+@group(0) @binding(11) var<storage, read_write> child_masks: array<u32>;
 
 // ------------------------------------------------------------ geometry
 
@@ -181,7 +171,7 @@ fn segment(world: vec3<i32>, ray: u32, k: u32) -> Segment {
 fn march_fraction(seg: Segment) -> f32 {
     let delta = seg.b - seg.a;
     let len = length(delta);
-    let m = march(params.clipmap, tier0, tier1, tier2, clipmap_sampler, seg.a, delta / len, len);
+    let m = march(params.clipmap, sdf, clipmap_sampler, seg.a, delta / len, len);
     if !m.hit || m.t >= len {
         return 1.0;
     }
@@ -189,29 +179,17 @@ fn march_fraction(seg: Segment) -> f32 {
 }
 
 // Light leaving the surface hit at p by a ray travelling along dir: color *
-// sun visibility, from the finest tier holding p. Looked up half a voxel
-// back along the ray, so the trilinear footprint stays on the side the ray
-// sees (voxels inside geometry carry no color; see clipmap_compose.wgsl).
+// sun visibility. Looked up half a voxel back along the ray, so the
+// trilinear footprint stays on the side the ray sees (voxels inside
+// geometry carry no color; see clipmap_compose.wgsl).
 fn surface_radiance(hit: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
-    let hit_tier = tier_at(params.clipmap, hit);
-    let p = hit - dir * 0.5 * params.clipmap.voxels[min(hit_tier, 2u)];
-    let tier = tier_at(params.clipmap, p);
-    let uvw = p / (params.clipmap.voxels[min(tier, 2u)] * f32(params.clipmap.resolutions[min(tier, 2u)]));
-    switch tier {
-        case 0u: {
-            return textureSampleLevel(color0, clipmap_sampler, uvw, 0.0).rgb
-                * textureSampleLevel(shadow0, clipmap_sampler, uvw, 0.0).r;
-        }
-        case 1u: {
-            return textureSampleLevel(color1, clipmap_sampler, uvw, 0.0).rgb
-                * textureSampleLevel(shadow1, clipmap_sampler, uvw, 0.0).r;
-        }
-        case 2u: {
-            return textureSampleLevel(color2, clipmap_sampler, uvw, 0.0).rgb
-                * textureSampleLevel(shadow2, clipmap_sampler, uvw, 0.0).r;
-        }
-        default: { return vec3(0.0); }
+    let p = hit - dir * 0.5 * params.clipmap.voxel;
+    if !in_grid(params.clipmap, p) {
+        return vec3(0.0);
     }
+    let uvw = grid_uvw(params.clipmap, p);
+    return textureSampleLevel(color, clipmap_sampler, uvw, 0.0).rgb
+        * textureSampleLevel(shadow, clipmap_sampler, uvw, 0.0).r;
 }
 
 fn hit_word(ray_slot: u32, k: u32) -> u32 {
@@ -250,7 +228,7 @@ fn load_src(i: u32) -> vec4<f32> {
 }
 
 fn store_dst(i: u32, r: vec4<f32>) {
-    cascade_dst[params.dst_base + i] = vec2(pack2x16float(r.xy), pack2x16float(r.zw));
+    cascade_dst[i] = vec2(pack2x16float(r.xy), pack2x16float(r.zw));
 }
 
 fn merge(near: vec4<f32>, far: vec4<f32>) -> vec4<f32> {
@@ -301,13 +279,12 @@ fn reachable_children(world: vec3<i32>) -> u32 {
     var mask = 0u;
     for (var k = 0u; k < 8u; k++) {
         let child = probe_center(t.base + corner(k), params.child_spacing);
-        let tier = tier_at(params.clipmap, child);
-        if tier == OUTSIDE || sample_tier(params.clipmap, tier0, tier1, tier2, clipmap_sampler, child, tier) <= 0.0 {
+        if !in_grid(params.clipmap, child) || sample_sdf(params.clipmap, sdf, clipmap_sampler, child) <= 0.0 {
             continue;
         }
         let delta = child - center;
         let len = length(delta);
-        if len < 1e-4 || !march(params.clipmap, tier0, tier1, tier2, clipmap_sampler, center, delta / len, len).hit {
+        if len < 1e-4 || !march(params.clipmap, sdf, clipmap_sampler, center, delta / len, len).hit {
             mask |= 1u << k;
         }
     }
@@ -327,7 +304,7 @@ fn commit(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
 
 // The children's radiance for parent ray `ray`, at child slot: the
 // solid-angle-weighted average of the child cells it covers, a ratio x ratio
-// block (2x2 between cascades; more for a shading level).
+// block (2x2 between cascades).
 fn child_arc(child_slot: u32, ray: u32) -> vec4<f32> {
     let side = params.octa_side;
     let child_side = params.child_octa_side;
@@ -344,20 +321,6 @@ fn child_arc(child_slot: u32, ray: u32) -> vec4<f32> {
         }
     }
     return sum / weight;
-}
-
-// For a shading level: its children's radiance averaged down to its own
-// directions, once per child probe (child_window^3 x rays), so the gather
-// reads one value per child instead of ratio^2. The gather then runs with
-// child_octa_side = octa_side on this output.
-@compute @workgroup_size(64, 1, 1)
-fn reduce(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let id = vec3(linear_index(gid, groups), 0u, 0u);
-    let rays = params.octa_side * params.octa_side;
-    if id.x >= params.child_window * params.child_window * params.child_window * rays {
-        return;
-    }
-    store_dst(id.x, child_arc(id.x / rays, id.x % rays));
 }
 
 @compute @workgroup_size(64, 1, 1)

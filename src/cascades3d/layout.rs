@@ -14,13 +14,6 @@ pub const OCTA_SIDE0: u32 = 4;
 pub const INTERVAL0: f32 = 1.5;
 /// Cascade-0 probes exist within this distance of the camera.
 pub const RADIUS0: f32 = 15.0;
-/// Shading levels: level l has probes every spacing(l) with cascade 0's
-/// directions, traces from 0 to INTERVAL0 * 2^l (cascade 0 scaled by 2^l)
-/// and merges with cascade l+1, whose interval starts there; it covers
-/// RADIUS0 * 2^l. Level 0 is cascade 0. Pixels shade from the finest level
-/// covering them, like the clipmap's tiers, so every level has the near
-/// field that cascade n > 0 lacks.
-pub const LEVELS: u32 = 1;
 /// Sub-samples per axis of each cascade-0 direction cell, for exact cosine
 /// weighting when shading from 16 directions.
 pub const SHADE_SUBSAMPLES: u32 = 4;
@@ -33,8 +26,6 @@ pub struct CascadeWindow {
     pub interval: [f32; 2],
     /// The cascade it merges with (its children); None for the top one.
     pub child: Option<u32>,
-    /// Shading levels > 0 only: offset of its rays in the levels buffer.
-    pub radiance_base: u32,
     /// Slots per axis (the window is size^3 probes, mapped toroidally).
     pub size: u32,
     /// Probes within this distance of the camera are live.
@@ -46,12 +37,6 @@ pub struct CascadeWindow {
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub cascades: Vec<CascadeWindow>,
-    /// Shading levels 1.. (level 0 is cascades[0]).
-    pub levels: Vec<CascadeWindow>,
-    /// Rays of all levels > 0, which sizes their radiance buffer.
-    pub level_rays: u64,
-    /// Largest shading level's children at its directions (the reduce pass).
-    pub reduced_rays: u64,
     pub tag_words: u64,
     pub hit_words: u64,
     /// Largest window in rays, which sizes the ping-pong radiance buffers.
@@ -94,7 +79,6 @@ impl CascadeWindow {
 
 impl Layout {
     pub fn new() -> Self {
-        let level_radius = |l: u32| RADIUS0 * (1 << l) as f32;
         // Even, and wide enough that the window centered on the camera's
         // probe holds every probe within `radius`.
         let window = |radius: f32, s: f32| 2 * ((radius / s).ceil() as u32 + 2);
@@ -112,17 +96,14 @@ impl Layout {
             let s = spacing(n);
             if n > 0 {
                 // Every live parent's 8 trilinear children lie within
-                // sqrt(3) child spacings of it; parents are cascade n-1
-                // and shading level n-1.
-                let parent = if n - 1 < LEVELS { radius.max(level_radius(n - 1)) } else { radius };
-                radius = parent + 1.75 * s;
+                // sqrt(3) child spacings of it.
+                radius += 1.75 * s;
             }
             let mut w = CascadeWindow {
                 spacing: s,
                 octa_side: octa_side(n),
                 interval: interval(n),
                 child: (n + 1 < CASCADES).then_some(n + 1),
-                radiance_base: 0,
                 size: window(radius, s),
                 radius,
                 tag_base: 0,
@@ -132,32 +113,8 @@ impl Layout {
             cascades.push(w);
         }
 
-        let mut levels = Vec::new();
-        let mut level_rays = 0u64;
-        for l in 1..LEVELS {
-            let s = spacing(l);
-            let mut w = CascadeWindow {
-                spacing: s,
-                octa_side: OCTA_SIDE0,
-                interval: [0.0, INTERVAL0 * (1 << l) as f32],
-                child: Some(l + 1),
-                radiance_base: level_rays as u32,
-                size: window(level_radius(l), s),
-                radius: level_radius(l),
-                tag_base: 0,
-                hit_base: 0,
-            };
-            allocate(&mut w);
-            level_rays += w.rays();
-            levels.push(w);
-        }
         let max_rays = cascades.iter().map(CascadeWindow::rays).max().unwrap_or(0);
-        let reduced_rays = levels
-            .iter()
-            .map(|w| (cascades[w.child.unwrap() as usize].size as u64).pow(3) * w.rays_per_probe() as u64)
-            .max()
-            .unwrap_or(0);
-        Self { cascades, levels, level_rays, reduced_rays, tag_words: tag_base, hit_words: hit_base, max_rays }
+        Self { cascades, tag_words: tag_base, hit_words: hit_base, max_rays }
     }
 }
 

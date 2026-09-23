@@ -29,9 +29,9 @@ use bevy::{
     },
 };
 
-use crate::cascades3d::layout::{LEVELS, Layout};
+use crate::cascades3d::layout::{Layout, SPACING0};
 use crate::cascades3d::{Cascades3dGpu, Cascades3dRenderSystems, LIGHTING_MODE};
-use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, SunLight, TIER_RESOLUTION, TIER_VOXEL, TIERS};
+use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, RESOLUTION, SunLight, VOXEL};
 use crate::scene3d::Scene3d;
 
 pub const WIDTH: u32 = 800;
@@ -61,22 +61,18 @@ pub struct SdfViewUniform {
     up: Vec3,
     mode: u32,
     forward: Vec3,
-    resolutions: UVec4,
-    origins: [IVec4; TIERS],
-    voxels: Vec4,
-    /// Per shading level: (window, tag_base, radiance_base, 0).
-    level_ints: [UVec4; MAX_LEVELS],
-    /// Per shading level: (radius, spacing, 0, 0).
-    level_floats: [Vec4; MAX_LEVELS],
+    resolution: u32,
+    origin: IVec4,
+    voxel: f32,
+    c0_window: u32,
+    c0_radius: f32,
+    c0_tag_base: u32,
+    spacing0: f32,
     sun_toward: Vec3,
     sun_k: f32,
     sun_irradiance: Vec3,
-    level_count: u32,
     shade_debug: u32,
 }
-
-/// Array size of the per-level uniform fields (sdf_view.wgsl).
-const MAX_LEVELS: usize = 4;
 
 /// Marks the full-window UI node showing the traced image.
 #[derive(Component)]
@@ -175,16 +171,8 @@ fn update_sdf_view_uniform(
     let (Ok((transform, projection)), Some(sun)) = (camera.single(), sun) else { return };
     let tan = (fov_y(projection) / 2.0).tan();
     let aspect = WIDTH as f32 / HEIGHT as f32;
-    let origins = std::array::from_fn(|t| state.origins[t].unwrap_or_default().extend(0));
     let mode = view.mode;
-    let layout = Layout::new();
-    let levels: Vec<_> = std::iter::once(layout.cascades[0]).chain(layout.levels.iter().copied()).collect();
-    let mut level_ints = [UVec4::ZERO; MAX_LEVELS];
-    let mut level_floats = [Vec4::ZERO; MAX_LEVELS];
-    for (l, w) in levels.iter().enumerate() {
-        level_ints[l] = UVec4::new(w.size, w.tag_base, w.radiance_base, 0);
-        level_floats[l] = Vec4::new(w.radius, w.spacing, 0.0, 0.0);
-    }
+    let c0 = Layout::new().cascades[0];
     view.uniform = SdfViewUniform {
         camera: transform.translation(),
         width: WIDTH,
@@ -193,12 +181,13 @@ fn update_sdf_view_uniform(
         up: transform.up().as_vec3() * tan,
         mode,
         forward: transform.forward().as_vec3(),
-        resolutions: UVec4::new(TIER_RESOLUTION[0] as u32, TIER_RESOLUTION[1] as u32, TIER_RESOLUTION[2] as u32, 0),
-        origins,
-        voxels: Vec4::new(TIER_VOXEL[0], TIER_VOXEL[1], TIER_VOXEL[2], 0.0),
-        level_ints,
-        level_floats,
-        level_count: LEVELS,
+        resolution: RESOLUTION as u32,
+        origin: state.origin.unwrap_or_default().extend(0),
+        voxel: VOXEL,
+        c0_window: c0.size,
+        c0_radius: c0.radius,
+        c0_tag_base: c0.tag_base,
+        spacing0: SPACING0,
         shade_debug: std::env::var("RC3D_SHADE_DEBUG").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
         sun_toward: sun.toward,
         sun_k: sun.k,
@@ -228,9 +217,7 @@ fn export(
         fov_y_degrees: fov_y(projection).to_degrees(),
         width: WIDTH,
         height: HEIGHT,
-        tiers: (0..TIERS)
-            .map(|t| (state.origins[t].unwrap_or_default(), TIER_VOXEL[t], TIER_RESOLUTION[t]))
-            .collect(),
+        grid: (state.origin.unwrap_or_default(), VOXEL, RESOLUTION),
     };
     if let Err(e) = std::fs::write(dir.join("scene.json"), scene.export_json(&camera)) {
         error!("export failed: {e}");
@@ -295,8 +282,6 @@ fn init_sdf_view_pipeline(mut commands: Commands, asset_server: Res<AssetServer>
             (
                 uniform_buffer::<SdfViewUniform>(false),
                 texture_3d(TextureSampleType::Float { filterable: true }),
-                texture_3d(TextureSampleType::Float { filterable: true }),
-                texture_3d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
                 texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
                 storage_buffer_sized(false, std::num::NonZero::new((WIDTH * HEIGHT * 4) as u64)),
@@ -305,11 +290,6 @@ fn init_sdf_view_pipeline(mut commands: Commands, asset_server: Res<AssetServer>
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_sized(false, std::num::NonZero::new((WIDTH * HEIGHT * 16) as u64)),
                 texture_3d(TextureSampleType::Float { filterable: true }),
-                texture_3d(TextureSampleType::Float { filterable: true }),
-                texture_3d(TextureSampleType::Float { filterable: true }),
-                texture_3d(TextureSampleType::Float { filterable: true }),
-                texture_3d(TextureSampleType::Float { filterable: true }),
-                storage_buffer_read_only_sized(false, None),
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 texture_3d(TextureSampleType::Float { filterable: true }),
             ),
@@ -362,9 +342,7 @@ fn trace_sdf_view(
         &pipeline_cache.get_bind_group_layout(&pipeline.layout),
         &BindGroupEntries::sequential((
             uniform_binding,
-            &textures.views[0],
-            &textures.views[1],
-            &textures.views[2],
+            &textures.sdf,
             &textures.sampler,
             &image.texture_view,
             depth.buffer.as_entire_buffer_binding(),
@@ -372,14 +350,9 @@ fn trace_sdf_view(
             cascades.tags.as_entire_buffer_binding(),
             cascades.shading_subsamples.as_entire_buffer_binding(),
             radiance.buffer.as_entire_buffer_binding(),
-            &textures.albedo[0],
-            &textures.albedo[1],
-            &textures.albedo[2],
-            &textures.shadow[0],
-            &textures.color[0],
-            cascades.radiance_levels.as_entire_buffer_binding(),
-            &textures.shadow[1],
-            &textures.shadow[2],
+            &textures.albedo,
+            &textures.shadow,
+            &textures.color,
         )),
     );
     let diagnostics = ctx.diagnostic_recorder();

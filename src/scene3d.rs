@@ -106,9 +106,10 @@ pub struct ExportCamera {
     pub fov_y_degrees: f32,
     pub width: u32,
     pub height: u32,
-    /// Clipmap tier windows at export time: (origin in voxels, voxel size,
-    /// resolution), so the comparison can attribute each hit to a tier.
-    pub tiers: Vec<(IVec3, f32, i32)>,
+    /// The SDF grid's window at export time: (origin in voxels, voxel size,
+    /// resolution). Exported as a one-entry "clipmap" list, the format the
+    /// depth comparison reads.
+    pub grid: (IVec3, f32, i32),
 }
 
 impl Scene3d {
@@ -126,11 +127,8 @@ impl Scene3d {
             v(self.sun.irradiance),
             self.sun.angular_radius.to_degrees()
         );
-        let tiers: Vec<String> = camera
-            .tiers
-            .iter()
-            .map(|(o, voxel, res)| format!("{{\"origin\": [{}, {}, {}], \"voxel\": {voxel}, \"resolution\": {res}}}", o.x, o.y, o.z))
-            .collect();
+        let (o, voxel, res) = camera.grid;
+        let grid = format!("{{\"origin\": [{}, {}, {}], \"voxel\": {voxel}, \"resolution\": {res}}}", o.x, o.y, o.z);
         format!(
             "{{\n  \"camera\": {{\"position\": {}, \"forward\": {}, \"up\": {}, \"fov_y_degrees\": {}, \"width\": {}, \"height\": {}}},\n  \"clipmap\": [{}],\n  \"boxes\": [\n    {}\n  ],\n  \"sun\": {sun}\n}}\n",
             v(camera.position),
@@ -139,7 +137,7 @@ impl Scene3d {
             camera.fov_y_degrees,
             camera.width,
             camera.height,
-            tiers.join(", "),
+            grid,
             boxes.join(",\n    "),
         )
     }

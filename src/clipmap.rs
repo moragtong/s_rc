@@ -1,14 +1,15 @@
-//! SDF geometry clipmap: three camera-centered tiers of 128^3 voxels at
-//! 12.5 cm / 50 cm / 2 m (spanning 16 / 64 / 256 m), each a 3D texture
-//! mapped toroidally: world voxel v lives in texel v mod 128. A sampler with
-//! repeat addressing then wraps trilinear filtering across the seam for free.
+//! SDF geometry grid: one camera-centered window of RESOLUTION^3 voxels at
+//! VOXEL (no tiers, no LOD), a 3D texture mapped toroidally: world voxel v
+//! lives in texel v mod RESOLUTION. A sampler with repeat addressing then
+//! wraps trilinear filtering across the seam for free. Beyond the window is
+//! empty space.
 //!
 //! Slice-triggered updates (ARCHITECTURE.md): when the camera crosses a
-//! tier's voxel boundary, only the newly revealed slabs are recomposed on
-//! the GPU, from the per-mesh SDF grids baked by `sdf_bake` (Lumen-style
-//! mesh distance fields). Everything else stays as it was.
+//! voxel boundary, only the newly revealed slabs are recomposed on the GPU,
+//! from the per-mesh SDF grids baked by `sdf_bake` (Lumen-style mesh
+//! distance fields). Everything else stays as it was.
 //!
-//! Besides distance, each tier holds, for voxels near surfaces:
+//! Besides distance, the grid holds, for voxels near surfaces:
 //! - albedo, from the nearest mesh's material;
 //! - unshadowed surface color: albedo / pi * sun irradiance * cos, with the
 //!   normal from the nearest mesh's own baked grid;
@@ -18,8 +19,8 @@
 //! separate is what lets it be re-marched on its own (time of day,
 //! double-buffered) without touching the rest.
 //!
-//! `K` throws the clipmap away and recomposes every tier, for checking
-//! that the scrolled result matches a fresh one.
+//! `K` throws the grid away and recomposes it, for checking that the
+//! scrolled result matches a fresh one.
 
 use std::path::Path;
 
@@ -41,23 +42,15 @@ use bevy::{
 use crate::scene3d::SceneBoxMesh;
 use crate::sdf_bake::{self, SdfGrid};
 
-pub const TIERS: usize = 3;
-/// Voxels per axis of each tier's window. (Tier 0 at 256, +-16 m, with
-/// RADIUS0 = 15 m and one shading level removes all LOD near the camera,
-/// for debugging.)
-pub const TIER_RESOLUTION: [i32; TIERS] = [256, 128, 128];
-pub const TIER_VOXEL: [f32; TIERS] = [0.125, 0.5, 2.0];
-/// The windows stay put until the camera is this far (m, on any axis) from
-/// tier 0's center; then every tier is recomposed around it from scratch,
-/// with its colour, sun visibility and all cascade hits. Between those, no
-/// cached result can go stale: the data under it doesn't change.
-pub const RECENTER_DISTANCE: f32 = 1.0;
+/// Voxels per axis: 256 at 12.5 cm spans 32 m, +-16 m around the camera.
+pub const RESOLUTION: i32 = 256;
+pub const VOXEL: f32 = 0.125;
 pub const FORMAT: TextureFormat = TextureFormat::R16Float;
 pub const ALBEDO_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 pub const COLOR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
 pub const SHADOW_FORMAT: TextureFormat = TextureFormat::R16Float;
-/// Per-mesh bake resolution: half the finest tier's voxel.
-const BAKE_VOXEL: f32 = 0.0625;
+/// Per-mesh bake resolution: half the grid's voxel.
+const BAKE_VOXEL: f32 = VOXEL / 2.0;
 const BAKE_PADDING: u32 = 3;
 const COMPOSE_SHADER: &str = "shaders/clipmap_compose.wgsl";
 const SHADOW_SHADER: &str = "shaders/clipmap_shadow.wgsl";
@@ -91,21 +84,17 @@ pub struct SunLight {
     pub k: f32,
 }
 
-/// The clipmap's tier windows at this frame, as the shaders' `Clipmap`.
+/// The grid's window at this frame, as the shaders' `Clipmap`.
 #[derive(ShaderType, Clone, Copy, Default)]
 pub struct ClipmapUniform {
-    pub origins: [IVec4; TIERS],
-    pub voxels: Vec4,
-    pub resolutions: UVec4,
+    pub origin: IVec4,
+    pub voxel: f32,
+    pub resolution: u32,
 }
 
 impl ClipmapUniform {
     pub fn from_state(state: &ClipmapState) -> Self {
-        Self {
-            origins: std::array::from_fn(|t| state.origins[t].unwrap_or_default().extend(0)),
-            voxels: Vec4::new(TIER_VOXEL[0], TIER_VOXEL[1], TIER_VOXEL[2], 0.0),
-            resolutions: UVec4::new(TIER_RESOLUTION[0] as u32, TIER_RESOLUTION[1] as u32, TIER_RESOLUTION[2] as u32, 0),
-        }
+        Self { origin: state.origin.unwrap_or_default().extend(0), voxel: VOXEL, resolution: RESOLUTION as u32 }
     }
 }
 
@@ -131,7 +120,7 @@ pub struct GpuInstance {
     pub albedo: Vec4,
 }
 
-/// An axis-aligned block of world voxels (in one tier's voxel units).
+/// An axis-aligned block of world voxels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Region {
     pub min: IVec3,
@@ -144,22 +133,22 @@ impl Region {
     }
 }
 
-/// Per-tier window origins (world voxel coordinates of each window's min
-/// corner) and the regions to recompose this frame.
+/// The window origin (world voxel coordinates of its min corner) and the
+/// regions to recompose this frame.
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct ClipmapState {
-    pub origins: [Option<IVec3>; TIERS],
-    pub pending: [Vec<Region>; TIERS],
-    /// Voxels recomposed per tier since the last log line.
-    pub updated_since_log: [u64; TIERS],
-    /// Bumping this recomposes every tier from scratch.
+    pub origin: Option<IVec3>,
+    pub pending: Vec<Region>,
+    /// Voxels recomposed since the last log line.
+    pub updated_since_log: u64,
+    /// Bumping this recomposes the whole grid from scratch.
     pub generation: u32,
     last_generation: Option<u32>,
 }
 
 impl ClipmapState {
-    pub fn tier_origin(tier: usize, camera: Vec3) -> IVec3 {
-        (camera / TIER_VOXEL[tier]).floor().as_ivec3() - IVec3::splat(TIER_RESOLUTION[tier] / 2)
+    pub fn window_origin(camera: Vec3) -> IVec3 {
+        (camera / VOXEL).floor().as_ivec3() - IVec3::splat(RESOLUTION / 2)
     }
 }
 
@@ -288,26 +277,15 @@ fn update_clipmap_state(
         return;
     };
     let state = &mut *state;
-    if let Some(origin) = state.origins[0] {
-        let center = (origin.as_vec3() + TIER_RESOLUTION[0] as f32 / 2.0) * TIER_VOXEL[0];
-        if (camera.translation() - center).abs().max_element() > RECENTER_DISTANCE {
-            state.generation += 1;
-        }
-    }
     if state.last_generation != Some(state.generation) {
-        state.origins = [None; TIERS];
+        state.origin = None;
         state.last_generation = Some(state.generation);
     }
-    for tier in 0..TIERS {
-        state.pending[tier].clear();
-        if state.origins[tier].is_none() {
-            let origin = ClipmapState::tier_origin(tier, camera.translation());
-            let regions = revealed_regions(None, origin, TIER_RESOLUTION[tier]);
-            state.updated_since_log[tier] += regions.iter().map(Region::voxels).sum::<u64>();
-            state.pending[tier] = regions;
-            state.origins[tier] = Some(origin);
-        }
-    }
+    let origin = ClipmapState::window_origin(camera.translation());
+    let regions = revealed_regions(state.origin, origin, RESOLUTION);
+    state.updated_since_log += regions.iter().map(Region::voxels).sum::<u64>();
+    state.pending = regions;
+    state.origin = Some(origin);
 }
 
 fn log_clipmap_updates(time: Res<Time>, mut timer: Local<Option<Timer>>, mut state: ResMut<ClipmapState>) {
@@ -315,26 +293,21 @@ fn log_clipmap_updates(time: Res<Time>, mut timer: Local<Option<Timer>>, mut sta
     if !timer.tick(time.delta()).just_finished() {
         return;
     }
-    let parts: Vec<String> = (0..TIERS)
-        .map(|t| {
-            let per_tier = TIER_RESOLUTION[t].pow(3) as f64;
-            format!("tier {t} {} ({:.1} windows)", state.updated_since_log[t], state.updated_since_log[t] as f64 / per_tier)
-        })
-        .collect();
-    info!("clipmap voxels recomposed in the last 2s: {}", parts.join(", "));
-    state.updated_since_log = [0; TIERS];
+    let voxels = state.updated_since_log;
+    info!("grid voxels recomposed in the last 2s: {voxels} ({:.2} windows)", voxels as f64 / RESOLUTION.pow(3) as f64);
+    state.updated_since_log = 0;
 }
 
 // ---------------------------------------------------------------- render
 
-/// The tier textures, shared with everything that traces or shades from the
-/// clipmap.
+/// The grid's textures, shared with everything that traces or shades from
+/// it.
 #[derive(Resource)]
 pub struct ClipmapTextures {
-    pub views: [TextureView; TIERS],
-    pub albedo: [TextureView; TIERS],
-    pub color: [TextureView; TIERS],
-    pub shadow: [TextureView; TIERS],
+    pub sdf: TextureView,
+    pub albedo: TextureView,
+    pub color: TextureView,
+    pub shadow: TextureView,
     pub sampler: Sampler,
 }
 
@@ -353,9 +326,8 @@ struct ComposeParams {
 struct ShadowParams {
     clipmap: ClipmapUniform,
     region_min: IVec3,
-    tier: u32,
-    region_size: UVec3,
     sun_k: f32,
+    region_size: UVec3,
     sun_toward: Vec3,
 }
 
@@ -365,10 +337,10 @@ struct ComposeGpu {
     compose: CachedComputePipelineId,
     shadow_layout: BindGroupLayoutDescriptor,
     shadow: CachedComputePipelineId,
-    storage: [TextureView; TIERS],
-    albedo_storage: [TextureView; TIERS],
-    color_storage: [TextureView; TIERS],
-    shadow_storage: [TextureView; TIERS],
+    storage: TextureView,
+    albedo_storage: TextureView,
+    color_storage: TextureView,
+    shadow_storage: TextureView,
 }
 
 #[derive(Resource)]
@@ -378,25 +350,23 @@ struct SdfSceneBuffers {
     instance_count: u32,
 }
 
-fn tier_textures(render_device: &RenderDevice, name: &str, format: TextureFormat) -> [TextureView; TIERS] {
-    std::array::from_fn(|tier| {
-        render_device
-            .create_texture(&TextureDescriptor {
-                label: Some(&format!("clipmap_{name}_{tier}")),
-                size: Extent3d {
-                    width: TIER_RESOLUTION[tier] as u32,
-                    height: TIER_RESOLUTION[tier] as u32,
-                    depth_or_array_layers: TIER_RESOLUTION[tier] as u32,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D3,
-                format,
-                usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-            .create_view(&TextureViewDescriptor::default())
-    })
+fn grid_texture(render_device: &RenderDevice, name: &str, format: TextureFormat) -> TextureView {
+    render_device
+        .create_texture(&TextureDescriptor {
+            label: Some(&format!("grid_{name}")),
+            size: Extent3d {
+                width: RESOLUTION as u32,
+                height: RESOLUTION as u32,
+                depth_or_array_layers: RESOLUTION as u32,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D3,
+            format,
+            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&TextureViewDescriptor::default())
 }
 
 fn init_clipmap_gpu(
@@ -405,10 +375,10 @@ fn init_clipmap_gpu(
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let views = tier_textures(&render_device, "sdf", FORMAT);
-    let albedo = tier_textures(&render_device, "albedo", ALBEDO_FORMAT);
-    let color = tier_textures(&render_device, "color", COLOR_FORMAT);
-    let shadow = tier_textures(&render_device, "shadow", SHADOW_FORMAT);
+    let sdf = grid_texture(&render_device, "sdf", FORMAT);
+    let albedo = grid_texture(&render_device, "albedo", ALBEDO_FORMAT);
+    let color = grid_texture(&render_device, "color", COLOR_FORMAT);
+    let shadow = grid_texture(&render_device, "shadow", SHADOW_FORMAT);
     let linear_repeat = render_device.create_sampler(&SamplerDescriptor {
         label: Some("clipmap_sampler"),
         address_mode_u: AddressMode::Repeat,
@@ -440,8 +410,6 @@ fn init_clipmap_gpu(
             (
                 uniform_buffer::<ShadowParams>(true),
                 texture_3d(TextureSampleType::Float { filterable: true }),
-                texture_3d(TextureSampleType::Float { filterable: true }),
-                texture_3d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
                 texture_storage_3d(SHADOW_FORMAT, StorageTextureAccess::WriteOnly),
             ),
@@ -464,12 +432,12 @@ fn init_clipmap_gpu(
         compose,
         shadow_layout,
         shadow: shadow_pipeline,
-        storage: views.clone(),
+        storage: sdf.clone(),
         albedo_storage: albedo.clone(),
         color_storage: color.clone(),
         shadow_storage: shadow.clone(),
     });
-    commands.insert_resource(ClipmapTextures { views, albedo, color, shadow, sampler: linear_repeat });
+    commands.insert_resource(ClipmapTextures { sdf, albedo, color, shadow, sampler: linear_repeat });
 }
 
 fn upload_sdf_scene(
@@ -535,13 +503,13 @@ fn compose_clipmap(
     };
     // Until a full window has been composed for this generation (e.g. the
     // pipelines were still compiling when the main world asked for it), the
-    // incremental regions aren't enough: compose whole windows instead.
+    // incremental regions aren't enough: compose the whole window instead.
     let full = *composed_generation != Some(state.generation);
-    let regions: [Vec<Region>; TIERS] = std::array::from_fn(|tier| match (full, state.origins[tier]) {
-        (true, Some(origin)) => vec![Region { min: origin, size: UVec3::splat(TIER_RESOLUTION[tier] as u32) }],
-        _ => state.pending[tier].clone(),
-    });
-    if regions.iter().all(Vec::is_empty) {
+    let regions = match (full, state.origin) {
+        (true, Some(origin)) => vec![Region { min: origin, size: UVec3::splat(RESOLUTION as u32) }],
+        _ => state.pending.clone(),
+    };
+    if regions.is_empty() {
         return;
     }
     if full {
@@ -552,27 +520,24 @@ fn compose_clipmap(
     shadow_params.clear();
     let clipmap = ClipmapUniform::from_state(&state);
     let mut jobs = Vec::new();
-    for tier in 0..TIERS {
-        for region in &regions[tier] {
-            let compose_offset = compose_params.push(&ComposeParams {
-                region_min: region.min,
-                instance_count: buffers.instance_count,
-                region_size: region.size,
-                resolution: TIER_RESOLUTION[tier] as u32,
-                sun_toward: sun.toward,
-                voxel: TIER_VOXEL[tier],
-                sun_irradiance: sun.irradiance,
-            });
-            let shadow_offset = shadow_params.push(&ShadowParams {
-                clipmap,
-                region_min: region.min,
-                tier: tier as u32,
-                region_size: region.size,
-                sun_k: sun.k,
-                sun_toward: sun.toward,
-            });
-            jobs.push((tier, *region, compose_offset, shadow_offset));
-        }
+    for region in &regions {
+        let compose_offset = compose_params.push(&ComposeParams {
+            region_min: region.min,
+            instance_count: buffers.instance_count,
+            region_size: region.size,
+            resolution: RESOLUTION as u32,
+            sun_toward: sun.toward,
+            voxel: VOXEL,
+            sun_irradiance: sun.irradiance,
+        });
+        let shadow_offset = shadow_params.push(&ShadowParams {
+            clipmap,
+            region_min: region.min,
+            sun_k: sun.k,
+            region_size: region.size,
+            sun_toward: sun.toward,
+        });
+        jobs.push((*region, compose_offset, shadow_offset));
     }
     compose_params.write_buffer(&render_device, &render_queue);
     shadow_params.write_buffer(&render_device, &render_queue);
@@ -581,35 +546,24 @@ fn compose_clipmap(
     };
 
     let compose_layout = pipeline_cache.get_bind_group_layout(&compose.compose_layout);
-    let compose_groups: [BindGroup; TIERS] = std::array::from_fn(|tier| {
-        render_device.create_bind_group(
-            "clipmap_compose",
-            &compose_layout,
-            &BindGroupEntries::sequential((
-                compose_binding.clone(),
-                buffers.instances.as_entire_buffer_binding(),
-                buffers.values.as_entire_buffer_binding(),
-                &compose.storage[tier],
-                &compose.albedo_storage[tier],
-                &compose.color_storage[tier],
-            )),
-        )
-    });
+    let compose_group = render_device.create_bind_group(
+        "clipmap_compose",
+        &compose_layout,
+        &BindGroupEntries::sequential((
+            compose_binding,
+            buffers.instances.as_entire_buffer_binding(),
+            buffers.values.as_entire_buffer_binding(),
+            &compose.storage,
+            &compose.albedo_storage,
+            &compose.color_storage,
+        )),
+    );
     let shadow_layout = pipeline_cache.get_bind_group_layout(&compose.shadow_layout);
-    let shadow_groups: [BindGroup; TIERS] = std::array::from_fn(|tier| {
-        render_device.create_bind_group(
-            "clipmap_shadow",
-            &shadow_layout,
-            &BindGroupEntries::sequential((
-                shadow_binding.clone(),
-                &textures.views[0],
-                &textures.views[1],
-                &textures.views[2],
-                &textures.sampler,
-                &compose.shadow_storage[tier],
-            )),
-        )
-    });
+    let shadow_group = render_device.create_bind_group(
+        "clipmap_shadow",
+        &shadow_layout,
+        &BindGroupEntries::sequential((shadow_binding, &textures.sdf, &textures.sampler, &compose.shadow_storage)),
+    );
 
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
@@ -620,8 +574,8 @@ fn compose_clipmap(
         let mut pass = ctx.command_encoder().begin_compute_pass(&descriptor);
         let span = diagnostics.pass_span(&mut pass, COMPOSE_SPAN);
         pass.set_pipeline(compose_pipeline);
-        for (tier, region, offset, _) in &jobs {
-            pass.set_bind_group(0, &compose_groups[*tier], &[*offset]);
+        for (region, offset, _) in &jobs {
+            pass.set_bind_group(0, &compose_group, &[*offset]);
             let groups = region.size.map(|s| s.div_ceil(4));
             pass.dispatch_workgroups(groups.x, groups.y, groups.z);
         }
@@ -631,8 +585,8 @@ fn compose_clipmap(
         let mut pass = ctx.command_encoder().begin_compute_pass(&descriptor);
         let span = diagnostics.pass_span(&mut pass, SHADOW_SPAN);
         pass.set_pipeline(shadow_pipeline);
-        for (tier, region, _, offset) in &jobs {
-            pass.set_bind_group(0, &shadow_groups[*tier], &[*offset]);
+        for (region, _, offset) in &jobs {
+            pass.set_bind_group(0, &shadow_group, &[*offset]);
             let groups = region.size.map(|s| s.div_ceil(4));
             pass.dispatch_workgroups(groups.x, groups.y, groups.z);
         }

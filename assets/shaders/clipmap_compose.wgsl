@@ -1,4 +1,4 @@
-// Recomposes one region of one clipmap tier from the baked per-mesh SDF
+// Recomposes one region of the SDF grid from the baked per-mesh SDF
 // grids: min over instances of each grid's trilinearly sampled distance.
 // Near surfaces it also writes the nearest instance's albedo and the
 // unshadowed surface color, albedo / pi * sun irradiance * cos, with the
@@ -28,7 +28,7 @@ struct ComposeParams {
 @group(0) @binding(0) var<uniform> params: ComposeParams;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
 @group(0) @binding(2) var<storage, read> values: array<f32>;
-@group(0) @binding(3) var tier: texture_storage_3d<r16float, write>;
+@group(0) @binding(3) var sdf_out: texture_storage_3d<r16float, write>;
 @group(0) @binding(4) var albedo_out: texture_storage_3d<rgba8unorm, write>;
 @group(0) @binding(5) var color_out: texture_storage_3d<rgba16float, write>;
 
@@ -86,7 +86,7 @@ fn compose(@builtin(global_invocation_id) id: vec3<u32>) {
             nearest = i;
         }
     }
-    textureStore(tier, texel, vec4(d, 0.0, 0.0, 0.0));
+    textureStore(sdf_out, texel, vec4(d, 0.0, 0.0, 0.0));
 
     var albedo = vec3(0.0);
     var color = vec3(0.0);
