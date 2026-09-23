@@ -42,10 +42,10 @@ use crate::scene3d::SceneBoxMesh;
 use crate::sdf_bake::{self, SdfGrid};
 
 pub const TIERS: usize = 3;
-/// Voxels per axis of each tier's window. Tier 0's 256 at 12.5 cm spans
-/// +-16 m, so within 15 m of the camera (cascade 0's reach) nothing changes
-/// resolution while debugging; the coarse tiers only cover beyond.
-pub const TIER_RESOLUTION: [i32; TIERS] = [256, 128, 128];
+/// Voxels per axis of each tier's window. (Tier 0 at 256, +-16 m, with
+/// RADIUS0 = 15 m and one shading level removes all LOD near the camera,
+/// for debugging.)
+pub const TIER_RESOLUTION: [i32; TIERS] = [128, 128, 128];
 pub const TIER_VOXEL: [f32; TIERS] = [0.125, 0.5, 2.0];
 pub const FORMAT: TextureFormat = TextureFormat::R16Float;
 pub const ALBEDO_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;

@@ -390,7 +390,8 @@ fn run_cascades(
     let reduce_from_b = bind_group(&gpu.radiance_b, &gpu.reduced);
     let writes_levels = bind_group(&gpu.reduced, &gpu.radiance_levels);
 
-    if *cleared_generation != Some(frame.generation) {
+    // DEBUG RC3D_RETRACE_ALL: drop every cached hit each frame.
+    if *cleared_generation != Some(frame.generation) || std::env::var("RC3D_RETRACE_ALL").is_ok() {
         ctx.command_encoder().clear_buffer(&gpu.tags, 0, None);
         *cleared_generation = Some(frame.generation);
     }
