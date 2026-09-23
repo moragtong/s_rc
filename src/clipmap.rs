@@ -38,6 +38,12 @@ pub const FORMAT: TextureFormat = TextureFormat::R16Float;
 const BAKE_VOXEL: f32 = 0.0625;
 const BAKE_PADDING: u32 = 3;
 const COMPOSE_SHADER: &str = "shaders/clipmap_compose.wgsl";
+/// Shared tracing code (`s_rc::clipmap_sample`), imported by every shader
+/// that traces the clipmap; must stay loaded for those imports to resolve.
+const SAMPLE_SHADER: &str = "shaders/clipmap_sample.wgsl";
+
+#[derive(Resource)]
+struct ClipmapShaderLibrary(#[allow(dead_code)] Handle<Shader>);
 
 pub struct ClipmapPlugin;
 
@@ -135,7 +141,9 @@ pub fn revealed_regions(old: Option<IVec3>, new: IVec3, res: i32) -> Vec<Region>
 
 impl Plugin for ClipmapPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ClipmapState>()
+        let library = app.world().resource::<AssetServer>().load(SAMPLE_SHADER);
+        app.insert_resource(ClipmapShaderLibrary(library))
+            .init_resource::<ClipmapState>()
             .add_plugins((
                 ExtractResourcePlugin::<SdfScene>::default(),
                 ExtractResourcePlugin::<ClipmapState>::default(),
