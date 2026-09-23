@@ -1,9 +1,11 @@
 //! Debug view of the SDF clipmap: sphere-traces it from the camera at a
 //! fixed 800x450 and shows the result full-window.
 //!
-//! Controls: `V` toggles the view, `N` cycles normals / tier / step count,
-//! `X` exports the scene, camera and traced depth to `target/rc3d/` for
-//! `tools/mitsuba_depth.py` to compare against Mitsuba.
+//! Controls: `V` toggles the view, `N` cycles normals / tier / step count /
+//! lighting from the 3D cascades, `X` exports the scene, camera and traced
+//! depth to `target/rc3d/` for `tools/mitsuba_depth.py` to compare against
+//! Mitsuba (and in lighting mode, the linear radiance image for
+//! `tools/mitsuba_compare.py`).
 
 use std::path::Path;
 
@@ -17,7 +19,7 @@ use bevy::{
         gpu_readback::{Readback, ReadbackComplete},
         render_asset::RenderAssets,
         render_resource::{
-            binding_types::{sampler, storage_buffer_sized, texture_3d, texture_storage_2d, uniform_buffer},
+            binding_types::{sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_3d, texture_storage_2d, uniform_buffer},
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -26,6 +28,8 @@ use bevy::{
     },
 };
 
+use crate::cascades3d::layout::{Layout, SPACING0};
+use crate::cascades3d::{Cascades3dGpu, Cascades3dRenderSystems, LIGHTING_MODE};
 use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, RESOLUTION, TIER_VOXEL, TIERS};
 use crate::scene3d::Scene3d;
 
@@ -42,6 +46,7 @@ pub struct SdfView {
     pub mode: u32,
     pub image: Handle<Image>,
     pub depth: Handle<ShaderBuffer>,
+    pub radiance: Handle<ShaderBuffer>,
     pub uniform: SdfViewUniform,
 }
 
@@ -57,6 +62,10 @@ pub struct SdfViewUniform {
     resolution: u32,
     origins: [IVec4; TIERS],
     voxels: Vec4,
+    c0_window: u32,
+    c0_radius: f32,
+    c0_tag_base: u32,
+    spacing0: f32,
 }
 
 /// Marks the full-window UI node showing the traced image.
@@ -75,7 +84,13 @@ impl Plugin for SdfViewPlugin {
         };
         render_app
             .add_systems(RenderStartup, init_sdf_view_pipeline)
-            .add_systems(Core3d, trace_sdf_view.after(ClipmapRenderSystems).in_set(Core3dSystems::Prepass));
+            .add_systems(
+                Core3d,
+                trace_sdf_view
+                    .after(ClipmapRenderSystems)
+                    .after(Cascades3dRenderSystems)
+                    .in_set(Core3dSystems::Prepass),
+            );
     }
 }
 
@@ -90,6 +105,7 @@ fn setup_sdf_view(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut
     image.texture_descriptor.usage |= TextureUsages::STORAGE_BINDING;
     let image = images.add(image);
     let depth = buffers.add(ShaderBuffer::with_size((WIDTH * HEIGHT * 4) as usize, RenderAssetUsages::RENDER_WORLD));
+    let radiance = buffers.add(ShaderBuffer::with_size((WIDTH * HEIGHT * 16) as usize, RenderAssetUsages::RENDER_WORLD));
 
     commands.spawn((
         Node { width: percent(100), height: percent(100), ..default() },
@@ -97,7 +113,7 @@ fn setup_sdf_view(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut
         Visibility::Hidden,
         SdfViewNode,
     ));
-    commands.insert_resource(SdfView { enabled: false, mode: 0, image, depth, uniform: default() });
+    commands.insert_resource(SdfView { enabled: false, mode: 0, image, depth, radiance, uniform: default() });
 }
 
 fn sdf_view_input(
@@ -113,7 +129,7 @@ fn sdf_view_input(
         view.enabled = !view.enabled;
     }
     if keys.just_pressed(KeyCode::KeyN) {
-        view.mode = (view.mode + 1) % 3;
+        view.mode = (view.mode + 1) % 4;
     }
     if keys.just_pressed(KeyCode::KeyX) {
         // The trace only runs while the view is on.
@@ -148,6 +164,7 @@ fn update_sdf_view_uniform(
     let aspect = WIDTH as f32 / HEIGHT as f32;
     let origins = std::array::from_fn(|t| state.origins[t].unwrap_or_default().extend(0));
     let mode = view.mode;
+    let c0 = Layout::new().cascades[0];
     view.uniform = SdfViewUniform {
         camera: transform.translation(),
         width: WIDTH,
@@ -159,6 +176,10 @@ fn update_sdf_view_uniform(
         resolution: RESOLUTION as u32,
         origins,
         voxels: Vec4::new(TIER_VOXEL[0], TIER_VOXEL[1], TIER_VOXEL[2], 0.0),
+        c0_window: c0.size,
+        c0_radius: c0.radius,
+        c0_tag_base: c0.tag_base,
+        spacing0: SPACING0,
     };
 }
 
@@ -191,6 +212,21 @@ fn export(
     if let Err(e) = std::fs::write(dir.join("scene.json"), scene.export_json(&camera)) {
         error!("export failed: {e}");
         return;
+    }
+    if view.mode == LIGHTING_MODE {
+        commands.spawn(Readback::buffer(view.radiance.clone())).observe(
+            |event: On<ReadbackComplete>, mut commands: Commands, mut handled: Local<bool>| {
+                if std::mem::replace(&mut *handled, true) {
+                    return;
+                }
+                commands.entity(event.entity).try_despawn();
+                let path = Path::new(EXPORT_DIR).join("radiance.f32");
+                match std::fs::write(&path, &event.data) {
+                    Ok(()) => info!("exported {} (rgba f32 per pixel, top row first)", path.display()),
+                    Err(e) => error!("export failed: {e}"),
+                }
+            },
+        );
     }
     commands.spawn(Readback::buffer(view.depth.clone())).observe(
         |event: On<ReadbackComplete>, mut commands: Commands, mut handled: Local<bool>| {
@@ -241,6 +277,10 @@ fn init_sdf_view_pipeline(mut commands: Commands, asset_server: Res<AssetServer>
                 sampler(SamplerBindingType::Filtering),
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
                 storage_buffer_sized(false, std::num::NonZero::new((WIDTH * HEIGHT * 4) as u64)),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_sized(false, std::num::NonZero::new((WIDTH * HEIGHT * 16) as u64)),
             ),
         ),
     );
@@ -259,6 +299,7 @@ fn trace_sdf_view(
     view: Res<SdfView>,
     pipeline: Res<SdfViewPipeline>,
     textures: Option<Res<ClipmapTextures>>,
+    cascades: Option<Res<Cascades3dGpu>>,
     pipeline_cache: Res<PipelineCache>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     gpu_buffers: Res<RenderAssets<GpuShaderBuffer>>,
@@ -269,11 +310,16 @@ fn trace_sdf_view(
     if !view.enabled {
         return;
     }
-    let (Some(textures), Some(compute), Some(image), Some(depth)) = (
+    if let CachedPipelineState::Err(e) = pipeline_cache.get_compute_pipeline_state(pipeline.pipeline) {
+        error_once!("sdf_view pipeline failed: {e}");
+    }
+    let (Some(textures), Some(cascades), Some(compute), Some(image), Some(depth), Some(radiance)) = (
         textures,
+        cascades,
         pipeline_cache.get_compute_pipeline(pipeline.pipeline),
         gpu_images.get(&view.image),
         gpu_buffers.get(&view.depth),
+        gpu_buffers.get(&view.radiance),
     ) else {
         return;
     };
@@ -291,6 +337,10 @@ fn trace_sdf_view(
             &textures.sampler,
             &image.texture_view,
             depth.buffer.as_entire_buffer_binding(),
+            cascades.radiance_a.as_entire_buffer_binding(),
+            cascades.tags.as_entire_buffer_binding(),
+            cascades.shading_subsamples.as_entire_buffer_binding(),
+            radiance.buffer.as_entire_buffer_binding(),
         )),
     );
     let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {

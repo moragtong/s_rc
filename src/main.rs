@@ -1,5 +1,6 @@
 mod hi_z;
 mod hi_z_debug;
+mod cascades3d;
 mod clipmap;
 mod scene3d;
 mod sdf_bake;
@@ -12,6 +13,7 @@ use bevy::render::renderer::RenderAdapterInfo;
 use hi_z::{HiZ, HiZPlugin};
 use hi_z_debug::HiZDebugPlugin;
 use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
+use cascades3d::Cascades3dPlugin;
 use clipmap::{ClipmapCamera, ClipmapPlugin};
 use scene3d::Scene3d;
 use sdf_view::{SceneResource, SdfViewPlugin};
@@ -28,6 +30,7 @@ fn main() {
             FreeCameraPlugin,
             ClipmapPlugin,
             SdfViewPlugin,
+            Cascades3dPlugin,
         ))
         .add_systems(Startup, (setup_scene, log_adapter_info))
         .run();
