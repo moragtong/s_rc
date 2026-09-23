@@ -40,6 +40,12 @@ def main():
     bias = lum(ours[both]).sum() / lum(ref[both]).sum() - 1
     print(f"lit in both: {both.sum()} px; black in ours but lit in Mitsuba (no live probe): "
           f"{(ref_lit & ~ours_lit).sum()} px")
+    # Light where Mitsuba has essentially none: the leak signal. Mitsuba's
+    # noise floor is well under 1% of the mean lit level at these spp.
+    dark_ref = lum(ref) < 0.01 * lum(ref[ref_lit]).mean()
+    leaking = dark_ref & (lum(ours) > 0.05 * lum(ref[ref_lit]).mean())
+    print(f"leak check: {leaking.sum()} px lit in ours (> 5% of the mean lit level) where Mitsuba is dark "
+          f"(< 1%); their mean {100 * lum(ours[leaking]).mean() / lum(ref[ref_lit]).mean() if leaking.any() else 0:.1f}% of it")
     print(f"relative RMSE {100 * rel_rmse:.1f}%, brightness {100 * bias:+.1f}% vs Mitsuba")
     # Per-pixel relative error distribution (luminance), ignoring very dark pixels.
     bright = both & (lum(ref) > 0.05 * lum(ref[both]).mean())

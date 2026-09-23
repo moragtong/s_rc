@@ -29,9 +29,11 @@ use layout::{CASCADES, INTERVAL0, Layout, OCTA_SIDE0, SPACING0, octa_side, rays_
 
 const SHADER: &str = "shaders/cascades3d.wgsl";
 const TRACE_SPAN: &str = "cascades3d_trace";
-const MAX_LIGHTS: usize = 16;
-/// SDF view mode that shows cascade lighting (and runs the cascades).
+pub const MAX_LIGHTS: usize = 16;
+/// First SDF view mode that shows lighting (exports radiance).
 pub const LIGHTING_MODE: u32 = 3;
+/// SDF view mode that shows light carried by the cascades (and runs them).
+pub const CASCADE_MODE: u32 = 4;
 
 pub struct Cascades3dPlugin;
 
@@ -103,7 +105,7 @@ fn update_frame(
     camera: Query<&GlobalTransform, With<ClipmapCamera>>,
 ) {
     let (Some(view), Ok(camera)) = (view, camera.single()) else { return };
-    frame.active = view.enabled && view.mode == LIGHTING_MODE;
+    frame.active = view.enabled && view.mode == CASCADE_MODE;
     frame.camera = camera.translation();
     frame.clipmap = ClipmapUniform::from_state(&state);
     frame.generation = state.generation;
@@ -176,7 +178,8 @@ pub struct Cascades3dGpu {
     /// Per cascade-0 direction cell: sub-directions and solid angles, for
     /// cosine-weighted irradiance.
     pub shading_subsamples: Buffer,
-    lights: Buffer,
+    /// The scene's lights; written once the scene is known.
+    pub lights: Buffer,
     angle_bases: Vec<u32>,
     bind_group_layout: BindGroupLayoutDescriptor,
     trace: CachedComputePipelineId,
@@ -305,7 +308,16 @@ fn run_cascades(
     mut ctx: RenderContext,
 ) {
     let (Some(gpu), Some(textures)) = (gpu, textures) else { return };
-    if !frame.active || frame.lights.is_empty() {
+    if frame.lights.is_empty() {
+        return;
+    }
+    // The SDF view's direct-light mode reads the lights too, so upload them
+    // regardless of whether the cascades run.
+    if *uploaded_lights != frame.lights.len() {
+        render_queue.write_buffer(&gpu.lights, 0, &bytes_of(&frame.lights));
+        *uploaded_lights = frame.lights.len();
+    }
+    if !frame.active {
         return;
     }
     for id in [gpu.trace, gpu.commit, gpu.gather] {
@@ -320,11 +332,6 @@ fn run_cascades(
     ) else {
         return;
     };
-    if *uploaded_lights != frame.lights.len() {
-        render_queue.write_buffer(&gpu.lights, 0, &bytes_of(&frame.lights));
-        *uploaded_lights = frame.lights.len();
-    }
-
     let windows = &gpu.layout.cascades;
     params.clear();
     let offsets: Vec<u32> = (0..CASCADES)

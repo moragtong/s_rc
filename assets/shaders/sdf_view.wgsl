@@ -14,8 +14,9 @@ struct View {
     height: u32,
     // Scaled by tan(fov_y / 2).
     up: vec3<f32>,
-    // 0 = normals, 1 = which tier answered, 2 = step count, 3 = lighting
-    // from the 3D cascades (white albedo, so irradiance / pi).
+    // 0 = normals, 1 = which tier answered, 2 = step count, 3 = direct
+    // light, analytic with SDF shadow rays, 4 = light carried by the 3D
+    // cascades (both white albedo, so irradiance / pi).
     mode: u32,
     forward: vec3<f32>,
     resolution: u32,
@@ -27,6 +28,13 @@ struct View {
     c0_radius: f32,
     c0_tag_base: u32,
     spacing0: f32,
+    light_count: u32,
+}
+
+struct Light {
+    center: vec3<f32>,
+    radius: f32,
+    radiance: vec3<f32>,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -43,6 +51,7 @@ struct View {
 @group(0) @binding(9) var<storage, read> shading_subsamples: array<vec4<f32>>;
 // Linear radiance per pixel in lighting mode, for exporting.
 @group(0) @binding(10) var<storage, read_write> radiance_out: array<vec4<f32>>;
+@group(0) @binding(11) var<storage, read> lights: array<Light>;
 
 const PI: f32 = 3.14159265359;
 const C0_DIRECTIONS: u32 = 16u;
@@ -63,6 +72,59 @@ fn normal_at(p: vec3<f32>, t: u32) -> vec3<f32> {
         sample_at(p + vec3(0.0, e, 0.0), t) - sample_at(p - vec3(0.0, e, 0.0), t),
         sample_at(p + vec3(0.0, 0.0, e), t) - sample_at(p - vec3(0.0, 0.0, e), t),
     ));
+}
+
+// --------------------------------------------------------- direct light
+
+// Fraction of a sphere light visible from `start`: hard shadow rays to 16
+// points spread over the light's disk as seen from there (a fixed
+// sunflower pattern, area-uniform), each using the clipmap's conservative
+// hit rule. An SDF cone-occlusion estimate was tried first and let faint
+// light through walls into fully shadowed regions: it only measures how
+// closely one central ray passes geometry, so it can't be made
+// conservative.
+const SHADOW_RAYS: u32 = 16u;
+
+fn shadow_visibility(start: vec3<f32>, light: Light) -> f32 {
+    let axis = normalize(light.center - start);
+    let helper = select(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), abs(axis.y) > 0.9);
+    let u = normalize(cross(axis, helper));
+    let v = cross(axis, u);
+    var visible = 0u;
+    for (var i = 0u; i < SHADOW_RAYS; i++) {
+        let r = sqrt((f32(i) + 0.5) / f32(SHADOW_RAYS)) * light.radius;
+        let angle = f32(i) * 2.39996323;
+        let target_point = light.center + r * (cos(angle) * u + sin(angle) * v);
+        let toward = target_point - start;
+        let len = length(toward);
+        let span = len - light.radius;
+        if span <= 0.0 || !march(clipmap(), tier0, tier1, tier2, clipmap_sampler, start, toward / len, span).hit {
+            visible += 1u;
+        }
+    }
+    return f32(visible) / f32(SHADOW_RAYS);
+}
+
+// Direct irradiance at p (normal n) from the sphere lights: a uniformly
+// emitting sphere of angular radius alpha above the horizon gives
+// radiance * pi * sin^2(alpha) * cos(theta), times its visible fraction
+// (shadow_visibility) along a ray toward its center, started clear of the
+// surface (past twice tier 0's hit threshold).
+fn direct_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let start = p + n * 0.07;
+    var e = vec3(0.0);
+    for (var i = 0u; i < view.light_count; i++) {
+        let light = lights[i];
+        let to_light = light.center - p;
+        let dist = length(to_light);
+        let cos_theta = dot(n, to_light / dist);
+        if dist <= light.radius || cos_theta <= 0.0 {
+            continue;
+        }
+        let sin_alpha = light.radius / dist;
+        e += light.radiance * PI * sin_alpha * sin_alpha * cos_theta * shadow_visibility(start, light);
+    }
+    return e;
 }
 
 // ------------------------------------------------ shading from cascades
@@ -151,13 +213,14 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
             case 2u: { color = vec3(f32(steps) / 64.0, f32(steps) / 256.0, 0.1); }
             default: {
                 let p = view.camera + dir * t;
-                let radiance = cascade_irradiance(p, normal_at(p, tier)) / PI;
+                let n = normal_at(p, tier);
+                let radiance = select(cascade_irradiance(p, n), direct_irradiance(p, n), view.mode == 3u) / PI;
                 radiance_out[id.y * view.width + id.x] = vec4(radiance, 1.0);
                 // Same tonemap as tools/mitsuba_render.py's PNG.
                 color = 1.0 - exp(-radiance * 2.0);
             }
         }
-    } else if view.mode == 3u {
+    } else if view.mode >= 3u {
         radiance_out[id.y * view.width + id.x] = vec4(0.0);
     }
     textureStore(output, id.xy, vec4(color, 1.0));
