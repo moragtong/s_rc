@@ -3,7 +3,7 @@
 // for a miss, which is what gets compared against Mitsuba's depth.
 // Tiers, sampling and hit thresholds come from clipmap_sample.wgsl.
 
-#import s_rc::clipmap_sample::{Clipmap, hit_eps, march, sample_tier, sun_visibility, tier_at}
+#import s_rc::clipmap_sample::{Clipmap, hit_eps, march, sample_tier, tier_at}
 
 struct View {
     camera: vec3<f32>,
@@ -56,6 +56,9 @@ struct View {
 @group(0) @binding(15) var color0: texture_3d<f32>;
 // Shading levels 1.. (16 directions per probe, each at its radiance_base).
 @group(0) @binding(16) var<storage, read> levels: array<vec2<u32>>;
+// The coarse tiers' sun visibility (shadow0 is binding 14).
+@group(0) @binding(17) var shadow1: texture_3d<f32>;
+@group(0) @binding(18) var shadow2: texture_3d<f32>;
 
 fn debug_shadow(p: vec3<f32>, t: u32) -> f32 {
     return textureSampleLevel(shadow0, clipmap_sampler, p / (view.voxels[0] * f32(view.resolutions[0])), 0.0).r;
@@ -89,17 +92,31 @@ fn normal_at(p: vec3<f32>, t: u32) -> vec3<f32> {
 // --------------------------------------------------------- direct light
 
 // Direct sun irradiance at p (normal n): irradiance * cos * visibility, the
-// visibility from the shared Aaltonen estimator, marched from just off the
-// surface (past twice tier 0's hit threshold). Computed per pixel here, not
-// read from the shadow clipmap: this is where sharp (e.g. dynamic) shadow
-// boundaries have to survive.
+// visibility read from the shadow clipmap (no per-pixel shadow rays), from
+// the finest tier holding p. Looked up half a voxel out along the normal,
+// so the trilinear footprint stays on the lit side: voxels inside a wall
+// may hold the other face's visibility.
 fn direct_sun(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let cos_theta = dot(n, view.sun_toward);
     if cos_theta <= 0.0 {
         return vec3(0.0);
     }
-    let visible = sun_visibility(clipmap(), tier0, tier1, tier2, clipmap_sampler, p + n * 0.07, view.sun_toward, view.sun_k);
-    return view.sun_irradiance * cos_theta * visible;
+    return view.sun_irradiance * cos_theta * shadow_at(p, n);
+}
+
+fn shadow_at(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    let hit_tier = tier_at(clipmap(), p);
+    if hit_tier == 3u {
+        return 1.0;
+    }
+    let q = p + n * 0.5 * view.voxels[hit_tier];
+    let t = min(tier_at(clipmap(), q), 2u);
+    let uvw = q / (view.voxels[t] * f32(view.resolutions[t]));
+    switch t {
+        case 0u: { return textureSampleLevel(shadow0, clipmap_sampler, uvw, 0.0).r; }
+        case 1u: { return textureSampleLevel(shadow1, clipmap_sampler, uvw, 0.0).r; }
+        default: { return textureSampleLevel(shadow2, clipmap_sampler, uvw, 0.0).r; }
+    }
 }
 
 // A march stops anywhere inside the hit threshold (25 cm in tier 1), at an

@@ -47,6 +47,11 @@ pub const TIERS: usize = 3;
 /// for debugging.)
 pub const TIER_RESOLUTION: [i32; TIERS] = [256, 128, 128];
 pub const TIER_VOXEL: [f32; TIERS] = [0.125, 0.5, 2.0];
+/// The windows stay put until the camera is this far (m, on any axis) from
+/// tier 0's center; then every tier is recomposed around it from scratch,
+/// with its colour, sun visibility and all cascade hits. Between those, no
+/// cached result can go stale: the data under it doesn't change.
+pub const RECENTER_DISTANCE: f32 = 1.0;
 pub const FORMAT: TextureFormat = TextureFormat::R16Float;
 pub const ALBEDO_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 pub const COLOR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
@@ -283,16 +288,25 @@ fn update_clipmap_state(
         return;
     };
     let state = &mut *state;
+    if let Some(origin) = state.origins[0] {
+        let center = (origin.as_vec3() + TIER_RESOLUTION[0] as f32 / 2.0) * TIER_VOXEL[0];
+        if (camera.translation() - center).abs().max_element() > RECENTER_DISTANCE {
+            state.generation += 1;
+        }
+    }
     if state.last_generation != Some(state.generation) {
         state.origins = [None; TIERS];
         state.last_generation = Some(state.generation);
     }
     for tier in 0..TIERS {
-        let origin = ClipmapState::tier_origin(tier, camera.translation());
-        let regions = revealed_regions(state.origins[tier], origin, TIER_RESOLUTION[tier]);
-        state.updated_since_log[tier] += regions.iter().map(Region::voxels).sum::<u64>();
-        state.pending[tier] = regions;
-        state.origins[tier] = Some(origin);
+        state.pending[tier].clear();
+        if state.origins[tier].is_none() {
+            let origin = ClipmapState::tier_origin(tier, camera.translation());
+            let regions = revealed_regions(None, origin, TIER_RESOLUTION[tier]);
+            state.updated_since_log[tier] += regions.iter().map(Region::voxels).sum::<u64>();
+            state.pending[tier] = regions;
+            state.origins[tier] = Some(origin);
+        }
     }
 }
 

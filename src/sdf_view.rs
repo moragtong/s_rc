@@ -310,6 +310,8 @@ fn init_sdf_view_pipeline(mut commands: Commands, asset_server: Res<AssetServer>
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 storage_buffer_read_only_sized(false, None),
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
             ),
         ),
     );
@@ -376,6 +378,8 @@ fn trace_sdf_view(
             &textures.shadow[0],
             &textures.color[0],
             cascades.radiance_levels.as_entire_buffer_binding(),
+            &textures.shadow[1],
+            &textures.shadow[2],
         )),
     );
     let diagnostics = ctx.diagnostic_recorder();

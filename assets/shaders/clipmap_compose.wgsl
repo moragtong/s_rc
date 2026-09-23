@@ -34,9 +34,12 @@ struct ComposeParams {
 
 const PI: f32 = 3.14159265359;
 // Voxels within this many voxels of a surface get albedo and color: enough
-// that trilinear lookups at hit points (within half a voxel of the
-// surface) only mix voxels that have them.
-const SURFACE_BAND: f32 = 1.5;
+// that trilinear lookups only mix voxels that have them. Lookups sit up to
+// about 0.75 voxel off a surface (half a voxel out, plus the hit threshold)
+// and reach one voxel further; at 1.5, the second voxel row out held the
+// defaults (color 0, visibility 1), blended in by how far off a march
+// stopped: rings, and sunlight in shadowed rooms.
+const SURFACE_BAND: f32 = 2.5;
 
 fn grid_value(inst: Instance, cell: vec3<i32>) -> f32 {
     let c = vec3<u32>(clamp(cell, vec3(0), vec3<i32>(inst.dims) - 1));

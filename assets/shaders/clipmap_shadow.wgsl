@@ -23,7 +23,7 @@ struct ShadowParams {
 @group(0) @binding(5) var shadow_out: texture_storage_3d<r16float, write>;
 
 // Same band as the color in clipmap_compose.wgsl.
-const SURFACE_BAND: f32 = 1.5;
+const SURFACE_BAND: f32 = 2.5;
 // Start the march this far off the surface: past tier 0's hit threshold
 // (a quarter of 12.5 cm), as for camera pixels.
 const START_OFFSET: f32 = 0.07;
