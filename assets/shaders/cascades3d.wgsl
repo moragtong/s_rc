@@ -226,6 +226,13 @@ fn cached_near(ray_slot: u32, k: u32, seg: Segment) -> vec4<f32> {
     if fraction >= 1.0 {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
+    // Hit at its start: the segment begins inside (or on) geometry, e.g. a
+    // cascade's interval starting inside a wall. It sees nothing. Looking
+    // up color there read the wall's far face through the trilinear
+    // footprint: at 6.25 cm voxels, half the indirect light was this.
+    if fraction <= 0.0 {
+        return vec4(0.0);
+    }
     return vec4(surface_radiance(mix(seg.a, seg.b, fraction), normalize(seg.b - seg.a)), 0.0);
 }
 

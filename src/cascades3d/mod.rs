@@ -132,7 +132,7 @@ struct Params {
     child_radius: f32,
     child_tag_base: u32,
     child_angle_base: u32,
-    /// DEBUG: 1 = cascade 0 without its far field (RC3D_C0_NEAR_ONLY).
+    /// DEBUG: 1 = without its far field (RC3D_C0_NEAR_ONLY, RC3D_CUT).
     debug: u32,
 }
 
@@ -337,7 +337,9 @@ fn run_cascades(
             child_radius: child.radius,
             child_tag_base: child.tag_base,
             child_angle_base: own.child.map(|c| gpu.angle_bases[c as usize]).unwrap_or(0),
-            debug: (i == 0 && std::env::var("RC3D_C0_NEAR_ONLY").is_ok()) as u32,
+            // RC3D_C0_NEAR_ONLY, or RC3D_CUT=k: cascade k ignores its children.
+            debug: ((i == 0 && std::env::var("RC3D_C0_NEAR_ONLY").is_ok())
+                || std::env::var("RC3D_CUT").ok().and_then(|s| s.parse::<usize>().ok()) == Some(i)) as u32,
         }
     };
     let mut offsets = Vec::new();
