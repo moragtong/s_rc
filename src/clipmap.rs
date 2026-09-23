@@ -42,7 +42,10 @@ use crate::scene3d::SceneBoxMesh;
 use crate::sdf_bake::{self, SdfGrid};
 
 pub const TIERS: usize = 3;
-pub const RESOLUTION: i32 = 128;
+/// Voxels per axis of each tier's window. Tier 0's 256 at 12.5 cm spans
+/// +-16 m, so within 15 m of the camera (cascade 0's reach) nothing changes
+/// resolution while debugging; the coarse tiers only cover beyond.
+pub const TIER_RESOLUTION: [i32; TIERS] = [256, 128, 128];
 pub const TIER_VOXEL: [f32; TIERS] = [0.125, 0.5, 2.0];
 pub const FORMAT: TextureFormat = TextureFormat::R16Float;
 pub const ALBEDO_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
@@ -88,7 +91,7 @@ pub struct SunLight {
 pub struct ClipmapUniform {
     pub origins: [IVec4; TIERS],
     pub voxels: Vec4,
-    pub resolution: u32,
+    pub resolutions: UVec4,
 }
 
 impl ClipmapUniform {
@@ -96,7 +99,7 @@ impl ClipmapUniform {
         Self {
             origins: std::array::from_fn(|t| state.origins[t].unwrap_or_default().extend(0)),
             voxels: Vec4::new(TIER_VOXEL[0], TIER_VOXEL[1], TIER_VOXEL[2], 0.0),
-            resolution: RESOLUTION as u32,
+            resolutions: UVec4::new(TIER_RESOLUTION[0] as u32, TIER_RESOLUTION[1] as u32, TIER_RESOLUTION[2] as u32, 0),
         }
     }
 }
@@ -151,7 +154,7 @@ pub struct ClipmapState {
 
 impl ClipmapState {
     pub fn tier_origin(tier: usize, camera: Vec3) -> IVec3 {
-        (camera / TIER_VOXEL[tier]).floor().as_ivec3() - IVec3::splat(RESOLUTION / 2)
+        (camera / TIER_VOXEL[tier]).floor().as_ivec3() - IVec3::splat(TIER_RESOLUTION[tier] / 2)
     }
 }
 
@@ -286,7 +289,7 @@ fn update_clipmap_state(
     }
     for tier in 0..TIERS {
         let origin = ClipmapState::tier_origin(tier, camera.translation());
-        let regions = revealed_regions(state.origins[tier], origin, RESOLUTION);
+        let regions = revealed_regions(state.origins[tier], origin, TIER_RESOLUTION[tier]);
         state.updated_since_log[tier] += regions.iter().map(Region::voxels).sum::<u64>();
         state.pending[tier] = regions;
         state.origins[tier] = Some(origin);
@@ -298,9 +301,11 @@ fn log_clipmap_updates(time: Res<Time>, mut timer: Local<Option<Timer>>, mut sta
     if !timer.tick(time.delta()).just_finished() {
         return;
     }
-    let per_tier = RESOLUTION.pow(3) as f64;
     let parts: Vec<String> = (0..TIERS)
-        .map(|t| format!("tier {t} {} ({:.1} windows)", state.updated_since_log[t], state.updated_since_log[t] as f64 / per_tier))
+        .map(|t| {
+            let per_tier = TIER_RESOLUTION[t].pow(3) as f64;
+            format!("tier {t} {} ({:.1} windows)", state.updated_since_log[t], state.updated_since_log[t] as f64 / per_tier)
+        })
         .collect();
     info!("clipmap voxels recomposed in the last 2s: {}", parts.join(", "));
     state.updated_since_log = [0; TIERS];
@@ -365,9 +370,9 @@ fn tier_textures(render_device: &RenderDevice, name: &str, format: TextureFormat
             .create_texture(&TextureDescriptor {
                 label: Some(&format!("clipmap_{name}_{tier}")),
                 size: Extent3d {
-                    width: RESOLUTION as u32,
-                    height: RESOLUTION as u32,
-                    depth_or_array_layers: RESOLUTION as u32,
+                    width: TIER_RESOLUTION[tier] as u32,
+                    height: TIER_RESOLUTION[tier] as u32,
+                    depth_or_array_layers: TIER_RESOLUTION[tier] as u32,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
@@ -519,7 +524,7 @@ fn compose_clipmap(
     // incremental regions aren't enough: compose whole windows instead.
     let full = *composed_generation != Some(state.generation);
     let regions: [Vec<Region>; TIERS] = std::array::from_fn(|tier| match (full, state.origins[tier]) {
-        (true, Some(origin)) => vec![Region { min: origin, size: UVec3::splat(RESOLUTION as u32) }],
+        (true, Some(origin)) => vec![Region { min: origin, size: UVec3::splat(TIER_RESOLUTION[tier] as u32) }],
         _ => state.pending[tier].clone(),
     });
     if regions.iter().all(Vec::is_empty) {
@@ -539,7 +544,7 @@ fn compose_clipmap(
                 region_min: region.min,
                 instance_count: buffers.instance_count,
                 region_size: region.size,
-                resolution: RESOLUTION as u32,
+                resolution: TIER_RESOLUTION[tier] as u32,
                 sun_toward: sun.toward,
                 voxel: TIER_VOXEL[tier],
                 sun_irradiance: sun.irradiance,

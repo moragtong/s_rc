@@ -8,7 +8,8 @@ struct Clipmap {
     // Each tier's window origin (world voxel coordinates) in xyz.
     origins: array<vec4<i32>, 3>,
     voxels: vec4<f32>,
-    resolution: u32,
+    // Voxels per axis of each tier's window.
+    resolutions: vec4<u32>,
 }
 
 // Hit thresholds are a fraction of each tier's voxel, erring toward
@@ -40,7 +41,7 @@ fn in_tier(clipmap: Clipmap, p: vec3<f32>, t: u32) -> bool {
     let voxel = clipmap.voxels[t];
     let origin = vec3<f32>(clipmap.origins[t].xyz);
     let lo = (origin + 1.5) * voxel;
-    let hi = (origin + f32(clipmap.resolution) - 1.5) * voxel;
+    let hi = (origin + f32(clipmap.resolutions[t]) - 1.5) * voxel;
     return all(p > lo) && all(p < hi);
 }
 
@@ -65,7 +66,7 @@ fn sample_tier(
     p: vec3<f32>,
     t: u32,
 ) -> f32 {
-    let uvw = p / (clipmap.voxels[t] * f32(clipmap.resolution));
+    let uvw = p / (clipmap.voxels[t] * f32(clipmap.resolutions[t]));
     switch t {
         case 0u: { return textureSampleLevel(tier0, s, uvw, 0.0).r; }
         case 1u: { return textureSampleLevel(tier1, s, uvw, 0.0).r; }

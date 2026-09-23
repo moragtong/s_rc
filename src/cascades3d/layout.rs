@@ -12,15 +12,16 @@ pub const OCTA_SIDE0: u32 = 4;
 /// End of cascade 0's interval, m; cascade n covers
 /// [INTERVAL0 * 2^(n-1), INTERVAL0 * 2^n] (cascade 0 from 0).
 pub const INTERVAL0: f32 = 1.5;
-/// Cascade-0 probes exist within this distance of the camera.
-pub const RADIUS0: f32 = 8.0;
+/// Cascade-0 probes exist within this distance of the camera. 15 m, with
+/// a single shading level, while debugging: no LOD anywhere near the room.
+pub const RADIUS0: f32 = 15.0;
 /// Shading levels: level l has probes every spacing(l) with cascade 0's
 /// directions, traces from 0 to INTERVAL0 * 2^l (cascade 0 scaled by 2^l)
 /// and merges with cascade l+1, whose interval starts there; it covers
 /// RADIUS0 * 2^l. Level 0 is cascade 0. Pixels shade from the finest level
 /// covering them, like the clipmap's tiers, so every level has the near
 /// field that cascade n > 0 lacks.
-pub const LEVELS: u32 = 2;
+pub const LEVELS: u32 = 1;
 /// Sub-samples per axis of each cascade-0 direction cell, for exact cosine
 /// weighting when shading from 16 directions.
 pub const SHADE_SUBSAMPLES: u32 = 4;

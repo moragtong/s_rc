@@ -38,7 +38,7 @@ fn shadow(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let v = params.region_min + vec3<i32>(id);
-    let res = i32(params.clipmap.resolution);
+    let res = i32(params.clipmap.resolutions[params.tier]);
     let texel = (v % res + res) % res;
     let voxel = params.clipmap.voxels[params.tier];
     let pos = (vec3<f32>(v) + 0.5) * voxel;

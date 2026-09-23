@@ -20,7 +20,7 @@ struct View {
     // sun irradiance, 7 = shadow clipmap, 8 = color clipmap (at the hit).
     mode: u32,
     forward: vec3<f32>,
-    resolution: u32,
+    resolutions: vec4<u32>,
     // Each tier's window origin (world voxel coordinates) in xyz.
     origins: array<vec4<i32>, 3>,
     voxels: vec4<f32>,
@@ -57,11 +57,11 @@ struct View {
 @group(0) @binding(16) var<storage, read> levels: array<vec2<u32>>;
 
 fn debug_shadow(p: vec3<f32>, t: u32) -> f32 {
-    return textureSampleLevel(shadow0, clipmap_sampler, p / (view.voxels[0] * f32(view.resolution)), 0.0).r;
+    return textureSampleLevel(shadow0, clipmap_sampler, p / (view.voxels[0] * f32(view.resolutions[0])), 0.0).r;
 }
 
 fn debug_color(p: vec3<f32>, t: u32) -> vec3<f32> {
-    return textureSampleLevel(color0, clipmap_sampler, p / (view.voxels[0] * f32(view.resolution)), 0.0).rgb;
+    return textureSampleLevel(color0, clipmap_sampler, p / (view.voxels[0] * f32(view.resolutions[0])), 0.0).rgb;
 }
 
 const PI: f32 = 3.14159265359;
@@ -69,7 +69,7 @@ const C0_DIRECTIONS: u32 = 16u;
 const SUBSAMPLES_PER_DIRECTION: u32 = 16u;
 
 fn clipmap() -> Clipmap {
-    return Clipmap(view.origins, view.voxels, view.resolution);
+    return Clipmap(view.origins, view.voxels, view.resolutions);
 }
 
 fn sample_at(p: vec3<f32>, t: u32) -> f32 {
@@ -117,7 +117,7 @@ fn on_threshold(hit: vec3<f32>, t: u32) -> vec3<f32> {
 }
 
 fn albedo_at(p: vec3<f32>, t: u32) -> vec3<f32> {
-    let uvw = p / (view.voxels[t] * f32(view.resolution));
+    let uvw = p / (view.voxels[t] * f32(view.resolutions[t]));
     switch t {
         case 0u: { return textureSampleLevel(albedo0, clipmap_sampler, uvw, 0.0).rgb; }
         case 1u: { return textureSampleLevel(albedo1, clipmap_sampler, uvw, 0.0).rgb; }

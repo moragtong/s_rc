@@ -194,7 +194,7 @@ fn surface_radiance(hit: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let hit_tier = tier_at(params.clipmap, hit);
     let p = hit - dir * 0.5 * params.clipmap.voxels[min(hit_tier, 2u)];
     let tier = tier_at(params.clipmap, p);
-    let uvw = p / (params.clipmap.voxels[min(tier, 2u)] * f32(params.clipmap.resolution));
+    let uvw = p / (params.clipmap.voxels[min(tier, 2u)] * f32(params.clipmap.resolutions[min(tier, 2u)]));
     switch tier {
         case 0u: {
             return textureSampleLevel(color0, clipmap_sampler, uvw, 0.0).rgb

@@ -31,7 +31,7 @@ use bevy::{
 
 use crate::cascades3d::layout::{LEVELS, Layout};
 use crate::cascades3d::{Cascades3dGpu, Cascades3dRenderSystems, LIGHTING_MODE};
-use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, RESOLUTION, SunLight, TIER_VOXEL, TIERS};
+use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, SunLight, TIER_RESOLUTION, TIER_VOXEL, TIERS};
 use crate::scene3d::Scene3d;
 
 pub const WIDTH: u32 = 800;
@@ -61,7 +61,7 @@ pub struct SdfViewUniform {
     up: Vec3,
     mode: u32,
     forward: Vec3,
-    resolution: u32,
+    resolutions: UVec4,
     origins: [IVec4; TIERS],
     voxels: Vec4,
     /// Per shading level: (window, tag_base, radiance_base, 0).
@@ -192,7 +192,7 @@ fn update_sdf_view_uniform(
         up: transform.up().as_vec3() * tan,
         mode,
         forward: transform.forward().as_vec3(),
-        resolution: RESOLUTION as u32,
+        resolutions: UVec4::new(TIER_RESOLUTION[0] as u32, TIER_RESOLUTION[1] as u32, TIER_RESOLUTION[2] as u32, 0),
         origins,
         voxels: Vec4::new(TIER_VOXEL[0], TIER_VOXEL[1], TIER_VOXEL[2], 0.0),
         level_ints,
@@ -227,7 +227,7 @@ fn export(
         width: WIDTH,
         height: HEIGHT,
         tiers: (0..TIERS)
-            .map(|t| (state.origins[t].unwrap_or_default(), TIER_VOXEL[t], RESOLUTION))
+            .map(|t| (state.origins[t].unwrap_or_default(), TIER_VOXEL[t], TIER_RESOLUTION[t]))
             .collect(),
     };
     if let Err(e) = std::fs::write(dir.join("scene.json"), scene.export_json(&camera)) {
