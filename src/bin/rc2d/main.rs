@@ -85,6 +85,11 @@
 //! | bilinear fix | 1 px | 0.5 | 2      | 7.67%     | 11.77%       | -0.7%              |
 //! | bilinear fix | 2 px | 1   | 2      | 7.69%     | 15.75%       | -1.8%              |
 //!
+//! (After moving the bounce lookup half a probe spacing off the surface,
+//! see bounce_radiance: default in-room brightness -1.2%. Wall pixels now
+//! show their nearest face's lit color; wall faces: 26.4% rel. RMSE, -6.4%
+//! brightness vs reference.)
+//!
 //! The plain merge leaks the outside lights' color through the 2px walls
 //! onto their inner faces, and that leaked light then bounces around the
 //! room. With the bilinear fix and side-of-surface bounce lookup, no
@@ -119,9 +124,13 @@ use bevy::{
     window::WindowResolution,
 };
 
+mod room;
+
 const SIZE: u32 = 512;
 const _: () = assert!(SIZE.is_power_of_two(), "probe grids assume exact halving");
 const SHADER_PATH: &str = "shaders/rc2d.wgsl";
+/// Imported by the main shader; must stay loaded for its imports to resolve.
+const SHADER_LIBRARIES: [&str; 2] = ["shaders/rc2d_sdf.wgsl", room::SHADER_PATH];
 /// Every cascade stores (W/(s0 2^n))(H/(s0 2^n)) probes * 4^(n+1) rays =
 /// 4WH/s0^2 entries. Buffers are sized for s0 = 1, the largest case.
 const CASCADE_ENTRIES: u64 = 4 * SIZE as u64 * SIZE as u64;
@@ -132,19 +141,15 @@ const CASCADE_ENTRY_BYTES: u64 = 8;
 const MAX_CASCADES: u32 = 9;
 /// Two vec4<f32> per pixel; layout in the shader's `error` binding.
 const ERROR_BYTES_PER_PIXEL: u64 = 32;
-/// Room scene: the empty inside of the room, walls excluded. Must match
-/// `room_scene` in the shader (wall centers x 180..460, y 140..420, 2px).
-const ROOM_INTERIOR: Rect = Rect {
-    min: Vec2::new(182.0, 142.0),
-    max: Vec2::new(458.0, 418.0),
-};
-
 fn scene_light_start(scene: u32) -> Vec2 {
     match scene {
-        1 => Vec2::new(130.0, 230.0),
+        room::SCENE_ID => room::LIGHT_START,
         _ => Vec2::new(110.0, 400.0),
     }
 }
+
+#[derive(Resource)]
+struct ShaderLibraries(#[allow(dead_code)] Vec<Handle<Shader>>);
 
 fn main() {
     App::new()
@@ -218,7 +223,7 @@ impl Default for Rc2dSettings {
 
 impl Rc2dSettings {
     fn effective_bounces(&self) -> u32 {
-        if self.scene == 1 { self.bounces } else { 0 }
+        if self.scene == room::SCENE_ID { self.bounces } else { 0 }
     }
 
     /// Everything the cascades' output depends on; a change restarts the
@@ -309,6 +314,7 @@ impl Plugin for Rc2dPlugin {
 
 fn setup(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
@@ -342,6 +348,10 @@ fn setup(
         bounce_src: buffer(CASCADE_ENTRIES * CASCADE_ENTRY_BYTES),
         display: display.clone(),
     });
+
+    commands.insert_resource(ShaderLibraries(
+        SHADER_LIBRARIES.iter().map(|path| asset_server.load(*path)).collect(),
+    ));
 
     commands.spawn((Camera2d, Tonemapping::None));
     commands.spawn(Sprite::from_image(display));
@@ -527,24 +537,22 @@ fn request_error_readback(
                 commands.entity(event.entity).try_despawn();
 
                 let (mut err, mut reference, mut pixels, mut rays) = (0.0f64, 0.0f64, 0u32, 0.0f32);
-                // Room scene only: squared error / reference inside the
-                // room, and summed brightness of reference vs cascades.
-                let mut room = [0.0f64; 4];
+                let mut room_stats = room::RoomStats::default();
                 for (i, texel) in event.data.chunks_exact(32).enumerate() {
                     let f = |k: usize| f32::from_le_bytes(texel[k * 4..k * 4 + 4].try_into().unwrap());
                     rays = rays.max(f(3).abs());
+                    let (squared_error, squared_reference, reference_sum, cascades_sum) = (f(0), f(1), f(4), f(5));
+                    if f(6) > 0.0 {
+                        room_stats.add_wall(squared_error, squared_reference, reference_sum, cascades_sum);
+                    }
                     if f(3) <= 0.0 {
                         continue;
                     }
-                    err += f(0) as f64;
-                    reference += f(1) as f64;
+                    err += squared_error as f64;
+                    reference += squared_reference as f64;
                     pixels += 1;
                     let pos = Vec2::new((i as u32 % SIZE) as f32 + 0.5, (i as u32 / SIZE) as f32 + 0.5);
-                    if settings.scene == 1 && ROOM_INTERIOR.contains(pos) {
-                        for (acc, v) in room.iter_mut().zip([f(0), f(1), f(4), f(5)]) {
-                            *acc += v as f64;
-                        }
-                    }
+                    room_stats.add_interior(pos, squared_error, squared_reference, reference_sum, cascades_sum);
                 }
                 // Before the pipelines compile, the buffer is still zeros;
                 // don't report that as a perfect 0% match.
@@ -552,12 +560,8 @@ fn request_error_readback(
                     info!("rc2d: no data yet (pipelines still compiling?)");
                     return;
                 }
-                let room_stats = if settings.scene == 1 {
-                    format!(
-                        " | inside room: rel. RMSE {:.2}%, cascades {:+.2}% vs reference brightness",
-                        100.0 * (room[0] / room[1].max(f64::MIN_POSITIVE)).sqrt(),
-                        100.0 * (room[3] - room[2]) / room[2].max(f64::MIN_POSITIVE),
-                    )
+                let room_stats = if settings.scene == room::SCENE_ID {
+                    room_stats.summary()
                 } else {
                     String::new()
                 };
