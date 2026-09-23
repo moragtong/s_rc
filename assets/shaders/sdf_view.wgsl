@@ -101,6 +101,21 @@ fn direct_sun(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     return view.sun_irradiance * cos_theta * visible;
 }
 
+// A march stops anywhere inside the hit threshold (25 cm in tier 1), at an
+// offset set by its step count, which changes in rings across a surface;
+// shading from there shifts its probe weights with it (visible rings).
+// Moving the hit out along the normal to the threshold's iso-surface makes
+// it depend only on position. Not onto the surface: in a coarse tier a thin
+// wall's distance never reaches 0, and stepping by it crosses the wall.
+fn on_threshold(hit: vec3<f32>, t: u32) -> vec3<f32> {
+    let eps = hit_eps(clipmap(), t);
+    var p = hit;
+    for (var i = 0; i < 2; i++) {
+        p += normal_at(p, t) * (eps - sample_at(p, t));
+    }
+    return p;
+}
+
 fn albedo_at(p: vec3<f32>, t: u32) -> vec3<f32> {
     let uvw = p / (view.voxels[t] * f32(view.resolution));
     switch t {
@@ -175,10 +190,7 @@ fn level_irradiance(c: ShadingLevel, p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
     let g = (p + n * 0.5 * s) / s - 0.5;
     let base = vec3<i32>(floor(g));
     let f = g - floor(g);
-    // The line test starts past the hit threshold of p's tier: from 7 cm,
-    // a coarse tier (25 cm threshold) hit the surface itself and dropped
-    // every probe.
-    let start = p + n * max(0.07, 1.25 * hit_eps(clipmap(), tier_at(clipmap(), p)));
+    let tier_p = tier_at(clipmap(), p);
     var e = vec3(0.0);
     var total = 0.0;
     for (var k = 0u; k < 8u; k++) {
@@ -192,7 +204,14 @@ fn level_irradiance(c: ShadingLevel, p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
         let empty = tier != 3u && sample_at(center, tier) > 0.0;
         let w3 = mix(1.0 - f, f, vec3<f32>(corner));
         let w = w3.x * w3.y * w3.z;
-        // In front of the line test's start, and nothing in between.
+        // In front of the line test's start, and nothing in between. The
+        // test runs at the resolution of the coarsest tier it touches,
+        // starting past that tier's hit threshold, measured in distance-
+        // field value (not from p, whose offset inside the threshold varies
+        // with the march): from a fixed 7 cm, paths that crossed into a
+        // coarser tier (25 cm threshold) hit their own surface there.
+        let tier_line = max(tier_p, tier);
+        let start = p + n * max(max(0.07, 1.25 * hit_eps(clipmap(), tier_line)) - sample_at(p, tier_line), 0.0);
         let toward = center - start;
         let span = length(toward);
         let clear = dot(toward, n) > 0.0
@@ -270,7 +289,7 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
             case 7u: { color = vec3(debug_shadow(view.camera + dir * t, tier)); }
             case 8u: { color = 1.0 - exp(-debug_color(view.camera + dir * t, tier) * 2.0); }
             default: {
-                let p = view.camera + dir * t;
+                let p = on_threshold(view.camera + dir * t, tier);
                 let n = normal_at(p, tier);
                 var irradiance = cascade_irradiance(p, n);
                 // (modes 3 and 4 only reach here via the default arm)
