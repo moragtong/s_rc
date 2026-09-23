@@ -21,6 +21,10 @@
 //!   frame and average the result over frames. Error that goes away is
 //!   aliasing from the fixed ray directions; error that stays is bias.
 //! - `R`: restart reference accumulation
+//! - `Space`: pause / resume the reference. Once it has converged, pausing
+//!   frees its GPU time (~50 ms/frame in the room scene) for smooth viewing;
+//!   metrics keep comparing against the frozen result. Anything that
+//!   restarts the reference also resumes it, so it can't silently go stale.
 //! - Left-drag: move the warm light (restarts the reference)
 //!
 //! Every 2s it also logs per-stage GPU time from timestamp queries, when the
@@ -191,6 +195,8 @@ struct Rc2dSettings {
     /// Makes the next extracted frame overwrite the reference instead of
     /// accumulating onto it.
     reset_reference: bool,
+    /// Skip reference accumulation; see the `Space` control.
+    reference_paused: bool,
     ref_rays: u32,
     exposure: f32,
     diff_gain: f32,
@@ -219,6 +225,7 @@ impl Default for Rc2dSettings {
             base_interval: 1.0,
             ref_frame: 0,
             reset_reference: true,
+            reference_paused: false,
             ref_rays: 16,
             exposure: 2.0,
             diff_gain: 8.0,
@@ -432,6 +439,13 @@ fn input(
     if keys.just_pressed(KeyCode::KeyR) {
         settings.reset_reference = true;
     }
+    if keys.just_pressed(KeyCode::Space) {
+        settings.reference_paused = !settings.reference_paused;
+        info!(
+            "reference {}",
+            if settings.reference_paused { "paused" } else { "resumed" }
+        );
+    }
     if keys.just_pressed(KeyCode::KeyP) {
         settings.probe0_log2 ^= 1;
     }
@@ -485,7 +499,11 @@ fn advance_reference(
     if settings.reset_reference {
         settings.ref_frame = 0;
         settings.reset_reference = false;
-    } else {
+        if settings.reference_paused {
+            settings.reference_paused = false;
+            info!("reference resumed (restarted)");
+        }
+    } else if !settings.reference_paused {
         settings.ref_frame += 1;
     }
 
@@ -514,7 +532,8 @@ fn log_gpu_timings(
     };
 
     let mut stages: Vec<(String, f64)> = Vec::new();
-    for span in [REFERENCE_SPAN.to_string()]
+    let reference_span = (!settings.reference_paused).then(|| REFERENCE_SPAN.to_string());
+    for span in reference_span
         .into_iter()
         .chain((0..settings.cascade_count()).rev().map(cascade_span))
         .chain([RESOLVE_SPAN.to_string()])
@@ -820,7 +839,7 @@ fn run_rc2d(
         timestamp_writes: None,
     };
 
-    {
+    if !settings.reference_paused {
         let mut pass = ctx.command_encoder().begin_compute_pass(&pass_descriptor);
         let span = diagnostics.pass_span(&mut pass, REFERENCE_SPAN);
         pass.set_pipeline(reference_pipeline);
