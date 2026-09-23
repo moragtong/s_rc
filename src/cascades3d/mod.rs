@@ -26,7 +26,7 @@ use bevy::{
 
 use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, ClipmapUniform};
 use crate::sdf_view::SdfView;
-use layout::{CASCADES, INTERVAL0, Layout, OCTA_SIDE0, SPACING0, octa_side, rays_per_probe};
+use layout::{CASCADES, CascadeWindow, LEVELS, Layout, octa_side};
 
 const SHADER: &str = "shaders/cascades3d.wgsl";
 const TRACE_SPAN: &str = "cascades3d_trace";
@@ -90,8 +90,11 @@ fn log_cascade_timings(time: Res<Time>, mut timer: Local<Option<Timer>>, frame: 
         return;
     }
     let ms = |span: &str| store.get(&DiagnosticPath::new(format!("render/{span}/elapsed_gpu"))).and_then(|d| d.smoothed());
-    let gathers: Vec<String> =
-        (0..CASCADES).rev().filter_map(|n| ms(&gather_span(n)).map(|v| format!("c{n} {v:.2}"))).collect();
+    let gathers: Vec<String> = (0..CASCADES)
+        .rev()
+        .filter_map(|n| ms(&gather_span(n)).map(|v| format!("c{n} {v:.2}")))
+        .chain((1..LEVELS).filter_map(|l| ms(&level_span(l)).map(|v| format!("level {l} {v:.2}"))))
+        .collect();
     if let Some(trace) = ms(TRACE_SPAN) {
         info!("cascades3d GPU ms: trace {trace:.2} | gather {}", gathers.join(", "));
     }
@@ -101,25 +104,33 @@ fn gather_span(n: u32) -> String {
     format!("cascades3d_gather_{n}")
 }
 
+fn level_span(l: u32) -> String {
+    format!("cascades3d_level_{l}")
+}
+
 // ---------------------------------------------------------------- render
 
 #[derive(ShaderType, Clone, Copy)]
 struct Params {
     clipmap: ClipmapUniform,
     camera: Vec3,
-    cascade: u32,
-    cascade_count: u32,
-    spacing0: f32,
-    interval0: f32,
-    octa_side0: u32,
+    /// Pass index: cascades 0.., then shading levels 1..
+    pass: u32,
+    interval: Vec2,
+    spacing: f32,
+    octa_side: u32,
+    has_children: u32,
+    child_spacing: f32,
+    child_octa_side: u32,
     window: u32,
     radius: f32,
     tag_base: u32,
     hit_base: u32,
+    /// Where this pass's rays go in the destination buffer.
+    dst_base: u32,
     child_window: u32,
     child_radius: f32,
     child_tag_base: u32,
-    angle_base: u32,
     child_angle_base: u32,
 }
 
@@ -130,6 +141,12 @@ pub struct Cascades3dGpu {
     /// Cascade 0 (even cascades write A) after the gather.
     pub radiance_a: Buffer,
     radiance_b: Buffer,
+    /// A shading level's children averaged to its directions (the reduce
+    /// pass), per child slot.
+    reduced: Buffer,
+    /// Shading levels 1.. after the gather (see layout.rs), each at its
+    /// radiance_base.
+    pub radiance_levels: Buffer,
     hits: Buffer,
     pub tags: Buffer,
     /// Per slot, which trilinear children are reachable (see the shader).
@@ -144,6 +161,7 @@ pub struct Cascades3dGpu {
     trace: CachedComputePipelineId,
     commit: CachedComputePipelineId,
     gather: CachedComputePipelineId,
+    reduce: CachedComputePipelineId,
 }
 
 fn storage(render_device: &RenderDevice, label: &str, size: u64) -> Buffer {
@@ -169,11 +187,14 @@ fn init_cascades_gpu(
 ) {
     let layout = Layout::new();
     info!(
-        "cascades3d: {} cascades, rays per window {:?}, hits {:.0} MB, radiance 2 x {:.0} MB",
+        "cascades3d: {} cascades + {} shading levels, rays per window {:?} + {:?}, hits {:.0} MB, radiance 2 x {:.0} + {:.0} MB",
         CASCADES,
-        (0..CASCADES).map(|n| layout.cascades[n as usize].size.pow(3) * rays_per_probe(n)).collect::<Vec<_>>(),
+        LEVELS - 1,
+        layout.cascades.iter().map(CascadeWindow::rays).collect::<Vec<_>>(),
+        layout.levels.iter().map(CascadeWindow::rays).collect::<Vec<_>>(),
         layout.hit_words as f64 * 4.0 / 1e6,
-        layout.max_rays as f64 * 8.0 / 1e6
+        layout.max_rays as f64 * 8.0 / 1e6,
+        layout.level_rays as f64 * 8.0 / 1e6
     );
 
     let mut angles = Vec::new();
@@ -225,14 +246,16 @@ fn init_cascades_gpu(
         })
     };
 
-    let (trace, commit, gather) = (queue("trace"), queue("commit"), queue("gather"));
+    let (trace, commit, gather, reduce) = (queue("trace"), queue("commit"), queue("gather"), queue("reduce"));
     commands.insert_resource(Cascades3dGpu {
         radiance_a: storage(&render_device, "cascades3d_radiance_a", layout.max_rays * 8),
         radiance_b: storage(&render_device, "cascades3d_radiance_b", layout.max_rays * 8),
+        reduced: storage(&render_device, "cascades3d_reduced", layout.reduced_rays.max(1) * 8),
+        radiance_levels: storage(&render_device, "cascades3d_radiance_levels", layout.level_rays.max(1) * 8),
         hits: storage(&render_device, "cascades3d_hits", layout.hit_words * 4),
         tags: storage(&render_device, "cascades3d_tags", layout.tag_words * 4),
         child_masks: storage(&render_device, "cascades3d_child_masks", layout.tag_words * 4),
-        remarched: storage(&render_device, "cascades3d_remarched", CASCADES as u64 * 4),
+        remarched: storage(&render_device, "cascades3d_remarched", (CASCADES + LEVELS) as u64 * 4),
         solid_angles,
         shading_subsamples,
         angle_bases,
@@ -240,6 +263,7 @@ fn init_cascades_gpu(
         trace,
         commit,
         gather,
+        reduce,
         layout,
     });
 }
@@ -273,44 +297,58 @@ fn run_cascades(
     if !frame.active {
         return;
     }
-    for id in [gpu.trace, gpu.commit, gpu.gather] {
+    for id in [gpu.trace, gpu.commit, gpu.gather, gpu.reduce] {
         if let CachedPipelineState::Err(e) = pipeline_cache.get_compute_pipeline_state(id) {
             error_once!("cascades3d pipeline failed: {e}");
         }
     }
-    let (Some(trace), Some(commit), Some(gather)) = (
+    let (Some(trace), Some(commit), Some(gather), Some(reduce)) = (
         pipeline_cache.get_compute_pipeline(gpu.trace),
         pipeline_cache.get_compute_pipeline(gpu.commit),
         pipeline_cache.get_compute_pipeline(gpu.gather),
+        pipeline_cache.get_compute_pipeline(gpu.reduce),
     ) else {
         return;
     };
+    // Passes: cascades 0.., then shading levels 1..
     let windows = &gpu.layout.cascades;
+    let passes: Vec<CascadeWindow> = windows.iter().chain(&gpu.layout.levels).copied().collect();
     params.clear();
-    let offsets: Vec<u32> = (0..CASCADES)
-        .map(|n| {
-            let own = windows[n as usize];
-            let child = windows.get(n as usize + 1).copied().unwrap_or_default();
-            params.push(&Params {
-                clipmap: frame.clipmap,
-                camera: frame.camera,
-                cascade: n,
-                cascade_count: CASCADES,
-                spacing0: SPACING0,
-                interval0: INTERVAL0,
-                octa_side0: OCTA_SIDE0,
-                window: own.size,
-                radius: own.radius,
-                tag_base: own.tag_base,
-                hit_base: own.hit_base,
-                child_window: child.size,
-                child_radius: child.radius,
-                child_tag_base: child.tag_base,
-                angle_base: gpu.angle_bases[n as usize],
-                child_angle_base: gpu.angle_bases.get(n as usize + 1).copied().unwrap_or(0),
-            })
-        })
-        .collect();
+    let make = |i: usize, own: &CascadeWindow| {
+        let child = own.child.map(|c| windows[c as usize]).unwrap_or_default();
+        Params {
+            clipmap: frame.clipmap,
+            camera: frame.camera,
+            pass: i as u32,
+            interval: Vec2::from(own.interval),
+            spacing: own.spacing,
+            octa_side: own.octa_side,
+            has_children: own.child.is_some() as u32,
+            child_spacing: child.spacing,
+            child_octa_side: child.octa_side,
+            window: own.size,
+            radius: own.radius,
+            tag_base: own.tag_base,
+            hit_base: own.hit_base,
+            dst_base: own.radiance_base,
+            child_window: child.size,
+            child_radius: child.radius,
+            child_tag_base: child.tag_base,
+            child_angle_base: own.child.map(|c| gpu.angle_bases[c as usize]).unwrap_or(0),
+        }
+    };
+    let mut offsets = Vec::new();
+    for (i, own) in passes.iter().enumerate() {
+        let mut p = make(i, own);
+        if i >= CASCADES as usize {
+            // Shading levels gather from the reduced children.
+            p.child_octa_side = p.octa_side;
+        }
+        offsets.push(params.push(&p));
+    }
+    // The reduce passes, one per shading level, after all the passes.
+    let reduce_offsets: Vec<u32> =
+        gpu.layout.levels.iter().enumerate().map(|(l, own)| params.push(&make(CASCADES as usize + l, own))).collect();
     params.write_buffer(&render_device, &render_queue);
     let Some(params_binding) = params.binding() else { return };
 
@@ -343,6 +381,11 @@ fn run_cascades(
     };
     let writes_a = bind_group(&gpu.radiance_b, &gpu.radiance_a);
     let writes_b = bind_group(&gpu.radiance_a, &gpu.radiance_b);
+    // Shading level l merges with cascade l+1, read from wherever that
+    // cascade was just written.
+    let reduce_from_a = bind_group(&gpu.radiance_a, &gpu.reduced);
+    let reduce_from_b = bind_group(&gpu.radiance_b, &gpu.reduced);
+    let writes_levels = bind_group(&gpu.reduced, &gpu.radiance_levels);
 
     if *cleared_generation != Some(frame.generation) {
         ctx.command_encoder().clear_buffer(&gpu.tags, 0, None);
@@ -350,7 +393,6 @@ fn run_cascades(
     }
     ctx.command_encoder().clear_buffer(&gpu.remarched, 0, None);
 
-    let slots = |n: u32| windows[n as usize].size.pow(3);
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
@@ -360,23 +402,39 @@ fn run_cascades(
 
     let span = diagnostics.pass_span(&mut pass, TRACE_SPAN);
     pass.set_pipeline(trace);
-    for n in 0..CASCADES {
-        pass.set_bind_group(0, &writes_a, &[offsets[n as usize]]);
-        dispatch_linear(&mut pass, slots(n) * rays_per_probe(n));
+    for (w, offset) in passes.iter().zip(&offsets) {
+        pass.set_bind_group(0, &writes_a, &[*offset]);
+        dispatch_linear(&mut pass, w.rays() as u32);
     }
     pass.set_pipeline(commit);
-    for n in 0..CASCADES {
-        pass.set_bind_group(0, &writes_a, &[offsets[n as usize]]);
-        dispatch_linear(&mut pass, slots(n));
+    for (w, offset) in passes.iter().zip(&offsets) {
+        pass.set_bind_group(0, &writes_a, &[*offset]);
+        dispatch_linear(&mut pass, w.size.pow(3));
     }
     span.end(&mut pass);
 
+    // Top down; each shading level right after the cascade it merges with,
+    // before the ping-pong overwrites that cascade.
     pass.set_pipeline(gather);
     for n in (0..CASCADES).rev() {
         let span = diagnostics.pass_span(&mut pass, gather_span(n));
         let group = if n % 2 == 0 { &writes_a } else { &writes_b };
         pass.set_bind_group(0, group, &[offsets[n as usize]]);
-        dispatch_linear(&mut pass, slots(n) * rays_per_probe(n));
+        dispatch_linear(&mut pass, windows[n as usize].rays() as u32);
         span.end(&mut pass);
+        let level = n.wrapping_sub(1);
+        if (1..LEVELS).contains(&level) {
+            let span = diagnostics.pass_span(&mut pass, level_span(level));
+            let index = (CASCADES + level - 1) as usize;
+            let own = passes[index];
+            pass.set_pipeline(reduce);
+            let group = if n % 2 == 0 { &reduce_from_a } else { &reduce_from_b };
+            pass.set_bind_group(0, group, &[reduce_offsets[level as usize - 1]]);
+            dispatch_linear(&mut pass, windows[n as usize].size.pow(3) * own.rays_per_probe());
+            pass.set_pipeline(gather);
+            pass.set_bind_group(0, &writes_levels, &[offsets[index]]);
+            dispatch_linear(&mut pass, own.rays() as u32);
+            span.end(&mut pass);
+        }
     }
 }

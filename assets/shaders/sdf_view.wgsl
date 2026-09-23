@@ -24,14 +24,14 @@ struct View {
     // Each tier's window origin (world voxel coordinates) in xyz.
     origins: array<vec4<i32>, 3>,
     voxels: vec4<f32>,
-    // Cascade 0's probe window (see cascades3d.wgsl).
-    c0_window: u32,
-    c0_radius: f32,
-    c0_tag_base: u32,
-    spacing0: f32,
+    // Shading levels' probe windows (see layout.rs; level 0 is cascade 0):
+    // (window, tag_base, radiance_base, 0) and (radius, spacing, 0, 0).
+    level_ints: array<vec4<u32>, 4>,
+    level_floats: array<vec4<f32>, 4>,
     sun_toward: vec3<f32>,
     sun_k: f32,
     sun_irradiance: vec3<f32>,
+    level_count: u32,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -39,7 +39,7 @@ struct View {
 @group(0) @binding(2) var tier1: texture_3d<f32>;
 @group(0) @binding(3) var tier2: texture_3d<f32>;
 @group(0) @binding(4) var clipmap_sampler: sampler;
-@group(0) @binding(5) var output: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(5) var output: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(6) var<storage, read_write> depth: array<f32>;
 // Cascade 0's radiance (16 directions per probe, rgba16float packed), its
 // slot tags, and per direction cell 16 sub-directions with solid angles.
@@ -53,6 +53,8 @@ struct View {
 @group(0) @binding(13) var albedo2: texture_3d<f32>;
 @group(0) @binding(14) var shadow0: texture_3d<f32>;
 @group(0) @binding(15) var color0: texture_3d<f32>;
+// Shading levels 1.. (16 directions per probe, each at its radiance_base).
+@group(0) @binding(16) var<storage, read> levels: array<vec2<u32>>;
 
 fn debug_shadow(p: vec3<f32>, t: u32) -> f32 {
     return textureSampleLevel(shadow0, clipmap_sampler, p / (view.voxels[0] * f32(view.resolution)), 0.0).r;
@@ -115,18 +117,40 @@ fn pack_tag(world: vec3<i32>) -> u32 {
     return (w.x | (w.y << 10u) | (w.z << 20u)) + 1u;
 }
 
-fn c0_slot(world: vec3<i32>) -> u32 {
-    let size = i32(view.c0_window);
-    let s = vec3<u32>((world % size + size) % size);
-    return s.x + view.c0_window * (s.y + view.c0_window * s.z);
+// One shading level's probes (layout.rs).
+struct ShadingLevel {
+    level: u32,
+    window: u32,
+    tag_base: u32,
+    radiance_base: u32,
+    radius: f32,
+    spacing: f32,
 }
 
-// Cosine-weighted irradiance at one cascade-0 probe for normal n, weighting
-// each direction cell by the cosine across its sub-directions.
-fn probe_irradiance(slot: u32, n: vec3<f32>) -> vec3<f32> {
+fn shading_level(l: u32) -> ShadingLevel {
+    let i = view.level_ints[l];
+    let f = view.level_floats[l];
+    return ShadingLevel(l, i.x, i.y, i.z, f.x, f.y);
+}
+
+fn probe_slot(c: ShadingLevel, world: vec3<i32>) -> u32 {
+    let size = i32(c.window);
+    let s = vec3<u32>((world % size + size) % size);
+    return s.x + c.window * (s.y + c.window * s.z);
+}
+
+// Cosine-weighted irradiance at one probe for normal n, weighting each
+// direction cell by the cosine across its sub-directions. Every level has
+// cascade 0's 16 directions.
+fn probe_irradiance(c: ShadingLevel, slot: u32, n: vec3<f32>) -> vec3<f32> {
     var e = vec3(0.0);
     for (var cell = 0u; cell < C0_DIRECTIONS; cell++) {
-        let v = cascade0[slot * C0_DIRECTIONS + cell];
+        var v: vec2<u32>;
+        if c.level == 0u {
+            v = cascade0[slot * C0_DIRECTIONS + cell];
+        } else {
+            v = levels[c.radiance_base + slot * C0_DIRECTIONS + cell];
+        }
         let radiance = vec4(unpack2x16float(v.x), unpack2x16float(v.y)).rgb;
         var weight = 0.0;
         for (var i = 0u; i < SUBSAMPLES_PER_DIRECTION; i++) {
@@ -138,16 +162,16 @@ fn probe_irradiance(slot: u32, n: vec3<f32>) -> vec3<f32> {
     return e;
 }
 
-// Irradiance at surface point p with normal n: trilinear over the 8
-// cascade-0 probes around p, sampled half a spacing off the surface. As in
+// Irradiance at surface point p with normal n from one level: trilinear
+// over the 8 probes around p, sampled half a spacing off the surface. As in
 // the 2D testbed, probes that aren't live, sit inside geometry, are behind
 // the surface, or have no clear line from it drop out and the rest are
-// renormalized; with none, black (missing coverage loses energy rather than
-// leaking). The line test is what keeps probes on the far side of a thin
-// slab out: e.g. the grid row above a 20 cm ceiling is in empty space and
-// in front of a wall point just under the ceiling, but out on the roof.
-fn cascade_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let s = view.spacing0;
+// renormalized. The line test is what keeps probes on the far side of a
+// thin slab out: e.g. the grid row above a 20 cm ceiling is in empty space
+// and in front of a wall point just under the ceiling, but out on the roof.
+// w = total weight used; 0 = no usable probe.
+fn level_irradiance(c: ShadingLevel, p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
+    let s = c.spacing;
     let g = (p + n * 0.5 * s) / s - 0.5;
     let base = vec3<i32>(floor(g));
     let f = g - floor(g);
@@ -158,28 +182,61 @@ fn cascade_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     var e = vec3(0.0);
     var total = 0.0;
     for (var k = 0u; k < 8u; k++) {
-        let c = vec3(k & 1u, (k >> 1u) & 1u, k >> 2u);
-        let world = base + vec3<i32>(c);
+        let corner = vec3(k & 1u, (k >> 1u) & 1u, k >> 2u);
+        let world = base + vec3<i32>(corner);
         let center = (vec3<f32>(world) + 0.5) * s;
-        let slot = c0_slot(world);
-        let live = distance(center, view.camera) <= view.c0_radius
-            && tags[view.c0_tag_base + slot] == pack_tag(world);
+        let slot = probe_slot(c, world);
+        let live = distance(center, view.camera) <= c.radius
+            && tags[c.tag_base + slot] == pack_tag(world);
         let tier = tier_at(clipmap(), center);
         let empty = tier != 3u && sample_at(center, tier) > 0.0;
-        let w3 = mix(1.0 - f, f, vec3<f32>(c));
+        let w3 = mix(1.0 - f, f, vec3<f32>(corner));
         let w = w3.x * w3.y * w3.z;
+        // In front of the line test's start, and nothing in between.
         let toward = center - start;
         let span = length(toward);
-        // A probe no further out than the start can't have an occluder
-        // between it and the surface.
-        let clear = dot(toward, n) <= 0.0
-            || !march(clipmap(), tier0, tier1, tier2, clipmap_sampler, start, toward / span, span).hit;
-        if live && empty && dot(center - p, n) > 0.0 && w > 0.0 && clear {
-            e += w * probe_irradiance(slot, n);
+        let clear = dot(toward, n) > 0.0
+            && !march(clipmap(), tier0, tier1, tier2, clipmap_sampler, start, toward / span, span).hit;
+        if live && empty && w > 0.0 && clear {
+            e += w * probe_irradiance(c, slot, n);
             total += w;
         }
     }
-    return select(vec3(0.0), e / total, total > 0.0);
+    return vec4(select(vec3(0.0), e / total, total > 0.0), total);
+}
+
+// From the finest level covering p, like the clipmap's tiers: level l while
+// p is more than a spacing inside its radius (so all 8 probes can be live),
+// blending into level l+1 over the 3 spacings before that. A level with no
+// usable probe hands over to the next; with none at all, black (missing
+// coverage loses energy rather than leaking).
+fn cascade_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let d = distance(p, view.camera);
+    var l = 0u;
+    while l + 1u < view.level_count && d > shading_level(l).radius - shading_level(l).spacing {
+        l++;
+    }
+    var fine = level_irradiance(shading_level(l), p, n);
+    while fine.w == 0.0 && l + 1u < view.level_count {
+        l++;
+        fine = level_irradiance(shading_level(l), p, n);
+    }
+    if l + 1u >= view.level_count {
+        return fine.rgb;
+    }
+    let c = shading_level(l);
+    let t = smoothstep(c.radius - 4.0 * c.spacing, c.radius - c.spacing, d);
+    if t <= 0.0 {
+        return fine.rgb;
+    }
+    let coarse = level_irradiance(shading_level(l + 1u), p, n);
+    if coarse.w == 0.0 {
+        return fine.rgb;
+    }
+    if fine.w == 0.0 {
+        return coarse.rgb;
+    }
+    return mix(fine.rgb, coarse.rgb, t);
 }
 
 @compute @workgroup_size(8, 8, 1)

@@ -12,16 +12,29 @@ pub const OCTA_SIDE0: u32 = 4;
 /// End of cascade 0's interval, m; cascade n covers
 /// [INTERVAL0 * 2^(n-1), INTERVAL0 * 2^n] (cascade 0 from 0).
 pub const INTERVAL0: f32 = 1.5;
-/// Cascade-0 probes exist within this distance of the camera; pixels
-/// beyond it get no indirect light. 12 m covers the whole test room from
-/// anywhere inside it (8 m left its far corners black).
-pub const RADIUS0: f32 = 12.0;
+/// Cascade-0 probes exist within this distance of the camera.
+pub const RADIUS0: f32 = 8.0;
+/// Shading levels: level l has probes every spacing(l) with cascade 0's
+/// directions, traces from 0 to INTERVAL0 * 2^l (cascade 0 scaled by 2^l)
+/// and merges with cascade l+1, whose interval starts there; it covers
+/// RADIUS0 * 2^l. Level 0 is cascade 0. Pixels shade from the finest level
+/// covering them, like the clipmap's tiers, so every level has the near
+/// field that cascade n > 0 lacks.
+pub const LEVELS: u32 = 2;
 /// Sub-samples per axis of each cascade-0 direction cell, for exact cosine
 /// weighting when shading from 16 directions.
 pub const SHADE_SUBSAMPLES: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CascadeWindow {
+    pub spacing: f32,
+    pub octa_side: u32,
+    /// Ray interval, m.
+    pub interval: [f32; 2],
+    /// The cascade it merges with (its children); None for the top one.
+    pub child: Option<u32>,
+    /// Shading levels > 0 only: offset of its rays in the levels buffer.
+    pub radiance_base: u32,
     /// Slots per axis (the window is size^3 probes, mapped toroidally).
     pub size: u32,
     /// Probes within this distance of the camera are live.
@@ -33,6 +46,12 @@ pub struct CascadeWindow {
 #[derive(Clone, Debug)]
 pub struct Layout {
     pub cascades: Vec<CascadeWindow>,
+    /// Shading levels 1.. (level 0 is cascades[0]).
+    pub levels: Vec<CascadeWindow>,
+    /// Rays of all levels > 0, which sizes their radiance buffer.
+    pub level_rays: u64,
+    /// Largest shading level's children at its directions (the reduce pass).
+    pub reduced_rays: u64,
     pub tag_words: u64,
     pub hit_words: u64,
     /// Largest window in rays, which sizes the ping-pong radiance buffers.
@@ -47,48 +66,98 @@ pub fn octa_side(n: u32) -> u32 {
     OCTA_SIDE0 << n
 }
 
-pub fn rays_per_probe(n: u32) -> u32 {
-    octa_side(n).pow(2)
+pub fn interval(n: u32) -> [f32; 2] {
+    let end = INTERVAL0 * (1 << n) as f32;
+    [if n == 0 { 0.0 } else { end / 2.0 }, end]
 }
 
-/// Segments marched per stored ray: the 3D bilinear fix traces one per
-/// trilinear child in the next cascade; the top cascade has no children.
-pub fn segments(n: u32) -> u32 {
-    if n + 1 < CASCADES { 8 } else { 1 }
-}
+impl CascadeWindow {
+    pub fn rays_per_probe(&self) -> u32 {
+        self.octa_side.pow(2)
+    }
 
-/// u32 words of cached hits per ray (two unorm16 fractions each).
-pub fn hit_words(n: u32) -> u32 {
-    segments(n).div_ceil(2)
+    /// Segments marched per stored ray: the 3D bilinear fix traces one per
+    /// trilinear child; the top cascade has no children.
+    pub fn segments(&self) -> u32 {
+        if self.child.is_some() { 8 } else { 1 }
+    }
+
+    /// u32 words of cached hits per ray (two unorm16 fractions each).
+    pub fn hit_words(&self) -> u32 {
+        self.segments().div_ceil(2)
+    }
+
+    pub fn rays(&self) -> u64 {
+        (self.size as u64).pow(3) * self.rays_per_probe() as u64
+    }
 }
 
 impl Layout {
     pub fn new() -> Self {
+        let level_radius = |l: u32| RADIUS0 * (1 << l) as f32;
+        // Even, and wide enough that the window centered on the camera's
+        // probe holds every probe within `radius`.
+        let window = |radius: f32, s: f32| 2 * ((radius / s).ceil() as u32 + 2);
+        let (mut tag_base, mut hit_base) = (0u64, 0u64);
+        let mut allocate = |w: &mut CascadeWindow| {
+            w.tag_base = tag_base as u32;
+            w.hit_base = hit_base as u32;
+            tag_base += (w.size as u64).pow(3);
+            hit_base += w.rays() * w.hit_words() as u64;
+        };
+
         let mut cascades = Vec::new();
-        let (mut radius, mut tag_base, mut hit_base, mut max_rays) = (RADIUS0, 0u64, 0u64, 0u64);
+        let mut radius = RADIUS0;
         for n in 0..CASCADES {
             let s = spacing(n);
             if n > 0 {
                 // Every live parent's 8 trilinear children lie within
-                // sqrt(3) child spacings of it.
-                radius += 1.75 * s;
+                // sqrt(3) child spacings of it; parents are cascade n-1
+                // and shading level n-1.
+                let parent = if n - 1 < LEVELS { radius.max(level_radius(n - 1)) } else { radius };
+                radius = parent + 1.75 * s;
             }
-            // Even, and wide enough that the window centered on the
-            // camera's probe holds every probe within `radius`.
-            let size = 2 * ((radius / s).ceil() as u32 + 2);
-            cascades.push(CascadeWindow {
-                size,
+            let mut w = CascadeWindow {
+                spacing: s,
+                octa_side: octa_side(n),
+                interval: interval(n),
+                child: (n + 1 < CASCADES).then_some(n + 1),
+                radiance_base: 0,
+                size: window(radius, s),
                 radius,
-                tag_base: tag_base as u32,
-                hit_base: hit_base as u32,
-            });
-            let slots = (size as u64).pow(3);
-            let rays = slots * rays_per_probe(n) as u64;
-            tag_base += slots;
-            hit_base += rays * hit_words(n) as u64;
-            max_rays = max_rays.max(rays);
+                tag_base: 0,
+                hit_base: 0,
+            };
+            allocate(&mut w);
+            cascades.push(w);
         }
-        Self { cascades, tag_words: tag_base, hit_words: hit_base, max_rays }
+
+        let mut levels = Vec::new();
+        let mut level_rays = 0u64;
+        for l in 1..LEVELS {
+            let s = spacing(l);
+            let mut w = CascadeWindow {
+                spacing: s,
+                octa_side: OCTA_SIDE0,
+                interval: [0.0, INTERVAL0 * (1 << l) as f32],
+                child: Some(l + 1),
+                radiance_base: level_rays as u32,
+                size: window(level_radius(l), s),
+                radius: level_radius(l),
+                tag_base: 0,
+                hit_base: 0,
+            };
+            allocate(&mut w);
+            level_rays += w.rays();
+            levels.push(w);
+        }
+        let max_rays = cascades.iter().map(CascadeWindow::rays).max().unwrap_or(0);
+        let reduced_rays = levels
+            .iter()
+            .map(|w| (cascades[w.child.unwrap() as usize].size as u64).pow(3) * w.rays_per_probe() as u64)
+            .max()
+            .unwrap_or(0);
+        Self { cascades, levels, level_rays, reduced_rays, tag_words: tag_base, hit_words: hit_base, max_rays }
     }
 }
 

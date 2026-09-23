@@ -29,7 +29,7 @@ use bevy::{
     },
 };
 
-use crate::cascades3d::layout::{Layout, SPACING0};
+use crate::cascades3d::layout::{LEVELS, Layout};
 use crate::cascades3d::{Cascades3dGpu, Cascades3dRenderSystems, LIGHTING_MODE};
 use crate::clipmap::{ClipmapCamera, ClipmapRenderSystems, ClipmapState, ClipmapTextures, RESOLUTION, SunLight, TIER_VOXEL, TIERS};
 use crate::scene3d::Scene3d;
@@ -64,14 +64,18 @@ pub struct SdfViewUniform {
     resolution: u32,
     origins: [IVec4; TIERS],
     voxels: Vec4,
-    c0_window: u32,
-    c0_radius: f32,
-    c0_tag_base: u32,
-    spacing0: f32,
+    /// Per shading level: (window, tag_base, radiance_base, 0).
+    level_ints: [UVec4; MAX_LEVELS],
+    /// Per shading level: (radius, spacing, 0, 0).
+    level_floats: [Vec4; MAX_LEVELS],
     sun_toward: Vec3,
     sun_k: f32,
     sun_irradiance: Vec3,
+    level_count: u32,
 }
+
+/// Array size of the per-level uniform fields (sdf_view.wgsl).
+const MAX_LEVELS: usize = 4;
 
 /// Marks the full-window UI node showing the traced image.
 #[derive(Component)]
@@ -103,8 +107,10 @@ fn setup_sdf_view(mut commands: Commands, mut images: ResMut<Assets<Image>>, mut
     let mut image = Image::new_fill(
         Extent3d { width: WIDTH, height: HEIGHT, depth_or_array_layers: 1 },
         TextureDimension::D2,
-        &[0, 0, 0, 255],
-        TextureFormat::Rgba8Unorm,
+        // Half floats: 8-bit linear left dark tones a few steps apart,
+        // each channel rounding differently (visible green/red bands).
+        &[0, 0, 0, 0, 0, 0, 0x00, 0x3c],
+        TextureFormat::Rgba16Float,
         RenderAssetUsages::RENDER_WORLD,
     );
     image.texture_descriptor.usage |= TextureUsages::STORAGE_BINDING;
@@ -170,7 +176,14 @@ fn update_sdf_view_uniform(
     let aspect = WIDTH as f32 / HEIGHT as f32;
     let origins = std::array::from_fn(|t| state.origins[t].unwrap_or_default().extend(0));
     let mode = view.mode;
-    let c0 = Layout::new().cascades[0];
+    let layout = Layout::new();
+    let levels: Vec<_> = std::iter::once(layout.cascades[0]).chain(layout.levels.iter().copied()).collect();
+    let mut level_ints = [UVec4::ZERO; MAX_LEVELS];
+    let mut level_floats = [Vec4::ZERO; MAX_LEVELS];
+    for (l, w) in levels.iter().enumerate() {
+        level_ints[l] = UVec4::new(w.size, w.tag_base, w.radiance_base, 0);
+        level_floats[l] = Vec4::new(w.radius, w.spacing, 0.0, 0.0);
+    }
     view.uniform = SdfViewUniform {
         camera: transform.translation(),
         width: WIDTH,
@@ -182,10 +195,9 @@ fn update_sdf_view_uniform(
         resolution: RESOLUTION as u32,
         origins,
         voxels: Vec4::new(TIER_VOXEL[0], TIER_VOXEL[1], TIER_VOXEL[2], 0.0),
-        c0_window: c0.size,
-        c0_radius: c0.radius,
-        c0_tag_base: c0.tag_base,
-        spacing0: SPACING0,
+        level_ints,
+        level_floats,
+        level_count: LEVELS,
         sun_toward: sun.toward,
         sun_k: sun.k,
         sun_irradiance: sun.irradiance,
@@ -284,7 +296,7 @@ fn init_sdf_view_pipeline(mut commands: Commands, asset_server: Res<AssetServer>
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
-                texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
+                texture_storage_2d(TextureFormat::Rgba16Float, StorageTextureAccess::WriteOnly),
                 storage_buffer_sized(false, std::num::NonZero::new((WIDTH * HEIGHT * 4) as u64)),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
@@ -295,6 +307,7 @@ fn init_sdf_view_pipeline(mut commands: Commands, asset_server: Res<AssetServer>
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 texture_3d(TextureSampleType::Float { filterable: true }),
+                storage_buffer_read_only_sized(false, None),
             ),
         ),
     );
@@ -360,6 +373,7 @@ fn trace_sdf_view(
             &textures.albedo[2],
             &textures.shadow[0],
             &textures.color[0],
+            cascades.radiance_levels.as_entire_buffer_binding(),
         )),
     );
     let diagnostics = ctx.diagnostic_recorder();
