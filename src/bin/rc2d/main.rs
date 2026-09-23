@@ -9,14 +9,17 @@
 //! - `B`: toggle plain bilinear merge vs. bilinear fix
 //! - `Up` / `Down`: double / halve the cascade-0 interval scale `b`
 //! - `P`: toggle cascade-0 probe spacing s0 between 1 and 2 px
-//! - `D`: cycle how many of the lowest cascades use the per-direction
+//! - `L`: cycle how many of the lowest cascades use the per-direction
 //!   merge (0-3, then all; see the cascade shader)
-//! - `S`: switch scene: lights and occluders / room with thin diffuse walls,
+//! - `Tab`: switch scene: lights and occluders / room with thin diffuse walls,
 //!   a spotlight outside its only entrance and lights around its outside
 //!   (resets the light position)
 //! - `G`: cycle diffuse bounces 0-4 (room scene; restarts the reference)
-//! - `C`: run the intermediate bounce passes at double probe spacing
-//!   (they only feed wall lighting); the final, visible pass is unchanged
+//! - `WASD` / right-drag: move the circle of live probes (eventually the
+//!   camera's region); `-` / `=`: shrink / grow it. Probes that stay in the
+//!   circle keep their cached hits; only ones entering it are re-marched.
+//! - `T`: throw away the hit cache and re-march every probe (for checking
+//!   that scrolled results match a fresh trace)
 //! - `J`: diagnostic: rotate all ray directions by a different angle each
 //!   frame and average the result over frames. Error that goes away is
 //!   aliasing from the fixed ray directions; error that stays is bias.
@@ -28,7 +31,15 @@
 //! - Left-drag: move the warm light (restarts the reference)
 //!
 //! Every 2s it also logs per-stage GPU time from timestamp queries, when the
-//! adapter supports timestamps inside compute passes.
+//! adapter supports timestamps inside compute passes, and how many probes
+//! each cascade re-marched that frame.
+//!
+//! Tracing and gathering are separate passes: tracing caches each ray
+//! segment's hit location, gathering evaluates lighting at the cached hits
+//! every frame (once per bounce). Geometry or cascade-layout changes
+//! (scene, moving the light, which also occludes, b, s0, merge settings,
+//! circle radius) invalidate the cache; lighting-only changes and moving
+//! the circle don't.
 //!
 //! The reference converges over time (noise ~ 1/sqrt(rays)); RMSE figures
 //! are only trustworthy once its ray count is in the thousands.
@@ -67,7 +78,7 @@
 //! ray directions per frame and averaging (`J`) barely changed it. The
 //! cascades were too bright within a few px of the light's surface, from
 //! tracing each arc's near segment along its center only (see the cascade
-//! shader). Merging per child direction in the lowest cascades (`D`):
+//! shader). Merging per child direction in the lowest cascades (`L`):
 //!
 //! | s0   | b   | per-direction levels | cascades GPU | rel. RMSE | 0-2px from light |
 //! |------|-----|----------------------|--------------|-----------|------------------|
@@ -80,7 +91,7 @@
 //!
 //! Higher levels cost the most (long rays x 4 traces) and help the least.
 //!
-//! Room scene (`S`), 2 diffuse bounces, same-run comparisons at ~12-17k
+//! Room scene (`Tab`), 2 diffuse bounces, same-run comparisons at ~12-17k
 //! reference rays/px. Path-traced bounces make the reference noisier, so
 //! the in-room RMSE includes reference noise. The in-room brightness sums
 //! average that noise out, so they're the reliable leak signal:
@@ -106,12 +117,27 @@
 //! Cost, room at 2 bounces (3 cascade passes), same run: the per-pass cost
 //! is ~1.3x scene 0's (9.2 vs 7.1 ms direct), plus ~3 ms per bounce pass
 //! for the lookups. Most of the total is the pass count. Running the
-//! intermediate passes at double probe spacing (`C`, default on) cut
-//! cascade work 37.1 -> 24.5 ms with every error figure within the spread
-//! of the off runs (in-room 16.2% vs 15.7-16.5%, wall faces -6.3% vs
-//! -6.4%). Compiling the bounce lookup out of the direct pass was also
+//! intermediate passes at double probe spacing cut cascade work 37.1 ->
+//! 24.5 ms with every error figure within the spread of the off runs
+//! (in-room 16.2% vs 15.7-16.5%, wall faces -6.3% vs -6.4%). That option
+//! was removed once tracing got cached: it existed to make re-tracing per
+//! bounce cheaper, and bounce passes are now gathers over one trace.
+//! Compiling the bounce lookup out of the direct pass was also
 //! tried: ~2-3%, within noise, so not kept. The path-traced reference, at
 //! ~53 ms, is the largest cost in the room scene.
+//!
+//! Hit cache (circle radius 160 unless noted): with the circle still, no
+//! probe re-marches (trace ~0.22 ms, just the stale check). Moving at 120
+//! px/s re-marches only the leading edge, ~150-160 cascade-0 probes per
+//! frame of ~20k in the circle, and far fewer in coarser cascades, which
+//! scroll in bigger steps. A full re-march (`T`) after scrolling continued
+//! the error's smooth convergence trend with no jump, so scrolled results
+//! match a fresh trace. Room scene, circle covering the whole canvas: error
+//! figures identical to the uncached runs (7.68%, in-room -1.22%, wall
+//! faces -6.39%), but cascade work is 32.7 ms vs 24.5 ms with the removed
+//! coarse passes: the direct gather is ~5.9 ms, each bounce gather 10.8-15.8
+//! ms. The bounce lookup per diffuse hit (normal from 4 SDF evaluations, an
+//! SDF test per probe, 16 loads) now dominates, not marching.
 //! A direction-first layout wasn't tried: its payoff is hardware-filtered
 //! probe blending, which the bilinear fix can't use (each neighbour is
 //! merged with its own near segment before weighting).
@@ -139,7 +165,10 @@ use bevy::{
     window::WindowResolution,
 };
 
+mod cache;
 mod room;
+
+use cache::{CacheLayout, LayoutInputs};
 
 const SIZE: u32 = 512;
 const _: () = assert!(SIZE.is_power_of_two(), "probe grids assume exact halving");
@@ -209,7 +238,12 @@ struct Rc2dSettings {
     scene: u32,
     /// Diffuse bounces in the room scene (scene 0 has no diffuse surfaces).
     bounces: u32,
-    coarse_bounce_passes: bool,
+    /// Circle of live probes; see the WASD control.
+    circle_center: Vec2,
+    circle_radius: f32,
+    /// Bumped whenever the hit cache must be thrown away; the render world
+    /// clears the tags when it sees a new value.
+    cache_generation: u32,
     /// Frames averaged into the jittered history; like `ref_frame`, 0 means
     /// overwrite. Reset whenever anything the cascades depend on changes.
     rc_frame: u32,
@@ -235,26 +269,42 @@ impl Default for Rc2dSettings {
             per_direction_levels: 2,
             scene: 0,
             bounces: 2,
-            // Measured free accuracy-wise; see the module docs.
-            coarse_bounce_passes: true,
+            circle_center: Vec2::splat(SIZE as f32 / 2.0),
+            circle_radius: 160.0,
+            cache_generation: 0,
             rc_frame: 0,
         }
     }
 }
 
-type CascadeKey = (u32, bool, u32, u32, [u32; 2], bool, u32, u32, bool);
+/// Everything the cached hits depend on: geometry (scene and the light,
+/// which also occludes) and which segments each ray marches.
+type HitCacheKey = (u32, bool, u32, u32, [u32; 2], u32, u32);
+/// Everything the displayed cascades depend on; restarts the jitter average.
+type CascadeKey = (HitCacheKey, bool, u32, [u32; 2]);
 
 impl Rc2dSettings {
-    /// Probe spacing (log2) and interval scale b for one cascade pass. With
-    /// coarse bounce passes, the passes before the last run at double
-    /// spacing and double b, keeping the b-to-spacing ratio measured best.
-    fn pass_layout(&self, iteration: u32) -> (u32, f32) {
-        let last = iteration == self.effective_bounces();
-        if self.coarse_bounce_passes && !last {
-            (self.probe0_log2 + 1, self.base_interval * 2.0)
-        } else {
-            (self.probe0_log2, self.base_interval)
-        }
+    fn hit_cache_key(&self) -> HitCacheKey {
+        (
+            self.base_interval.to_bits(),
+            self.bilinear_fix,
+            self.per_direction_levels,
+            self.probe0_log2,
+            [self.light_pos.x.to_bits(), self.light_pos.y.to_bits()],
+            self.scene,
+            self.cache_layout().radius.to_bits(),
+        )
+    }
+
+    fn cache_layout(&self) -> CacheLayout {
+        CacheLayout::new(&LayoutInputs {
+            canvas: SIZE,
+            probe0_log2: self.probe0_log2,
+            cascade_count: self.cascade_count(),
+            per_direction_levels: self.per_direction_levels,
+            bilinear_fix: self.bilinear_fix,
+            radius: self.circle_radius,
+        })
     }
 
     fn effective_bounces(&self) -> u32 {
@@ -265,15 +315,10 @@ impl Rc2dSettings {
     /// jittered average.
     fn cascade_key(&self) -> CascadeKey {
         (
-            self.base_interval.to_bits(),
-            self.bilinear_fix,
-            self.per_direction_levels,
-            self.probe0_log2,
-            [self.light_pos.x.to_bits(), self.light_pos.y.to_bits()],
+            self.hit_cache_key(),
             self.jitter,
-            self.scene,
             self.effective_bounces(),
-            self.coarse_bounce_passes,
+            [self.circle_center.x.to_bits(), self.circle_center.y.to_bits()],
         )
     }
 
@@ -301,9 +346,6 @@ fn cascade_count_for(base_interval: f32) -> u32 {
         .unwrap_or(MAX_CASCADES)
 }
 
-impl Rc2dSettings {
-}
-
 #[derive(Resource, Clone, ExtractResource)]
 struct Rc2dBuffers {
     cascade_a: Handle<ShaderBuffer>,
@@ -313,6 +355,11 @@ struct Rc2dBuffers {
     rc_history: Handle<ShaderBuffer>,
     /// Cascade 0 of the previous bounce pass.
     bounce_src: Handle<ShaderBuffer>,
+    /// Hit cache: cached hit fractions, slot tags, per-cascade re-march
+    /// counters.
+    hits: Handle<ShaderBuffer>,
+    tags: Handle<ShaderBuffer>,
+    remarched: Handle<ShaderBuffer>,
     display: Handle<Image>,
 }
 
@@ -327,6 +374,7 @@ fn bounce_pass_span(iteration: u32) -> String {
     format!("rc2d_bounce_pass_{iteration}")
 }
 const REFERENCE_SPAN: &str = "rc2d_reference";
+const TRACE_SPAN: &str = "rc2d_trace";
 const RESOLVE_SPAN: &str = "rc2d_resolve";
 
 impl Plugin for Rc2dPlugin {
@@ -341,7 +389,14 @@ impl Plugin for Rc2dPlugin {
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
-                (input, advance_reference, request_error_readback, log_gpu_timings).chain(),
+                (
+                    input,
+                    advance_reference,
+                    request_error_readback,
+                    log_gpu_timings,
+                    request_remarch_readback,
+                )
+                    .chain(),
             );
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
@@ -389,6 +444,9 @@ fn setup(
         error: buffer(PIXELS * ERROR_BYTES_PER_PIXEL),
         rc_history: buffer(PIXELS * VEC4),
         bounce_src: buffer(CASCADE_ENTRIES * CASCADE_ENTRY_BYTES),
+        hits: buffer(cache::HIT_BUDGET_BYTES),
+        tags: buffer(cache::TAG_CAPACITY_WORDS * 4),
+        remarched: buffer(MAX_CASCADES as u64 * 4),
         display: display.clone(),
     });
 
@@ -405,6 +463,7 @@ fn setup(
 fn input(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    time: Res<Time>,
     mut cursor_moved: MessageReader<CursorMoved>,
     mut cursor: Local<Option<Vec2>>,
     mut settings: ResMut<Rc2dSettings>,
@@ -420,6 +479,36 @@ fn input(
     {
         settings.light_pos = pos;
         settings.reset_reference = true;
+    }
+    if mouse.pressed(MouseButton::Right)
+        && let Some(pos) = *cursor
+    {
+        settings.circle_center = pos;
+    }
+    let mut step = Vec2::ZERO;
+    for (key, dir) in [
+        (KeyCode::KeyW, Vec2::NEG_Y),
+        (KeyCode::KeyS, Vec2::Y),
+        (KeyCode::KeyA, Vec2::NEG_X),
+        (KeyCode::KeyD, Vec2::X),
+    ] {
+        if keys.pressed(key) {
+            step += dir;
+        }
+    }
+    if step != Vec2::ZERO {
+        let speed = 120.0;
+        settings.circle_center = (settings.circle_center + step.normalize() * speed * time.delta_secs())
+            .clamp(Vec2::ZERO, Vec2::splat(SIZE as f32));
+    }
+    if keys.just_pressed(KeyCode::Minus) {
+        settings.circle_radius = (settings.circle_radius - 16.0).max(32.0);
+    }
+    if keys.just_pressed(KeyCode::Equal) {
+        settings.circle_radius = (settings.circle_radius + 16.0).min(368.0);
+    }
+    if keys.just_pressed(KeyCode::KeyT) {
+        settings.cache_generation += 1;
     }
 
     for (key, mode) in [(KeyCode::Digit1, 0), (KeyCode::Digit2, 1), (KeyCode::Digit3, 2)] {
@@ -452,7 +541,7 @@ fn input(
     if keys.just_pressed(KeyCode::KeyJ) {
         settings.jitter = !settings.jitter;
     }
-    if keys.just_pressed(KeyCode::KeyS) {
+    if keys.just_pressed(KeyCode::Tab) {
         settings.scene ^= 1;
         settings.light_pos = scene_light_start(settings.scene);
         settings.reset_reference = true;
@@ -462,10 +551,7 @@ fn input(
         // The reference path-traces the same number of bounces.
         settings.reset_reference = true;
     }
-    if keys.just_pressed(KeyCode::KeyC) {
-        settings.coarse_bounce_passes = !settings.coarse_bounce_passes;
-    }
-    if keys.just_pressed(KeyCode::KeyD) {
+    if keys.just_pressed(KeyCode::KeyL) {
         settings.per_direction_levels = match settings.per_direction_levels {
             0..3 => settings.per_direction_levels + 1,
             3 => MAX_CASCADES,
@@ -474,10 +560,10 @@ fn input(
     }
     if settings.is_changed() && keys.get_just_pressed().next().is_some() {
         info!(
-            "scene={} bounces={} coarse_bounce_passes={} view={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={}",
+            "scene={} bounces={} circle_radius={} view={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={}",
             settings.scene,
             settings.effective_bounces(),
-            settings.coarse_bounce_passes,
+            settings.cache_layout().radius,
             ["cascades", "reference", "difference"][settings.view_mode as usize],
             settings.bilinear_fix,
             settings.per_direction_levels,
@@ -495,7 +581,24 @@ fn input(
 fn advance_reference(
     mut settings: ResMut<Rc2dSettings>,
     mut last_cascade_key: Local<Option<CascadeKey>>,
+    mut last_hit_key: Local<Option<HitCacheKey>>,
+    mut warned_radius: Local<f32>,
 ) {
+    // Jitter rotates every ray each frame, so nothing cached stays valid.
+    let hit_key = settings.hit_cache_key();
+    if last_hit_key.replace(hit_key) != Some(hit_key) || settings.jitter {
+        settings.cache_generation += 1;
+    }
+    let radius = settings.cache_layout().radius;
+    if radius < settings.circle_radius && radius != *warned_radius {
+        warn!(
+            "circle radius {} doesn't fit the {} MiB hit cache with these settings; using {radius}",
+            settings.circle_radius,
+            cache::HIT_BUDGET_BYTES >> 20
+        );
+        *warned_radius = radius;
+    }
+
     if settings.reset_reference {
         settings.ref_frame = 0;
         settings.reset_reference = false;
@@ -535,6 +638,7 @@ fn log_gpu_timings(
     let reference_span = (!settings.reference_paused).then(|| REFERENCE_SPAN.to_string());
     for span in reference_span
         .into_iter()
+        .chain([TRACE_SPAN.to_string()])
         .chain((0..settings.cascade_count()).rev().map(cascade_span))
         .chain([RESOLVE_SPAN.to_string()])
     {
@@ -555,7 +659,9 @@ fn log_gpu_timings(
 
     let cascades: f64 = stages
         .iter()
-        .filter(|(name, _)| name.starts_with("cascade") || name.starts_with("bounce_pass"))
+        .filter(|(name, _)| {
+            name.starts_with("cascade") || name.starts_with("bounce_pass") || name == "trace"
+        })
         .map(|(_, ms)| ms)
         .sum();
     let breakdown: Vec<String> = stages
@@ -563,7 +669,7 @@ fn log_gpu_timings(
         .map(|(name, ms)| format!("{name} {ms:.2}"))
         .collect();
     info!(
-        "GPU ms | cascades total {cascades:.2} over {} pass(es) (bilinear_fix={}) | {}",
+        "GPU ms | cascades total {cascades:.2} (trace + {} gather pass(es), bilinear_fix={}) | {}",
         settings.effective_bounces() + 1,
         settings.bilinear_fix,
         breakdown.join(", ")
@@ -625,11 +731,10 @@ fn request_error_readback(
                     String::new()
                 };
                 info!(
-                    "relative RMSE {:.3}% over {pixels} px{room_stats} | scene={} bounces={} coarse_bounce_passes={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={} | reference {rays} rays/px",
+                    "relative RMSE {:.3}% over {pixels} px in the circle{room_stats} | scene={} bounces={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={} | reference {rays} rays/px",
                     100.0 * (err / reference.max(f64::MIN_POSITIVE)).sqrt(),
                     settings.scene,
                     settings.effective_bounces(),
-                    settings.coarse_bounce_passes,
                     settings.bilinear_fix,
                     settings.per_direction_levels,
                     settings.jitter,
@@ -639,6 +744,43 @@ fn request_error_readback(
                 );
             },
         );
+}
+
+/// Logs how many probes each cascade re-marched in one frame: zero while
+/// the circle is still, only the entering edge while it moves.
+fn request_remarch_readback(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut timer: Local<Option<Timer>>,
+    buffers: Res<Rc2dBuffers>,
+) {
+    let timer = timer.get_or_insert_with(|| Timer::from_seconds(2.0, TimerMode::Repeating));
+    if !timer.tick(time.delta()).just_finished() {
+        return;
+    }
+    commands.spawn(Readback::buffer(buffers.remarched.clone())).observe(
+        |event: On<ReadbackComplete>,
+         settings: Res<Rc2dSettings>,
+         mut commands: Commands,
+         mut handled: Local<bool>| {
+            if std::mem::replace(&mut *handled, true) {
+                return;
+            }
+            commands.entity(event.entity).try_despawn();
+            let layout = settings.cache_layout();
+            let counts: Vec<String> = event
+                .data
+                .chunks_exact(4)
+                .zip(&layout.cascades)
+                .enumerate()
+                .map(|(n, (word, window))| {
+                    let count = u32::from_le_bytes(word.try_into().unwrap());
+                    format!("c{n} {count}/{}", window.size * window.size)
+                })
+                .collect();
+            info!("re-marched probes this frame (of window slots): {}", counts.join(", "));
+        },
+    );
 }
 
 // ---------------------------------------------------------------- render
@@ -664,13 +806,25 @@ struct Params {
     scene_id: u32,
     bounces: u32,
     bounce_iteration: u32,
-    bounce_probe0_log2: u32,
+    circle_center: Vec2,
+    window: u32,
+    radius: f32,
+    tag_base: u32,
+    child_window: u32,
+    child_radius: f32,
+    child_tag_base: u32,
+    c0_window: u32,
+    c0_radius: f32,
+    c0_tag_base: u32,
+    hit_base: u32,
 }
 
 #[derive(Resource)]
 struct Rc2dPipelines {
     layout: BindGroupLayoutDescriptor,
-    cascade: CachedComputePipelineId,
+    trace: CachedComputePipelineId,
+    commit: CachedComputePipelineId,
+    gather: CachedComputePipelineId,
     reference: CachedComputePipelineId,
     resolve: CachedComputePipelineId,
 }
@@ -695,6 +849,9 @@ fn init_pipelines(
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
                 storage_buffer_sized(false, pixel_size),
                 storage_buffer_read_only_sized(false, cascade_size),
+                storage_buffer_sized(false, std::num::NonZero::new(cache::HIT_BUDGET_BYTES)),
+                storage_buffer_sized(false, std::num::NonZero::new(cache::TAG_CAPACITY_WORDS * 4)),
+                storage_buffer_sized(false, std::num::NonZero::new(MAX_CASCADES as u64 * 4)),
             ),
         ),
     );
@@ -709,14 +866,14 @@ fn init_pipelines(
             ..default()
         })
     };
-    let (cascade, reference, resolve) =
-        (queue("cascade"), queue("reference_accumulate"), queue("resolve"));
 
     commands.insert_resource(Rc2dPipelines {
-        layout,
-        cascade,
-        reference,
-        resolve,
+        layout: layout.clone(),
+        trace: queue("cascade_trace"),
+        commit: queue("cascade_commit"),
+        gather: queue("cascade_gather"),
+        reference: queue("reference_accumulate"),
+        resolve: queue("resolve"),
     });
 }
 
@@ -731,28 +888,38 @@ fn run_rc2d(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     mut params: Local<DynamicUniformBuffer<Params>>,
+    mut cleared_generation: Local<Option<u32>>,
     mut ctx: RenderContext,
 ) {
-    let (Some(cascade_pipeline), Some(reference_pipeline), Some(resolve_pipeline)) = (
-        pipeline_cache.get_compute_pipeline(pipelines.cascade),
+    let (Some(trace_pipeline), Some(commit_pipeline), Some(gather_pipeline), Some(reference_pipeline), Some(resolve_pipeline)) = (
+        pipeline_cache.get_compute_pipeline(pipelines.trace),
+        pipeline_cache.get_compute_pipeline(pipelines.commit),
+        pipeline_cache.get_compute_pipeline(pipelines.gather),
         pipeline_cache.get_compute_pipeline(pipelines.reference),
         pipeline_cache.get_compute_pipeline(pipelines.resolve),
     ) else {
         return;
     };
-    let (Some(a), Some(b), Some(reference), Some(error), Some(rc_history), Some(bounce_src), Some(display)) = (
-        gpu_buffers.get(&buffers.cascade_a),
-        gpu_buffers.get(&buffers.cascade_b),
-        gpu_buffers.get(&buffers.reference),
-        gpu_buffers.get(&buffers.error),
-        gpu_buffers.get(&buffers.rc_history),
-        gpu_buffers.get(&buffers.bounce_src),
+    let gpu = |handle: &Handle<ShaderBuffer>| gpu_buffers.get(handle).map(|b| b.buffer.clone());
+    let (Some(a), Some(b), Some(reference), Some(error), Some(rc_history), Some(bounce_src), Some(hits), Some(tags), Some(remarched), Some(display)) = (
+        gpu(&buffers.cascade_a),
+        gpu(&buffers.cascade_b),
+        gpu(&buffers.reference),
+        gpu(&buffers.error),
+        gpu(&buffers.rc_history),
+        gpu(&buffers.bounce_src),
+        gpu(&buffers.hits),
+        gpu(&buffers.tags),
+        gpu(&buffers.remarched),
         gpu_images.get(&buffers.display),
     ) else {
         return;
     };
 
     let cascade_count = settings.cascade_count();
+    let layout = settings.cache_layout();
+    let windows = &layout.cascades;
+    let c0 = windows[0];
     let base = Params {
         size: UVec2::splat(SIZE),
         cascade: 0,
@@ -773,32 +940,42 @@ fn run_rc2d(
         scene_id: settings.scene,
         bounces: settings.effective_bounces(),
         bounce_iteration: 0,
-        bounce_probe0_log2: settings.probe0_log2,
+        circle_center: settings.circle_center,
+        window: c0.size,
+        radius: c0.radius,
+        tag_base: c0.tag_base,
+        child_window: 0,
+        child_radius: 0.0,
+        child_tag_base: 0,
+        c0_window: c0.size,
+        c0_radius: c0.radius,
+        c0_tag_base: c0.tag_base,
+        hit_base: c0.hit_base,
     };
     params.clear();
-    // Offsets [iteration][cascade] for the cascade passes; the last one is
-    // shared by the reference and resolve passes, which ignore both. Each
-    // pass has its own probe spacing and b (see pass_layout), and reads
-    // bounce_src at the previous pass's spacing.
+    // Offsets [iteration][cascade]; iteration 0's also drive trace and
+    // commit. The last offset is shared by the reference and resolve passes.
     let passes = settings.effective_bounces() + 1;
-    let pass_params: Vec<Params> = (0..passes)
-        .map(|bounce_iteration| {
-            let (probe0_log2, base_interval) = settings.pass_layout(bounce_iteration);
-            Params {
-                bounce_iteration,
-                probe0_log2,
-                base_interval,
-                cascade_count: cascade_count_for(base_interval),
-                bounce_probe0_log2: settings.pass_layout(bounce_iteration.saturating_sub(1)).0,
-                ..base
-            }
-        })
-        .collect();
-    let cascade_offsets: Vec<Vec<u32>> = pass_params
-        .iter()
-        .map(|pass| {
-            (0..pass.cascade_count)
-                .map(|cascade| params.push(&Params { cascade, ..*pass }))
+    let cascade_params = |cascade: u32, bounce_iteration: u32| {
+        let own = windows[cascade as usize];
+        let child = windows.get(cascade as usize + 1).copied().unwrap_or_default();
+        Params {
+            cascade,
+            bounce_iteration,
+            window: own.size,
+            radius: own.radius,
+            tag_base: own.tag_base,
+            hit_base: own.hit_base,
+            child_window: child.size,
+            child_radius: child.radius,
+            child_tag_base: child.tag_base,
+            ..base
+        }
+    };
+    let offsets: Vec<Vec<u32>> = (0..passes)
+        .map(|iteration| {
+            (0..cascade_count)
+                .map(|cascade| params.push(&cascade_params(cascade, iteration)))
                 .collect()
         })
         .collect();
@@ -808,30 +985,41 @@ fn run_rc2d(
         return;
     };
 
-    // Cascades run top-down, ping-ponging: cascade n reads n+1 from `src`
+    // Gathers run top-down, ping-ponging: cascade n reads n+1 from `src`
     // and writes `dst`. Even cascades write A, so cascade 0 ends up in A.
-    let layout = pipeline_cache.get_bind_group_layout(&pipelines.layout);
+    let bind_group_layout = pipeline_cache.get_bind_group_layout(&pipelines.layout);
     let bind_group = |src: &Buffer, dst: &Buffer| {
         render_device.create_bind_group(
             "rc2d",
-            &layout,
+            &bind_group_layout,
             &BindGroupEntries::sequential((
                 params_binding.clone(),
                 src.as_entire_buffer_binding(),
                 dst.as_entire_buffer_binding(),
-                reference.buffer.as_entire_buffer_binding(),
-                error.buffer.as_entire_buffer_binding(),
+                reference.as_entire_buffer_binding(),
+                error.as_entire_buffer_binding(),
                 &display.texture_view,
-                rc_history.buffer.as_entire_buffer_binding(),
-                bounce_src.buffer.as_entire_buffer_binding(),
+                rc_history.as_entire_buffer_binding(),
+                bounce_src.as_entire_buffer_binding(),
+                hits.as_entire_buffer_binding(),
+                tags.as_entire_buffer_binding(),
+                remarched.as_entire_buffer_binding(),
             )),
         )
     };
-    let writes_a = bind_group(&b.buffer, &a.buffer);
-    let writes_b = bind_group(&a.buffer, &b.buffer);
+    let writes_a = bind_group(&b, &a);
+    let writes_b = bind_group(&a, &b);
+
+    // Invalidation: zeroed tags match no probe, so everything re-marches.
+    if *cleared_generation != Some(settings.cache_generation) {
+        ctx.command_encoder().clear_buffer(&tags, 0, None);
+        *cleared_generation = Some(settings.cache_generation);
+    }
+    ctx.command_encoder().clear_buffer(&remarched, 0, None);
 
     let pixel_groups = SIZE.div_ceil(8);
-    let entries_at = |probe0_log2: u32| (CASCADE_ENTRIES >> (2 * probe0_log2)) as u32;
+    let slots = |cascade: u32| windows[cascade as usize].size.pow(2);
+    let rays = |cascade: u32| 4u32 << (2 * cascade);
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let pass_descriptor = ComputePassDescriptor {
@@ -848,23 +1036,38 @@ fn run_rc2d(
         span.end(&mut pass);
     }
 
-    // One full cascade pass per bounce, plus the direct pass. Between
-    // passes, cascade 0 (in A) is copied to bounce_src, where the next pass
-    // reads it to light diffuse surfaces. The final pass gets per-cascade
-    // timing spans; earlier ones are timed whole.
+    // Trace: re-march stale probes of every cascade, then commit the tags.
+    {
+        let mut pass = ctx.command_encoder().begin_compute_pass(&pass_descriptor);
+        let span = diagnostics.pass_span(&mut pass, TRACE_SPAN);
+        pass.set_pipeline(trace_pipeline);
+        for cascade in 0..cascade_count {
+            pass.set_bind_group(0, &writes_a, &[offsets[0][cascade as usize]]);
+            pass.dispatch_workgroups((slots(cascade) * rays(cascade)).div_ceil(64), 1, 1);
+        }
+        pass.set_pipeline(commit_pipeline);
+        for cascade in 0..cascade_count {
+            pass.set_bind_group(0, &writes_a, &[offsets[0][cascade as usize]]);
+            pass.dispatch_workgroups(slots(cascade).div_ceil(64), 1, 1);
+        }
+        span.end(&mut pass);
+    }
+
+    // One gather per bounce, plus the direct one, all over the same cached
+    // hits. Between passes, cascade 0 (in A) is copied to bounce_src, where
+    // the next pass reads it to light diffuse surfaces. The final pass gets
+    // per-cascade timing spans; earlier ones are timed whole.
     for iteration in 0..passes {
         let last = iteration + 1 == passes;
-        let pass_params = &pass_params[iteration as usize];
-        let entries = entries_at(pass_params.probe0_log2);
         {
             let mut pass = ctx.command_encoder().begin_compute_pass(&pass_descriptor);
             let whole = (!last).then(|| diagnostics.pass_span(&mut pass, bounce_pass_span(iteration)));
-            pass.set_pipeline(cascade_pipeline);
-            for cascade in (0..pass_params.cascade_count).rev() {
+            pass.set_pipeline(gather_pipeline);
+            for cascade in (0..cascade_count).rev() {
                 let span = last.then(|| diagnostics.pass_span(&mut pass, cascade_span(cascade)));
                 let group = if cascade % 2 == 0 { &writes_a } else { &writes_b };
-                pass.set_bind_group(0, group, &[cascade_offsets[iteration as usize][cascade as usize]]);
-                pass.dispatch_workgroups(entries.div_ceil(64), 1, 1);
+                pass.set_bind_group(0, group, &[offsets[iteration as usize][cascade as usize]]);
+                pass.dispatch_workgroups((slots(cascade) * rays(cascade)).div_ceil(64), 1, 1);
                 if let Some(span) = span {
                     span.end(&mut pass);
                 }
@@ -875,11 +1078,11 @@ fn run_rc2d(
         }
         if !last {
             ctx.command_encoder().copy_buffer_to_buffer(
-                &a.buffer,
+                &a,
                 0,
-                &bounce_src.buffer,
+                &bounce_src,
                 0,
-                entries as u64 * CASCADE_ENTRY_BYTES,
+                (slots(0) * rays(0)) as u64 * CASCADE_ENTRY_BYTES,
             );
         }
     }
