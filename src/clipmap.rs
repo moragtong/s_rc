@@ -42,8 +42,9 @@ use bevy::{
 use crate::scene3d::SceneBoxMesh;
 use crate::sdf_bake::{self, SdfGrid};
 
-/// Voxels per axis: 256 at 12.5 cm spans 32 m, +-16 m around the camera.
-pub const RESOLUTION: i32 = 256;
+/// Voxels per axis: 384 at 12.5 cm spans 48 m, +-24 m around the camera,
+/// which holds the whole 24 m ground slab from anywhere around the room.
+pub const RESOLUTION: i32 = 384;
 pub const VOXEL: f32 = 0.125;
 pub const FORMAT: TextureFormat = TextureFormat::R16Float;
 pub const ALBEDO_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;

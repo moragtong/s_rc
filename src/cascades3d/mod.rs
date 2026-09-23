@@ -30,6 +30,7 @@ use layout::{CASCADES, CascadeWindow, Layout, octa_side};
 
 const SHADER: &str = "shaders/cascades3d.wgsl";
 const TRACE_SPAN: &str = "cascades3d_trace";
+const SELECT_SPAN: &str = "cascades3d_select";
 
 /// First SDF view mode that shows lighting (exports radiance).
 pub const LIGHTING_MODE: u32 = 3;
@@ -92,8 +93,8 @@ fn log_cascade_timings(time: Res<Time>, mut timer: Local<Option<Timer>>, frame: 
     let ms = |span: &str| store.get(&DiagnosticPath::new(format!("render/{span}/elapsed_gpu"))).and_then(|d| d.smoothed());
     let gathers: Vec<String> =
         (0..CASCADES).rev().filter_map(|n| ms(&gather_span(n)).map(|v| format!("c{n} {v:.2}"))).collect();
-    if let Some(trace) = ms(TRACE_SPAN) {
-        info!("cascades3d GPU ms: trace {trace:.2} | gather {}", gathers.join(", "));
+    if let (Some(select), Some(trace)) = (ms(SELECT_SPAN), ms(TRACE_SPAN)) {
+        info!("cascades3d GPU ms: select {select:.2}, trace {trace:.2} | gather {}", gathers.join(", "));
     }
 }
 
@@ -138,13 +139,20 @@ pub struct Cascades3dGpu {
     pub tags: Buffer,
     /// Per slot, which trilinear children are reachable (see the shader).
     child_masks: Buffer,
-    remarched: Buffer,
+    /// Per cascade: probes to trace this frame, their slots, and the
+    /// dispatch arguments (see the shader), copied to `indirect`.
+    work_count: Buffer,
+    work_list: Buffer,
+    dispatch_args: Buffer,
+    indirect: Buffer,
     solid_angles: Buffer,
     /// Per cascade-0 direction cell: sub-directions and solid angles, for
     /// cosine-weighted irradiance.
     pub shading_subsamples: Buffer,
     angle_bases: Vec<u32>,
     bind_group_layout: BindGroupLayoutDescriptor,
+    select: CachedComputePipelineId,
+    write_args: CachedComputePipelineId,
     trace: CachedComputePipelineId,
     commit: CachedComputePipelineId,
     gather: CachedComputePipelineId,
@@ -209,6 +217,8 @@ fn init_cascades_gpu(
                 storage_buffer_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_sized(false, None),
+                storage_buffer_sized(false, None),
+                storage_buffer_sized(false, None),
             ),
         ),
     );
@@ -223,6 +233,7 @@ fn init_cascades_gpu(
         })
     };
 
+    let (select, write_args) = (queue("select_probes"), queue("write_args"));
     let (trace, commit, gather) = (queue("trace"), queue("commit"), queue("gather"));
     commands.insert_resource(Cascades3dGpu {
         radiance_a: storage(&render_device, "cascades3d_radiance_a", layout.max_rays * 8),
@@ -230,11 +241,21 @@ fn init_cascades_gpu(
         hits: storage(&render_device, "cascades3d_hits", layout.hit_words * 4),
         tags: storage(&render_device, "cascades3d_tags", layout.tag_words * 4),
         child_masks: storage(&render_device, "cascades3d_child_masks", layout.tag_words * 4),
-        remarched: storage(&render_device, "cascades3d_remarched", CASCADES as u64 * 4),
+        work_count: storage(&render_device, "cascades3d_work_count", CASCADES as u64 * 4),
+        work_list: storage(&render_device, "cascades3d_work_list", layout.tag_words * 4),
+        dispatch_args: storage(&render_device, "cascades3d_dispatch_args", CASCADES as u64 * 12),
+        indirect: render_device.create_buffer(&BufferDescriptor {
+            label: Some("cascades3d_indirect"),
+            size: CASCADES as u64 * 12,
+            usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }),
         solid_angles,
         shading_subsamples,
         angle_bases,
         bind_group_layout,
+        select,
+        write_args,
         trace,
         commit,
         gather,
@@ -271,12 +292,14 @@ fn run_cascades(
     if !frame.active {
         return;
     }
-    for id in [gpu.trace, gpu.commit, gpu.gather] {
+    for id in [gpu.select, gpu.write_args, gpu.trace, gpu.commit, gpu.gather] {
         if let CachedPipelineState::Err(e) = pipeline_cache.get_compute_pipeline_state(id) {
             error_once!("cascades3d pipeline failed: {e}");
         }
     }
-    let (Some(trace), Some(commit), Some(gather)) = (
+    let (Some(select), Some(write_args), Some(trace), Some(commit), Some(gather)) = (
+        pipeline_cache.get_compute_pipeline(gpu.select),
+        pipeline_cache.get_compute_pipeline(gpu.write_args),
         pipeline_cache.get_compute_pipeline(gpu.trace),
         pipeline_cache.get_compute_pipeline(gpu.commit),
         pipeline_cache.get_compute_pipeline(gpu.gather),
@@ -329,9 +352,11 @@ fn run_cascades(
                 dst.as_entire_buffer_binding(),
                 gpu.hits.as_entire_buffer_binding(),
                 gpu.tags.as_entire_buffer_binding(),
-                gpu.remarched.as_entire_buffer_binding(),
+                gpu.work_count.as_entire_buffer_binding(),
                 gpu.solid_angles.as_entire_buffer_binding(),
                 gpu.child_masks.as_entire_buffer_binding(),
+                gpu.work_list.as_entire_buffer_binding(),
+                gpu.dispatch_args.as_entire_buffer_binding(),
             )),
         )
     };
@@ -343,20 +368,38 @@ fn run_cascades(
         ctx.command_encoder().clear_buffer(&gpu.tags, 0, None);
         *cleared_generation = Some(frame.generation);
     }
-    ctx.command_encoder().clear_buffer(&gpu.remarched, 0, None);
+    ctx.command_encoder().clear_buffer(&gpu.work_count, 0, None);
 
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
-    let mut pass = ctx.command_encoder().begin_compute_pass(&ComputePassDescriptor {
-        label: Some("cascades3d"),
-        timestamp_writes: None,
-    });
+    let descriptor = ComputePassDescriptor { label: Some("cascades3d"), timestamp_writes: None };
 
+    // Which probes need tracing, and the indirect arguments for them. The
+    // arguments are copied to a separate buffer between passes: a buffer
+    // can't be writable storage and indirect in the same dispatch.
+    {
+        let mut pass = ctx.command_encoder().begin_compute_pass(&descriptor);
+        let span = diagnostics.pass_span(&mut pass, SELECT_SPAN);
+        pass.set_pipeline(select);
+        for (w, offset) in windows.iter().zip(&offsets) {
+            pass.set_bind_group(0, &writes_a, &[*offset]);
+            dispatch_linear(&mut pass, w.size.pow(3));
+        }
+        pass.set_pipeline(write_args);
+        for offset in &offsets {
+            pass.set_bind_group(0, &writes_a, &[*offset]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        span.end(&mut pass);
+    }
+    ctx.command_encoder().copy_buffer_to_buffer(&gpu.dispatch_args, 0, &gpu.indirect, 0, CASCADES as u64 * 12);
+
+    let mut pass = ctx.command_encoder().begin_compute_pass(&descriptor);
     let span = diagnostics.pass_span(&mut pass, TRACE_SPAN);
     pass.set_pipeline(trace);
-    for (w, offset) in windows.iter().zip(&offsets) {
+    for (n, offset) in offsets.iter().enumerate() {
         pass.set_bind_group(0, &writes_a, &[*offset]);
-        dispatch_linear(&mut pass, w.rays() as u32);
+        pass.dispatch_workgroups_indirect(&gpu.indirect, n as u64 * 12);
     }
     pass.set_pipeline(commit);
     for (w, offset) in windows.iter().zip(&offsets) {

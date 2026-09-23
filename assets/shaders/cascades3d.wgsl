@@ -59,12 +59,17 @@ struct Params {
 @group(0) @binding(7) var<storage, read_write> hits: array<u32>;
 // Which world probe each slot's cached hits belong to (0 = none).
 @group(0) @binding(8) var<storage, read_write> tags: array<u32>;
-@group(0) @binding(9) var<storage, read_write> remarched: array<atomic<u32>>;
+// Per cascade, probes to (re)trace this frame: their count, then their
+// slots in work_list (indexed like tags), and the indirect dispatch
+// arguments for tracing them (copied out to the indirect buffer).
+@group(0) @binding(9) var<storage, read_write> work_count: array<atomic<u32>>;
 // Solid angle of every octahedral cell, all cascades concatenated.
 @group(0) @binding(10) var<storage, read> solid_angles: array<f32>;
 // Per slot (indexed like tags): bit k set if trilinear child k is reachable,
 // i.e. in empty space with a clear straight line from this probe.
 @group(0) @binding(11) var<storage, read_write> child_masks: array<u32>;
+@group(0) @binding(12) var<storage, read_write> work_list: array<u32>;
+@group(0) @binding(13) var<storage, read_write> dispatch_args: array<u32>;
 
 // ------------------------------------------------------------ geometry
 
@@ -235,19 +240,46 @@ fn merge(near: vec4<f32>, far: vec4<f32>) -> vec4<f32> {
     return vec4(near.rgb + near.a * far.rgb, near.a * far.a);
 }
 
+// Per slot: a live probe whose cached hits belong to another world probe
+// (or none) goes on this frame's work list. Tracing then runs over the list
+// only, not over every ray of every window just to find them.
+@compute @workgroup_size(64, 1, 1)
+fn select_probes(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let slot = linear_index(gid, groups);
+    if slot >= params.window * params.window * params.window {
+        return;
+    }
+    let world = slot_world(slot, params.spacing, params.window);
+    if probe_valid(world, params.spacing, params.radius) && tags[params.tag_base + slot] != pack_tag(world) {
+        work_list[params.tag_base + atomicAdd(&work_count[params.pass_index], 1u)] = slot;
+    }
+}
+
+// One thread per cascade: indirect dispatch arguments for tracing its work
+// list, spread over y past 32768 workgroups like `dispatch_linear`.
+@compute @workgroup_size(1, 1, 1)
+fn write_args() {
+    let threads = atomicLoad(&work_count[params.pass_index]) * params.octa_side * params.octa_side;
+    let groups = (threads + 63u) / 64u;
+    let x = min(groups, 32768u);
+    let base = params.pass_index * 3u;
+    dispatch_args[base] = x;
+    dispatch_args[base + 1u] = select((groups + 32767u) / 32768u, 1u, groups <= 32768u);
+    dispatch_args[base + 2u] = 1u;
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    let id = vec3(linear_index(gid, groups), 0u, 0u);
+    let id = linear_index(gid, groups);
     let rays = params.octa_side * params.octa_side;
-    if id.x >= params.window * params.window * params.window * rays {
+    let entry = id / rays;
+    if entry >= atomicLoad(&work_count[params.pass_index]) {
         return;
     }
-    let ray = id.x % rays;
-    let slot = id.x / rays;
+    let ray = id % rays;
+    let slot = work_list[params.tag_base + entry];
+    let ray_slot = slot * rays + ray;
     let world = slot_world(slot, params.spacing, params.window);
-    if !probe_valid(world, params.spacing, params.radius) || tags[params.tag_base + slot] == pack_tag(world) {
-        return;
-    }
     let count = segment_count();
     for (var k = 0u; k < count; k += 2u) {
         let first = march_fraction(segment(world, ray, k));
@@ -255,13 +287,10 @@ fn trace(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups)
         if k + 1u < count {
             second = march_fraction(segment(world, ray, k + 1u));
         }
-        hits[hit_word(id.x, k)] = pack2x16unorm(vec2(first, second));
+        hits[hit_word(ray_slot, k)] = pack2x16unorm(vec2(first, second));
     }
-    if ray == 0u {
-        atomicAdd(&remarched[params.pass_index], 1u);
-        if has_children() {
-            child_masks[params.tag_base + slot] = reachable_children(world);
-        }
+    if ray == 0u && has_children() {
+        child_masks[params.tag_base + slot] = reachable_children(world);
     }
 }
 
