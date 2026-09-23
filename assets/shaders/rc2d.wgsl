@@ -58,6 +58,10 @@ struct Params {
     // Cascade pass within this frame. Pass 0 is direct light only; pass
     // k > 0 lights diffuse surfaces from pass k-1's cascade 0 (bounce_src).
     bounce_iteration: u32,
+    // log2 of bounce_src's cascade-0 probe spacing: the previous pass's,
+    // which is coarser than this pass's when intermediate passes run at
+    // reduced resolution.
+    bounce_probe0_log2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -194,18 +198,22 @@ fn trace_segment(a: vec2<f32>, b: vec2<f32>) -> vec4<f32> {
 // loses energy rather than leaking it.
 fn bounce_radiance(pos: vec2<f32>, final_pass: bool) -> vec3<f32> {
     let n = scene_normal(pos);
+    // The grid being read: this pass's cascade 0, or the previous pass's.
+    let log2 = select(params.bounce_probe0_log2, params.probe0_log2, final_pass);
+    let spacing = f32(1u << log2);
+    let grid = params.size >> vec2(log2);
     // Sample the probe grid half a spacing off the surface. Exactly on it,
     // the footprint can hold only the probe rows centered on the wall's two
     // faces, which the side test rejects, and the face goes black; half a
     // spacing out, one bracketing row is always strictly in front.
-    let probes = bilinear(pos + n * 0.5 * probe_spacing(0u), 0u);
+    let probes = bilinear_at(pos + n * 0.5 * spacing, spacing);
     var sum = vec3(0.0);
     var weight = 0.0;
     for (var k = 0u; k < 4u; k++) {
-        let probe = bilinear_probe(probes, k, 0u);
-        let center = (vec2<f32>(probe) + 0.5) * probe_spacing(0u);
+        let probe = clamp_probe(probes, k, grid);
+        let center = (vec2<f32>(probe) + 0.5) * spacing;
         if scene(center).dist > 0.0 && dot(center - pos, n) > 0.0 {
-            sum += probes.weights[k] * cosine_weighted(probe, n, final_pass);
+            sum += probes.weights[k] * cosine_weighted(probe, grid, n, final_pass);
             weight += probes.weights[k];
         }
     }
@@ -215,9 +223,9 @@ fn bounce_radiance(pos: vec2<f32>, final_pass: bool) -> vec3<f32> {
 // (1/2) * integral of L_in cos over the half-circle around n, from one
 // cascade-0 probe's 4 arc-averaged rays. Each arc's cosine weight is exact:
 // sin(hi) - sin(lo) over the part of the arc inside [-90, 90] degrees.
-fn cosine_weighted(probe: vec2<u32>, n: vec2<f32>, final_pass: bool) -> vec3<f32> {
+fn cosine_weighted(probe: vec2<u32>, grid: vec2<u32>, n: vec2<f32>, final_pass: bool) -> vec3<f32> {
     let normal_angle = atan2(n.y, n.x);
-    let base = (probe.y * probe_grid(0u).x + probe.x) * 4u;
+    let base = (probe.y * grid.x + probe.x) * 4u;
     var sum = vec3(0.0);
     for (var i = 0u; i < 4u; i++) {
         let d = (f32(i) + 0.5) * TAU / 4.0 + params.ray_rotation - normal_angle;
@@ -254,7 +262,11 @@ struct Bilinear {
 const BILINEAR_OFFSETS = array(vec2(0, 0), vec2(1, 0), vec2(0, 1), vec2(1, 1));
 
 fn bilinear(pos: vec2<f32>, n: u32) -> Bilinear {
-    let g = pos / probe_spacing(n) - 0.5;
+    return bilinear_at(pos, probe_spacing(n));
+}
+
+fn bilinear_at(pos: vec2<f32>, spacing: f32) -> Bilinear {
+    let g = pos / spacing - 0.5;
     let f = g - floor(g);
     return Bilinear(
         vec2<i32>(floor(g)),
@@ -268,7 +280,11 @@ fn bilinear(pos: vec2<f32>, n: u32) -> Bilinear {
 }
 
 fn bilinear_probe(b: Bilinear, k: u32, n: u32) -> vec2<u32> {
-    return vec2<u32>(clamp(b.base + BILINEAR_OFFSETS[k], vec2(0), vec2<i32>(probe_grid(n)) - 1));
+    return clamp_probe(b, k, probe_grid(n));
+}
+
+fn clamp_probe(b: Bilinear, k: u32, grid: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(clamp(b.base + BILINEAR_OFFSETS[k], vec2(0), vec2<i32>(grid) - 1));
 }
 
 fn interval(n: u32) -> vec2<f32> {

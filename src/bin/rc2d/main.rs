@@ -15,6 +15,8 @@
 //!   a spotlight outside its only entrance and lights around its outside
 //!   (resets the light position)
 //! - `G`: cycle diffuse bounces 0-4 (room scene; restarts the reference)
+//! - `C`: run the intermediate bounce passes at double probe spacing
+//!   (they only feed wall lighting); the final, visible pass is unchanged
 //! - `J`: diagnostic: rotate all ray directions by a different angle each
 //!   frame and average the result over frames. Error that goes away is
 //!   aliasing from the fixed ray directions; error that stays is bias.
@@ -95,8 +97,17 @@
 //! room. With the bilinear fix and side-of-surface bounce lookup, no
 //! outside color shows up inside. What's left is blurred, blotchy edges on
 //! the spotlight's cone and beam, a sharp angular feature the cascades'
-//! fixed directions resolve poorly. Cost: 3 cascade passes ~37 ms at the
-//! default settings; the reference path tracer ~45 ms.
+//! fixed directions resolve poorly.
+//!
+//! Cost, room at 2 bounces (3 cascade passes), same run: the per-pass cost
+//! is ~1.3x scene 0's (9.2 vs 7.1 ms direct), plus ~3 ms per bounce pass
+//! for the lookups. Most of the total is the pass count. Running the
+//! intermediate passes at double probe spacing (`C`, default on) cut
+//! cascade work 37.1 -> 24.5 ms with every error figure within the spread
+//! of the off runs (in-room 16.2% vs 15.7-16.5%, wall faces -6.3% vs
+//! -6.4%). Compiling the bounce lookup out of the direct pass was also
+//! tried: ~2-3%, within noise, so not kept. The path-traced reference, at
+//! ~53 ms, is the largest cost in the room scene.
 //! A direction-first layout wasn't tried: its payoff is hardware-filtered
 //! probe blending, which the bilinear fix can't use (each neighbour is
 //! merged with its own near segment before weighting).
@@ -192,6 +203,7 @@ struct Rc2dSettings {
     scene: u32,
     /// Diffuse bounces in the room scene (scene 0 has no diffuse surfaces).
     bounces: u32,
+    coarse_bounce_passes: bool,
     /// Frames averaged into the jittered history; like `ref_frame`, 0 means
     /// overwrite. Reset whenever anything the cascades depend on changes.
     rc_frame: u32,
@@ -216,19 +228,35 @@ impl Default for Rc2dSettings {
             per_direction_levels: 2,
             scene: 0,
             bounces: 2,
+            // Measured free accuracy-wise; see the module docs.
+            coarse_bounce_passes: true,
             rc_frame: 0,
         }
     }
 }
 
+type CascadeKey = (u32, bool, u32, u32, [u32; 2], bool, u32, u32, bool);
+
 impl Rc2dSettings {
+    /// Probe spacing (log2) and interval scale b for one cascade pass. With
+    /// coarse bounce passes, the passes before the last run at double
+    /// spacing and double b, keeping the b-to-spacing ratio measured best.
+    fn pass_layout(&self, iteration: u32) -> (u32, f32) {
+        let last = iteration == self.effective_bounces();
+        if self.coarse_bounce_passes && !last {
+            (self.probe0_log2 + 1, self.base_interval * 2.0)
+        } else {
+            (self.probe0_log2, self.base_interval)
+        }
+    }
+
     fn effective_bounces(&self) -> u32 {
         if self.scene == room::SCENE_ID { self.bounces } else { 0 }
     }
 
     /// Everything the cascades' output depends on; a change restarts the
     /// jittered average.
-    fn cascade_key(&self) -> (u32, bool, u32, u32, [u32; 2], bool, u32, u32) {
+    fn cascade_key(&self) -> CascadeKey {
         (
             self.base_interval.to_bits(),
             self.bilinear_fix,
@@ -238,6 +266,7 @@ impl Rc2dSettings {
             self.jitter,
             self.scene,
             self.effective_bounces(),
+            self.coarse_bounce_passes,
         )
     }
 
@@ -254,11 +283,18 @@ impl Rc2dSettings {
     /// Fewest cascades whose last interval end, b*4^N, reaches the canvas
     /// diagonal, so every ray can see the whole scene.
     fn cascade_count(&self) -> u32 {
-        let diagonal = (2.0 * (SIZE as f32).powi(2)).sqrt();
-        (1..=MAX_CASCADES)
-            .find(|&n| self.base_interval * 4f32.powi(n as i32) >= diagonal)
-            .unwrap_or(MAX_CASCADES)
+        cascade_count_for(self.base_interval)
     }
+}
+
+fn cascade_count_for(base_interval: f32) -> u32 {
+    let diagonal = (2.0 * (SIZE as f32).powi(2)).sqrt();
+    (1..=MAX_CASCADES)
+        .find(|&n| base_interval * 4f32.powi(n as i32) >= diagonal)
+        .unwrap_or(MAX_CASCADES)
+}
+
+impl Rc2dSettings {
 }
 
 #[derive(Resource, Clone, ExtractResource)]
@@ -412,6 +448,9 @@ fn input(
         // The reference path-traces the same number of bounces.
         settings.reset_reference = true;
     }
+    if keys.just_pressed(KeyCode::KeyC) {
+        settings.coarse_bounce_passes = !settings.coarse_bounce_passes;
+    }
     if keys.just_pressed(KeyCode::KeyD) {
         settings.per_direction_levels = match settings.per_direction_levels {
             0..3 => settings.per_direction_levels + 1,
@@ -421,9 +460,10 @@ fn input(
     }
     if settings.is_changed() && keys.get_just_pressed().next().is_some() {
         info!(
-            "scene={} bounces={} view={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={}",
+            "scene={} bounces={} coarse_bounce_passes={} view={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={}",
             settings.scene,
             settings.effective_bounces(),
+            settings.coarse_bounce_passes,
             ["cascades", "reference", "difference"][settings.view_mode as usize],
             settings.bilinear_fix,
             settings.per_direction_levels,
@@ -440,7 +480,7 @@ fn input(
 /// `ref_frame` in `input` directly got incremented away before extraction.)
 fn advance_reference(
     mut settings: ResMut<Rc2dSettings>,
-    mut last_cascade_key: Local<Option<(u32, bool, u32, u32, [u32; 2], bool, u32, u32)>>,
+    mut last_cascade_key: Local<Option<CascadeKey>>,
 ) {
     if settings.reset_reference {
         settings.ref_frame = 0;
@@ -566,10 +606,11 @@ fn request_error_readback(
                     String::new()
                 };
                 info!(
-                    "relative RMSE {:.3}% over {pixels} px{room_stats} | scene={} bounces={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={} | reference {rays} rays/px",
+                    "relative RMSE {:.3}% over {pixels} px{room_stats} | scene={} bounces={} coarse_bounce_passes={} bilinear_fix={} per_direction_levels={} jitter={} s0={} b={} cascades={} | reference {rays} rays/px",
                     100.0 * (err / reference.max(f64::MIN_POSITIVE)).sqrt(),
                     settings.scene,
                     settings.effective_bounces(),
+                    settings.coarse_bounce_passes,
                     settings.bilinear_fix,
                     settings.per_direction_levels,
                     settings.jitter,
@@ -604,6 +645,7 @@ struct Params {
     scene_id: u32,
     bounces: u32,
     bounce_iteration: u32,
+    bounce_probe0_log2: u32,
 }
 
 #[derive(Resource)]
@@ -712,15 +754,32 @@ fn run_rc2d(
         scene_id: settings.scene,
         bounces: settings.effective_bounces(),
         bounce_iteration: 0,
+        bounce_probe0_log2: settings.probe0_log2,
     };
     params.clear();
     // Offsets [iteration][cascade] for the cascade passes; the last one is
-    // shared by the reference and resolve passes, which ignore both.
+    // shared by the reference and resolve passes, which ignore both. Each
+    // pass has its own probe spacing and b (see pass_layout), and reads
+    // bounce_src at the previous pass's spacing.
     let passes = settings.effective_bounces() + 1;
-    let cascade_offsets: Vec<Vec<u32>> = (0..passes)
+    let pass_params: Vec<Params> = (0..passes)
         .map(|bounce_iteration| {
-            (0..cascade_count)
-                .map(|cascade| params.push(&Params { cascade, bounce_iteration, ..base }))
+            let (probe0_log2, base_interval) = settings.pass_layout(bounce_iteration);
+            Params {
+                bounce_iteration,
+                probe0_log2,
+                base_interval,
+                cascade_count: cascade_count_for(base_interval),
+                bounce_probe0_log2: settings.pass_layout(bounce_iteration.saturating_sub(1)).0,
+                ..base
+            }
+        })
+        .collect();
+    let cascade_offsets: Vec<Vec<u32>> = pass_params
+        .iter()
+        .map(|pass| {
+            (0..pass.cascade_count)
+                .map(|cascade| params.push(&Params { cascade, ..*pass }))
                 .collect()
         })
         .collect();
@@ -753,7 +812,7 @@ fn run_rc2d(
     let writes_b = bind_group(&a.buffer, &b.buffer);
 
     let pixel_groups = SIZE.div_ceil(8);
-    let entries = (CASCADE_ENTRIES >> (2 * settings.probe0_log2)) as u32;
+    let entries_at = |probe0_log2: u32| (CASCADE_ENTRIES >> (2 * probe0_log2)) as u32;
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
     let pass_descriptor = ComputePassDescriptor {
@@ -776,11 +835,13 @@ fn run_rc2d(
     // timing spans; earlier ones are timed whole.
     for iteration in 0..passes {
         let last = iteration + 1 == passes;
+        let pass_params = &pass_params[iteration as usize];
+        let entries = entries_at(pass_params.probe0_log2);
         {
             let mut pass = ctx.command_encoder().begin_compute_pass(&pass_descriptor);
             let whole = (!last).then(|| diagnostics.pass_span(&mut pass, bounce_pass_span(iteration)));
             pass.set_pipeline(cascade_pipeline);
-            for cascade in (0..cascade_count).rev() {
+            for cascade in (0..pass_params.cascade_count).rev() {
                 let span = last.then(|| diagnostics.pass_span(&mut pass, cascade_span(cascade)));
                 let group = if cascade % 2 == 0 { &writes_a } else { &writes_b };
                 pass.set_bind_group(0, group, &[cascade_offsets[iteration as usize][cascade as usize]]);
