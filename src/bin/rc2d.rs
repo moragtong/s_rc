@@ -8,6 +8,7 @@
 //! - `1` / `2` / `3`: show cascades / reference / |difference|
 //! - `B`: toggle plain bilinear merge vs. bilinear fix
 //! - `Up` / `Down`: double / halve the cascade-0 interval scale `b`
+//! - `P`: toggle cascade-0 probe spacing s0 between 1 and 2 px
 //! - `R`: restart reference accumulation
 //! - Left-drag: move the warm light (restarts the reference)
 //!
@@ -30,10 +31,26 @@
 //! boundaries; the bilinear fix removes the leak and most of the ringing.
 //! What's left is streaking along shadow edges (angular resolution).
 //!
-//! GPU cost on Iris Xe at b = 0.5: all 6 cascades ~19-24 ms per frame with
-//! either merge; the fix's 4x traces didn't separate from run-to-run noise.
-//! Cascade 0 alone is ~3 ms despite 2px rays, so this is memory-bound
-//! (4WH vec4<f32> written per cascade, 16 read per ray), not trace-bound.
+//! (Those errors are at s0 = 1 px.) The fix's 4x traces cost about the same
+//! as the plain merge: with vec4<f32> cascades, both ran ~19-24 ms on Iris
+//! Xe, and cascade 0 alone took ~3 ms despite 2px rays. It's memory-bound,
+//! not trace-bound.
+//!
+//! Bandwidth cuts, bilinear fix on, same-run comparisons:
+//!
+//! | cascade storage | s0   | best b | cascades GPU | rel. RMSE |
+//! |-----------------|------|--------|--------------|-----------|
+//! | rgba32f         | 1 px | 0.5    | ~23 ms       | 4.37%     |
+//! | rgba16f packed  | 1 px | 0.5    | ~15 ms       | 4.37%     |
+//! | rgba16f packed  | 2 px | 1      | ~4 ms        | 6.29%     |
+//!
+//! fp16 is free accuracy-wise. s0 = 2 is ~4x cheaper; its extra error is
+//! mostly blotchy halos ~40px around the lights (the small near-light ring
+//! at s0 = 1, grown). At s0 = 2 the resolve must skip cascade-0 probes that
+//! sit inside shapes, or every shape edge gets a halo (12.48% without).
+//! A direction-first layout wasn't tried: its payoff is hardware-filtered
+//! probe blending, which the bilinear fix can't use (each neighbour is
+//! merged with its own near segment before weighting).
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -61,10 +78,13 @@ use bevy::{
 const SIZE: u32 = 512;
 const _: () = assert!(SIZE.is_power_of_two(), "probe grids assume exact halving");
 const SHADER_PATH: &str = "shaders/rc2d.wgsl";
-/// Every cascade stores (W/2^n)(H/2^n) probes * 4^(n+1) rays = 4WH entries.
+/// Every cascade stores (W/(s0 2^n))(H/(s0 2^n)) probes * 4^(n+1) rays =
+/// 4WH/s0^2 entries. Buffers are sized for s0 = 1, the largest case.
 const CASCADE_ENTRIES: u64 = 4 * SIZE as u64 * SIZE as u64;
 const PIXELS: u64 = SIZE as u64 * SIZE as u64;
 const VEC4: u64 = 16;
+/// rgba16float packed as two u32s.
+const CASCADE_ENTRY_BYTES: u64 = 8;
 const MAX_CASCADES: u32 = 9;
 
 fn main() {
@@ -100,6 +120,8 @@ struct Rc2dSettings {
     exposure: f32,
     diff_gain: f32,
     light_pos: Vec2,
+    /// log2 of the cascade-0 probe spacing s0 in px.
+    probe0_log2: u32,
 }
 
 impl Default for Rc2dSettings {
@@ -116,6 +138,7 @@ impl Default for Rc2dSettings {
             exposure: 2.0,
             diff_gain: 8.0,
             light_pos: Vec2::new(110.0, 400.0),
+            probe0_log2: 0,
         }
     }
 }
@@ -196,17 +219,17 @@ fn setup(
     display.sampler = ImageSampler::nearest();
     let display = images.add(display);
 
-    let mut buffer = |entries: u64| {
+    let mut buffer = |bytes: u64| {
         buffers.add(ShaderBuffer::with_size(
-            (entries * VEC4) as usize,
+            bytes as usize,
             RenderAssetUsages::RENDER_WORLD,
         ))
     };
     commands.insert_resource(Rc2dBuffers {
-        cascade_a: buffer(CASCADE_ENTRIES),
-        cascade_b: buffer(CASCADE_ENTRIES),
-        reference: buffer(PIXELS),
-        error: buffer(PIXELS),
+        cascade_a: buffer(CASCADE_ENTRIES * CASCADE_ENTRY_BYTES),
+        cascade_b: buffer(CASCADE_ENTRIES * CASCADE_ENTRY_BYTES),
+        reference: buffer(PIXELS * VEC4),
+        error: buffer(PIXELS * VEC4),
         display: display.clone(),
     });
 
@@ -253,11 +276,15 @@ fn input(
     if keys.just_pressed(KeyCode::KeyR) {
         settings.reset_reference = true;
     }
+    if keys.just_pressed(KeyCode::KeyP) {
+        settings.probe0_log2 ^= 1;
+    }
     if settings.is_changed() && keys.get_just_pressed().next().is_some() {
         info!(
-            "view={} bilinear_fix={} b={} cascades={}",
+            "view={} bilinear_fix={} s0={} b={} cascades={}",
             ["cascades", "reference", "difference"][settings.view_mode as usize],
             settings.bilinear_fix,
+            1 << settings.probe0_log2,
             settings.base_interval,
             settings.cascade_count()
         );
@@ -361,9 +388,10 @@ fn request_error_readback(
                     return;
                 }
                 info!(
-                    "relative RMSE {:.3}% over {pixels} px | bilinear_fix={} b={} cascades={} | reference {rays} rays/px",
+                    "relative RMSE {:.3}% over {pixels} px | bilinear_fix={} s0={} b={} cascades={} | reference {rays} rays/px",
                     100.0 * (err / reference.max(f64::MIN_POSITIVE)).sqrt(),
                     settings.bilinear_fix,
+                    1 << settings.probe0_log2,
                     settings.base_interval,
                     settings.cascade_count(),
                 );
@@ -386,6 +414,7 @@ struct Params {
     exposure: f32,
     diff_gain: f32,
     light_pos: Vec2,
+    probe0_log2: u32,
 }
 
 #[derive(Resource)]
@@ -401,7 +430,7 @@ fn init_pipelines(
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let cascade_size = std::num::NonZero::new(CASCADE_ENTRIES * VEC4);
+    let cascade_size = std::num::NonZero::new(CASCADE_ENTRIES * CASCADE_ENTRY_BYTES);
     let pixel_size = std::num::NonZero::new(PIXELS * VEC4);
     let layout = BindGroupLayoutDescriptor::new(
         "rc2d_layout",
@@ -482,6 +511,7 @@ fn run_rc2d(
         exposure: settings.exposure,
         diff_gain: settings.diff_gain,
         light_pos: settings.light_pos,
+        probe0_log2: settings.probe0_log2,
     };
     params.clear();
     // Offsets [0..cascade_count) are per-cascade; the last one is shared by
@@ -536,7 +566,8 @@ fn run_rc2d(
         let span = diagnostics.pass_span(&mut pass, cascade_span(cascade));
         let group = if cascade % 2 == 0 { &writes_a } else { &writes_b };
         pass.set_bind_group(0, group, &[cascade_offsets[cascade as usize]]);
-        pass.dispatch_workgroups((CASCADE_ENTRIES as u32).div_ceil(64), 1, 1);
+        let entries = (CASCADE_ENTRIES >> (2 * settings.probe0_log2)) as u32;
+        pass.dispatch_workgroups(entries.div_ceil(64), 1, 1);
         span.end(&mut pass);
     }
 

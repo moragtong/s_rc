@@ -5,9 +5,9 @@
 // Conventions (checked against m4xc.dev "Fundamentals of Radiance Cascades"
 // and Osborne & Sannikov 2024, arXiv:2408.14425):
 // - Branching factor 4: cascade n has 4^(n+1) rays per probe, probe spacing
-//   2^n px (s0 = 1 px, one cascade-0 probe per pixel), interval
-//   [b*4^n, b*4^(n+1)] with cascade 0 starting at 0. Memory per cascade is
-//   constant: (W/2^n)(H/2^n) * 4^(n+1) = 4WH.
+//   s0*2^n px (s0 = 1 or 2 px), interval [b*4^n, b*4^(n+1)] with cascade 0
+//   starting at 0. Memory per cascade is constant:
+//   (W/(s0 2^n))(H/(s0 2^n)) * 4^(n+1) = 4WH/s0^2.
 // - Ray i of cascade n covers the same arc as rays 4i..4i+3 of cascade n+1.
 // - Merge: near.rgb + near.a * far.rgb, visibility near.a * far.a
 //   (a = 1 means the segment hit nothing).
@@ -30,11 +30,15 @@ struct Params {
     diff_gain: f32,
     // Warm light center; draggable.
     light_pos: vec2<f32>,
+    // log2 of the cascade-0 probe spacing s0 in px.
+    probe0_log2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> cascade_src: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> cascade_dst: array<vec4<f32>>;
+// Cascade entries are rgba16float packed into two u32s (pack2x16float), so
+// half the bandwidth of vec4<f32> without needing the f16 shader feature.
+@group(0) @binding(1) var<storage, read> cascade_src: array<vec2<u32>>;
+@group(0) @binding(2) var<storage, read_write> cascade_dst: array<vec2<u32>>;
 // rgb = summed radiance, a = number of rays summed.
 @group(0) @binding(3) var<storage, read_write> reference: array<vec4<f32>>;
 // Per pixel: (squared rgb error, squared reference, empty-space mask,
@@ -121,11 +125,37 @@ fn ray_count(n: u32) -> u32 {
 }
 
 fn probe_spacing(n: u32) -> f32 {
-    return f32(1u << n);
+    return f32(1u << (n + params.probe0_log2));
 }
 
 fn probe_grid(n: u32) -> vec2<u32> {
-    return params.size >> vec2(n);
+    return params.size >> vec2(n + params.probe0_log2);
+}
+
+// Cell-centered bilinear footprint of cascade n's probes at `pos`.
+struct Bilinear {
+    base: vec2<i32>,
+    weights: vec4<f32>,
+}
+
+const BILINEAR_OFFSETS = array(vec2(0, 0), vec2(1, 0), vec2(0, 1), vec2(1, 1));
+
+fn bilinear(pos: vec2<f32>, n: u32) -> Bilinear {
+    let g = pos / probe_spacing(n) - 0.5;
+    let f = g - floor(g);
+    return Bilinear(
+        vec2<i32>(floor(g)),
+        vec4(
+            (1.0 - f.x) * (1.0 - f.y),
+            f.x * (1.0 - f.y),
+            (1.0 - f.x) * f.y,
+            f.x * f.y,
+        ),
+    );
+}
+
+fn bilinear_probe(b: Bilinear, k: u32, n: u32) -> vec2<u32> {
+    return vec2<u32>(clamp(b.base + BILINEAR_OFFSETS[k], vec2(0), vec2<i32>(probe_grid(n)) - 1));
 }
 
 fn interval(n: u32) -> vec2<f32> {
@@ -139,17 +169,26 @@ fn ray_dir(ray: u32, count: u32) -> vec2<f32> {
     return vec2(cos(angle), sin(angle));
 }
 
+fn load_ray(i: u32) -> vec4<f32> {
+    let v = cascade_src[i];
+    return vec4(unpack2x16float(v.x), unpack2x16float(v.y));
+}
+
+fn store_ray(i: u32, r: vec4<f32>) {
+    cascade_dst[i] = vec2(pack2x16float(r.xy), pack2x16float(r.zw));
+}
+
 fn merge(near: vec4<f32>, far: vec4<f32>) -> vec4<f32> {
     return vec4(near.rgb + near.a * far.rgb, near.a * far.a);
 }
 
-// Cascade n+1 radiance for parent ray `ray` of cascade n at child probe
-// `probe`: the average of the 4 child rays spanning the parent's arc.
-fn child_radiance(probe: vec2<u32>, ray: u32) -> vec4<f32> {
-    let n1 = params.cascade + 1u;
-    let base = (probe.y * probe_grid(n1).x + probe.x) * ray_count(n1) + ray * 4u;
-    return 0.25 * (cascade_src[base] + cascade_src[base + 1u]
-        + cascade_src[base + 2u] + cascade_src[base + 3u]);
+// Average of rays 4*ray .. 4*ray+3 of `probe` in cascade n: for a cascade
+// n+1 probe, that's the arc of parent ray `ray`; for cascade 0 with
+// ray = 0, it's the probe's whole fluence.
+fn probe_arc(probe: vec2<u32>, n: u32, ray: u32) -> vec4<f32> {
+    let base = (probe.y * probe_grid(n).x + probe.x) * ray_count(n) + ray * 4u;
+    return 0.25 * (load_ray(base) + load_ray(base + 1u)
+        + load_ray(base + 2u) + load_ray(base + 3u));
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -169,22 +208,11 @@ fn cascade(@builtin(global_invocation_id) id: vec3<u32>) {
     let range = interval(n);
 
     if n + 1u >= params.cascade_count {
-        cascade_dst[id.x] = trace(center, dir, range.x, range.y);
+        store_ray(id.x, trace(center, dir, range.x, range.y));
         return;
     }
 
-    let child_spacing = probe_spacing(n + 1u);
-    let child_grid = vec2<i32>(probe_grid(n + 1u));
-    let g = center / child_spacing - 0.5;
-    let base = vec2<i32>(floor(g));
-    let f = g - floor(g);
-    let offsets = array(vec2(0, 0), vec2(1, 0), vec2(0, 1), vec2(1, 1));
-    let weights = array(
-        (1.0 - f.x) * (1.0 - f.y),
-        f.x * (1.0 - f.y),
-        (1.0 - f.x) * f.y,
-        f.x * f.y,
-    );
+    let children = bilinear(center, n + 1u);
 
     var result = vec4(0.0);
     if params.merge_mode == 0u {
@@ -193,9 +221,8 @@ fn cascade(@builtin(global_invocation_id) id: vec3<u32>) {
         // the near segment never saw.
         let near = trace(center, dir, range.x, range.y);
         var far = vec4(0.0);
-        for (var k = 0; k < 4; k++) {
-            let c = vec2<u32>(clamp(base + offsets[k], vec2(0), child_grid - 1));
-            far += weights[k] * child_radiance(c, ray);
+        for (var k = 0u; k < 4u; k++) {
+            far += children.weights[k] * probe_arc(bilinear_probe(children, k, n + 1u), n + 1u, ray);
         }
         result = merge(near, far);
     } else {
@@ -203,14 +230,14 @@ fn cascade(@builtin(global_invocation_id) id: vec3<u32>) {
         // child probe's interval starts, so each near segment actually
         // connects to the far field it's merged with.
         let start = center + dir * range.x;
-        for (var k = 0; k < 4; k++) {
-            let c = vec2<u32>(clamp(base + offsets[k], vec2(0), child_grid - 1));
-            let child_start = (vec2<f32>(c) + 0.5) * child_spacing + dir * range.y;
+        for (var k = 0u; k < 4u; k++) {
+            let c = bilinear_probe(children, k, n + 1u);
+            let child_start = (vec2<f32>(c) + 0.5) * probe_spacing(n + 1u) + dir * range.y;
             let near = trace_segment(start, child_start);
-            result += weights[k] * merge(near, child_radiance(c, ray));
+            result += children.weights[k] * merge(near, probe_arc(c, n + 1u, ray));
         }
     }
-    cascade_dst[id.x] = result;
+    store_ray(id.x, result);
 }
 
 // ------------------------------------------------------------ reference
@@ -257,16 +284,38 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let i = id.y * params.size.x + id.x;
 
-    // s0 = 1 px: this pixel's own cascade-0 probe, centered on it.
-    let rc = 0.25 * (cascade_src[i * 4u] + cascade_src[i * 4u + 1u]
-        + cascade_src[i * 4u + 2u] + cascade_src[i * 4u + 3u]).rgb;
+    // Bilinear over the 4 nearest cascade-0 probes. At s0 = 1 the pixel
+    // center is exactly on its own probe, so this is just that probe.
+    // Probes centered inside a shape report that shape's emission, not the
+    // light field around it; blending them in paints a halo around every
+    // shape edge, so they're dropped and the remaining weights renormalized.
+    // (A pixel inside a shape keeps them all: it wants the emission.)
+    let pixel_center = vec2<f32>(id.xy) + 0.5;
+    let pixel_empty = scene(pixel_center).dist > 0.0;
+    let probes = bilinear(pixel_center, 0u);
+    var rc = vec3(0.0);
+    var rc_all = vec3(0.0);
+    var weight = 0.0;
+    for (var k = 0u; k < 4u; k++) {
+        let probe = bilinear_probe(probes, k, 0u);
+        let value = probe_arc(probe, 0u, 0u).rgb;
+        rc_all += probes.weights[k] * value;
+        let probe_center = (vec2<f32>(probe) + 0.5) * probe_spacing(0u);
+        if !pixel_empty || scene(probe_center).dist > 0.0 {
+            rc += probes.weights[k] * value;
+            weight += probes.weights[k];
+        }
+    }
+    // All 4 inside shapes (a gap thinner than the probe spacing): nothing
+    // better to go on than the plain blend.
+    rc = select(rc_all, rc / weight, weight > 0.0);
     let acc = reference[i];
     let ref_value = acc.rgb / max(acc.a, 1.0);
     let e = rc - ref_value;
 
     // Error is only meaningful in empty space; inside shapes both sides
     // just report the shape's own emission.
-    let empty = scene(vec2<f32>(id.xy) + 0.5).dist > 0.0;
+    let empty = pixel_empty;
     error[i] = select(
         vec4(0.0, 0.0, 0.0, acc.a),
         vec4(dot(e, e), dot(ref_value, ref_value), 1.0, acc.a),
