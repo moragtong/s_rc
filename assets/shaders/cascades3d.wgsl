@@ -47,6 +47,8 @@ struct Params {
     frame: u32,
     // 1 = every live probe is dirty (e.g. the sun changed).
     force: u32,
+    // DEBUG: with debug 3, the one slot debug 2 applies to.
+    test_slot: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -435,7 +437,13 @@ fn gather(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
     let id = vec3(slot * rays + ray, 0u, 0u);
     let world = slot_world(slot, params.spacing, params.window);
     if !has_children() {
-        store_dst(id.x, cached_near(id.x, 0u, segment(world, ray, 0u)));
+        var top = cached_near(id.x, 0u, segment(world, ray, 0u));
+        // DEBUG 2 (RC3D_TEST_FRAME): double the top cascade's radiance, to
+        // follow a change down the hierarchy.
+        if params.debug == 2u || (params.debug == 3u && slot == params.test_slot) {
+            top = vec4(top.rgb * 2.0, top.a);
+        }
+        store_dst(id.x, top);
         return;
     }
 

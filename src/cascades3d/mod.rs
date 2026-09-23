@@ -141,6 +141,8 @@ struct Params {
     frame: u32,
     /// 1 = every live probe changed (the sun changed; RC3D_FULL_GATHER).
     force: u32,
+    /// DEBUG: the top-cascade slot RC3D_TEST_ONE applies to.
+    test_slot: u32,
 }
 
 /// GPU state shared with the SDF view, which shades from cascade 0.
@@ -358,6 +360,26 @@ fn run_cascades(
     // the first frame after the sun changes.
     *frame_count = frame_count.wrapping_add(1).max(1);
     let force = *lighting != Some(frame.lighting) || std::env::var("RC3D_FULL_GATHER").is_ok();
+    // DEBUG RC3D_TEST_FRAME=f: from active frame f, the top cascade's
+    // radiance doubles; at f, its cached hits are dropped (all of them, or
+    // with RC3D_TEST_ONE only the probe holding (0, 1.5, 0)), so the change
+    // enters through re-tracing and has to propagate down.
+    let test_frame: Option<u32> = std::env::var("RC3D_TEST_FRAME").ok().and_then(|s| s.parse().ok());
+    let boost_top = test_frame.is_some_and(|f| *frame_count >= f);
+    let test_one = std::env::var("RC3D_TEST_ONE").is_ok();
+    let top = windows[CASCADES as usize - 1];
+    let test_slot = {
+        let world = (Vec3::new(0.0, 1.5, 0.0) / top.spacing).floor().as_ivec3();
+        let s = world.rem_euclid(IVec3::splat(top.size as i32)).as_uvec3();
+        s.x + top.size * (s.y + top.size * s.z)
+    };
+    if test_frame == Some(*frame_count) {
+        if test_one {
+            render_queue.write_buffer(&gpu.tags, (top.tag_base + test_slot) as u64 * 4, &[0u8; 4]);
+        } else {
+            ctx.command_encoder().clear_buffer(&gpu.tags, top.tag_base as u64 * 4, Some((top.size as u64).pow(3) * 4));
+        }
+    }
     *lighting = Some(frame.lighting);
     params.clear();
     let make = |i: usize, own: &CascadeWindow| {
@@ -381,10 +403,15 @@ fn run_cascades(
             child_tag_base: child.tag_base,
             child_angle_base: own.child.map(|c| gpu.angle_bases[c as usize]).unwrap_or(0),
             // RC3D_C0_NEAR_ONLY, or RC3D_CUT=k: cascade k ignores its children.
-            debug: ((i == 0 && std::env::var("RC3D_C0_NEAR_ONLY").is_ok())
-                || std::env::var("RC3D_CUT").ok().and_then(|s| s.parse::<usize>().ok()) == Some(i)) as u32,
+            debug: if boost_top && i + 1 == CASCADES as usize {
+                if test_one { 3 } else { 2 }
+            } else {
+                ((i == 0 && std::env::var("RC3D_C0_NEAR_ONLY").is_ok())
+                    || std::env::var("RC3D_CUT").ok().and_then(|s| s.parse::<usize>().ok()) == Some(i)) as u32
+            },
             frame: *frame_count,
             force: force as u32,
+            test_slot,
         }
     };
     let offsets: Vec<u32> = windows.iter().enumerate().map(|(i, own)| params.push(&make(i, own))).collect();
