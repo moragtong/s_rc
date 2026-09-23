@@ -50,6 +50,11 @@ impl ViewHiZ {
     }
 }
 
+/// Full chain down to 1x1 for a `size` base level.
+pub fn hi_z_mip_count(size: UVec2) -> u32 {
+    size.max_element().max(1).ilog2() + 1
+}
+
 #[derive(Resource)]
 struct HiZPipelines {
     first_mip_layout: BindGroupLayoutDescriptor,
@@ -148,7 +153,7 @@ fn prepare_hi_z(
             height: prepass.size.height,
             depth_or_array_layers: 1,
         };
-        let mip_count = size.width.max(size.height).ilog2() + 1;
+        let mip_count = hi_z_mip_count(UVec2::new(size.width, size.height));
 
         let texture = texture_cache.get(
             &render_device,

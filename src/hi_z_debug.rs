@@ -20,7 +20,7 @@ use bevy::{
     },
 };
 
-use crate::hi_z::ViewHiZ;
+use crate::hi_z::{HiZ, ViewHiZ, hi_z_mip_count};
 
 const SHADER_PATH: &str = "shaders/hi_z_debug.wgsl";
 /// Distance that maps to black in the gray ramp.
@@ -94,7 +94,22 @@ impl Plugin for HiZDebugPlugin {
     }
 }
 
-fn hi_z_debug_input(keys: Res<ButtonInput<KeyCode>>, mut debug: ResMut<HiZDebug>) {
+fn hi_z_debug_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    cameras: Query<&Camera, With<HiZ>>,
+    mut debug: ResMut<HiZDebug>,
+) {
+    // Same size the pyramid is built from, so the clamp matches its real
+    // level count, and re-clamps if the window shrinks.
+    let Some(max_mip) = cameras
+        .iter()
+        .filter_map(|camera| camera.physical_target_size())
+        .map(|size| hi_z_mip_count(size) - 1)
+        .max()
+    else {
+        return;
+    };
+
     let before = *debug;
     if keys.just_pressed(KeyCode::KeyH) {
         debug.enabled = !debug.enabled;
@@ -105,9 +120,8 @@ fn hi_z_debug_input(keys: Res<ButtonInput<KeyCode>>, mut debug: ResMut<HiZDebug>
     if keys.just_pressed(KeyCode::BracketLeft) {
         debug.mip = debug.mip.saturating_sub(1);
     }
+    debug.mip = debug.mip.min(max_mip);
     if debug.enabled != before.enabled || debug.mip != before.mip {
-        // The shader clamps to the pyramid's last level, so a mip past the
-        // end just keeps showing the 1x1 top.
         let HiZDebug { enabled, mip } = *debug;
         info!("Hi-Z debug: enabled={enabled} mip={mip}");
     }
