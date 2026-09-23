@@ -1,5 +1,9 @@
 mod hi_z;
 mod hi_z_debug;
+mod clipmap;
+mod scene3d;
+mod sdf_bake;
+mod sdf_view;
 
 use bevy::core_pipeline::prepass::{DeferredPrepass, DepthPrepass};
 use bevy::pbr::DefaultOpaqueRendererMethod;
@@ -7,47 +11,39 @@ use bevy::prelude::*;
 use bevy::render::renderer::RenderAdapterInfo;
 use hi_z::{HiZ, HiZPlugin};
 use hi_z_debug::HiZDebugPlugin;
+use bevy::camera_controller::free_camera::{FreeCamera, FreeCameraPlugin};
+use clipmap::{ClipmapCamera, ClipmapPlugin};
+use scene3d::Scene3d;
+use sdf_view::{SceneResource, SdfViewPlugin};
 
 fn main() {
     App::new()
         // Deferred for every opaque material: GI needs a G-buffer to read
         // hit-point normals/albedo from, not just a lit color.
         .insert_resource(DefaultOpaqueRendererMethod::deferred())
-        .add_plugins((DefaultPlugins, HiZPlugin, HiZDebugPlugin))
+        .add_plugins((
+            DefaultPlugins,
+            HiZPlugin,
+            HiZDebugPlugin,
+            FreeCameraPlugin,
+            ClipmapPlugin,
+            SdfViewPlugin,
+        ))
         .add_systems(Startup, (setup_scene, log_adapter_info))
         .run();
 }
 
-/// Ground plane + a cube + a directional "sun" light + camera.
-/// The cube exists purely so there's something for the eventual
-/// SDF march / shadow clipmap to have an opinion about later.
+/// The analytic test room (see `scene3d`), and a free camera outside the
+/// doorway that the SDF clipmap follows. The room's walls are 20 cm, 1.6
+/// finest-tier voxels; thinner walls are a separate test.
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    commands.spawn((
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(10.0, 10.0))),
-        MeshMaterial3d(materials.add(Color::srgb(0.3, 0.3, 0.35))),
-        Transform::default(),
-    ));
-
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-        MeshMaterial3d(materials.add(Color::srgb(0.8, 0.2, 0.2))),
-        Transform::from_xyz(0.0, 0.5, 0.0),
-    ));
-
-    // Stands in for L_sun. Directional, shadows on, so we can confirm
-    // Bevy's own shadow path works before we ever touch our clipmap.
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 10_000.0,
-            shadow_maps_enabled: true,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.4, 0.0)),
-    ));
+    let scene = Scene3d::room(0.2);
+    scene3d::spawn(&scene, &mut commands, &mut meshes, &mut materials);
+    commands.insert_resource(SceneResource(scene));
 
     commands.spawn((
         Camera3d::default(),
@@ -57,7 +53,9 @@ fn setup_scene(
         DepthPrepass,
         DeferredPrepass,
         HiZ,
-        Transform::from_xyz(4.0, 3.0, 8.0).looking_at(Vec3::ZERO, Vec3::Y),
+        FreeCamera::default(),
+        ClipmapCamera,
+        Transform::from_xyz(-9.0, 1.7, 2.0).looking_at(Vec3::new(0.0, 1.2, -0.5), Vec3::Y),
     ));
 }
 

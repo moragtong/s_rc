@@ -1,0 +1,3 @@
+drjit==1.5.0
+mitsuba==3.9.1
+numpy==2.5.3

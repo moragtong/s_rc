@@ -5,12 +5,16 @@ edition = "2024"
 default-run = "s_rc"
 
 [dependencies]
-bevy = "0.19.1"
+bevy = { version = "0.19.1", features = ["free_camera"] }
+parry3d = "0.31"
 
-# Enable a small amount of optimization in the dev profile.
+# Enable a small amount of optimization in the dev profile. Line tables
+# only: full debug info made each binary ~1.8 GB and filled the disk.
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 # Enable a large amount of optimization in the dev profile for dependencies.
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
