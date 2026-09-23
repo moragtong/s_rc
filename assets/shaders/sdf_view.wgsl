@@ -31,16 +31,24 @@ struct View {
 const MAX_STEPS: u32 = 256u;
 const MIN_STEP: f32 = 0.01;
 
-// A wall thinner than a tier's voxel sits between voxel centers, so the
-// stored distances stay positive on both sides: the smallest interpolated
-// value across it is at most (voxel - thickness) / 2. A fixed small hit
-// threshold then walks straight through it, which for lighting is a leak.
-// Half a voxel always catches it; the cost is hitting up to that much
-// early, i.e. over-occlusion (lost energy), never a leak. Tier 0 keeps a
-// fine threshold so nearby depth stays accurate; the test room's 20 cm
-// walls are thicker than its 12.5 cm voxels.
+// Hit thresholds are a fraction of each tier's voxel, erring toward
+// over-occlusion (lost energy) rather than leaks (ARCHITECTURE.md):
+// - Coarse tiers, half a voxel: a wall thinner than the voxel sits between
+//   voxel centers, so the stored distances stay positive on both sides; the
+//   smallest interpolated value across it is at most (voxel - thickness) / 2.
+//   A fixed small threshold walks straight through it.
+// - Tier 0, a quarter voxel: trilinear filtering rounds convex edges off, so
+//   rays grazing past a sharp edge miss it. Measured against Mitsuba from
+//   outside the doorway, edge misses went 987 (1 cm threshold) -> 211 (1/6
+//   voxel) -> 15 (1/4), the last ones within 1 cm of the edge, while hits
+//   stayed within ~2 cm (median) of the true surface.
+// The cost is hitting up to that much early; along grazing rays, depth is
+// off by threshold / sin(angle), though the hit point stays that close to a
+// real surface.
+const TIER0_HIT_FRACTION: f32 = 0.25;
+
 fn hit_eps(t: u32) -> f32 {
-    return select(0.01, 0.5 * view.voxels[t], t > 0u);
+    return select(TIER0_HIT_FRACTION, 0.5, t > 0u) * view.voxels[t];
 }
 
 // Inside tier t's window, with a voxel and a half of margin so trilinear

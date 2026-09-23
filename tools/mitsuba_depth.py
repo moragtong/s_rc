@@ -4,14 +4,18 @@ Reads target/rc3d/scene.json and target/rc3d/sdf_depth.f32 (exported with X
 in the app), casts the exact same pixel-center rays through Mitsuba's own
 intersection of the analytic boxes, and compares:
 
-- hit/miss agreement: a pixel Mitsuba hits but the clipmap misses is a ray
-  that went through geometry, i.e. a leak;
+- hit/miss agreement: a pixel Mitsuba hits but the clipmap misses is a
+  leak if the ray passes more than LEAK_TOLERANCE into the true geometry,
+  else a silhouette graze (a ray skimming a sharp edge, which any
+  finite-resolution SDF rounds off slightly);
 - position error: how far each clipmap hit point is from the true surface
   (the exact box SDF there), per clipmap tier, against that tier's voxel.
   That's what matters for lighting. Depth along the ray is also reported,
   but it inflates position error by 1/sin(angle) at grazing incidence.
 
 Run with the project venv:  tools/.venv/bin/python tools/mitsuba_depth.py
+Optional arguments: a scene.json path and an sdf_depth.f32 path (defaults to
+the latest export).
 """
 
 import json
@@ -26,6 +30,7 @@ mi.set_variant("llvm_ad_rgb")
 EXPORT = Path("target/rc3d")
 # The clipmap's finest voxel, for putting errors in scale.
 VOXEL = 0.125
+LEAK_TOLERANCE = 0.01
 
 
 def load_scene(scene_json):
@@ -74,10 +79,12 @@ def pixel_rays(camera):
 
 
 def main():
-    camera_scene = json.loads((EXPORT / "scene.json").read_text())
+    scene_path = Path(sys.argv[1]) if len(sys.argv) > 1 else EXPORT / "scene.json"
+    depth_path = Path(sys.argv[2]) if len(sys.argv) > 2 else EXPORT / "sdf_depth.f32"
+    camera_scene = json.loads(scene_path.read_text())
     camera = camera_scene["camera"]
     w, h = camera["width"], camera["height"]
-    sdf = np.fromfile(EXPORT / "sdf_depth.f32", dtype="<f4")
+    sdf = np.fromfile(depth_path, dtype="<f4")
     if sdf.size != w * h:
         sys.exit(f"sdf_depth.f32 has {sdf.size} values, expected {w * h}")
 
@@ -94,9 +101,19 @@ def main():
     sdf_hit, ref_hit = sdf > 0, ref > 0
     both = sdf_hit & ref_hit
     err = np.abs(sdf[both] - ref[both])
-    print(f"pixels: {w * h}, both hit: {both.sum()}, "
-          f"hit in SDF only: {(sdf_hit & ~ref_hit).sum()}, "
-          f"hit in Mitsuba only (leaks): {(ref_hit & ~sdf_hit).sum()}")
+    # How far each clipmap-missed ray passes into the true geometry: the
+    # most negative exact SDF within 30 cm of Mitsuba's hit.
+    missed = np.nonzero(ref_hit & ~sdf_hit)[0]
+    offsets = np.linspace(-0.3, 0.3, 601)
+    penetration = np.array([
+        -exact_sdf(camera_scene["boxes"], origin + dirs[i] * (ref[i] + offsets)[:, None]).min()
+        for i in missed
+    ])
+    leaks = int((penetration > LEAK_TOLERANCE).sum())
+    print(f"pixels: {w * h}, both hit: {both.sum()}, hit in SDF only: {(sdf_hit & ~ref_hit).sum()}, "
+          f"hit in Mitsuba only: {len(missed)} = {leaks} leaks (> {LEAK_TOLERANCE * 100:.0f} cm into geometry) "
+          f"+ {len(missed) - leaks} silhouette grazes"
+          + (f" (max {penetration.max() * 100:.1f} cm)" if len(missed) else ""))
     if both.any():
         pct = lambda p: np.percentile(err, p)
         print(f"|depth error| where both hit (m): median {pct(50):.4f}, 95% {pct(95):.4f}, "
