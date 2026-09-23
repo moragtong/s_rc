@@ -132,6 +132,8 @@ struct Params {
     child_radius: f32,
     child_tag_base: u32,
     child_angle_base: u32,
+    /// DEBUG: 1 = cascade 0 without its far field (RC3D_C0_NEAR_ONLY).
+    debug: u32,
 }
 
 /// GPU state shared with the SDF view, which shades from cascade 0.
@@ -335,6 +337,7 @@ fn run_cascades(
             child_radius: child.radius,
             child_tag_base: child.tag_base,
             child_angle_base: own.child.map(|c| gpu.angle_bases[c as usize]).unwrap_or(0),
+            debug: (i == 0 && std::env::var("RC3D_C0_NEAR_ONLY").is_ok()) as u32,
         }
     };
     let mut offsets = Vec::new();

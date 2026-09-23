@@ -45,6 +45,8 @@ struct Params {
     child_tag_base: u32,
     // Offset of the children's cells in solid_angles.
     child_angle_base: u32,
+    // DEBUG: 1 = no far field.
+    debug: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -386,7 +388,8 @@ fn gather(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups
         let w = corner_weight(t, k);
         if ready && w > 0.0 {
             let near = cached_near(id.x, k, segment(world, ray, k));
-            result += w * merge(near, child_arc(child_slot, ray));
+            let far = select(child_arc(child_slot, ray), vec4(0.0, 0.0, 0.0, 1.0), params.debug == 1u);
+            result += w * merge(near, far);
             total += w;
         }
     }

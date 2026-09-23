@@ -32,6 +32,7 @@ struct View {
     sun_k: f32,
     sun_irradiance: vec3<f32>,
     level_count: u32,
+    shade_debug: u32,
 }
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -193,6 +194,8 @@ fn level_irradiance(c: ShadingLevel, p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
     let tier_p = tier_at(clipmap(), p);
     var e = vec3(0.0);
     var total = 0.0;
+    var best = vec3(0.0);
+    var best_w = 0.0;
     for (var k = 0u; k < 8u; k++) {
         let corner = vec3(k & 1u, (k >> 1u) & 1u, k >> 2u);
         let world = base + vec3<i32>(corner);
@@ -216,10 +219,23 @@ fn level_irradiance(c: ShadingLevel, p: vec3<f32>, n: vec3<f32>) -> vec4<f32> {
         let span = length(toward);
         let clear = dot(toward, n) > 0.0
             && !march(clipmap(), tier0, tier1, tier2, clipmap_sampler, start, toward / span, span).hit;
-        if live && empty && w > 0.0 && clear {
-            e += w * probe_irradiance(c, slot, n);
-            total += w;
+        // DEBUG 1: no dropout (every live probe). DEBUG 2: nearest accepted
+        // probe only.
+        let accepted = select(live && empty && clear, live, view.shade_debug == 1u);
+        if accepted && w > 0.0 {
+            if view.shade_debug == 2u {
+                if w > best_w {
+                    best_w = w;
+                    best = probe_irradiance(c, slot, n);
+                }
+            } else {
+                e += w * probe_irradiance(c, slot, n);
+                total += w;
+            }
         }
+    }
+    if view.shade_debug == 2u {
+        return vec4(best, best_w);
     }
     return vec4(select(vec3(0.0), e / total, total > 0.0), total);
 }

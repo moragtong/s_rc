@@ -72,6 +72,7 @@ pub struct SdfViewUniform {
     sun_k: f32,
     sun_irradiance: Vec3,
     level_count: u32,
+    shade_debug: u32,
 }
 
 /// Array size of the per-level uniform fields (sdf_view.wgsl).
@@ -198,6 +199,7 @@ fn update_sdf_view_uniform(
         level_ints,
         level_floats,
         level_count: LEVELS,
+        shade_debug: std::env::var("RC3D_SHADE_DEBUG").ok().and_then(|s| s.parse().ok()).unwrap_or(0),
         sun_toward: sun.toward,
         sun_k: sun.k,
         sun_irradiance: sun.irradiance,

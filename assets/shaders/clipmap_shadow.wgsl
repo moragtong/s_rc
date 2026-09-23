@@ -52,14 +52,17 @@ fn shadow(@builtin(global_invocation_id) id: vec3<u32>) {
             sample_own(pos + vec3(0.0, e, 0.0)) - sample_own(pos - vec3(0.0, e, 0.0)),
             sample_own(pos + vec3(0.0, 0.0, e)) - sample_own(pos - vec3(0.0, 0.0, e)),
         ));
-        // Surfaces facing away have zero color anyway.
-        if dot(n, params.sun_toward) > 0.0 {
-            let surface = pos - n * d;
-            visibility = sun_visibility(
-                params.clipmap, tier0, tier1, tier2, clipmap_sampler,
-                surface + n * START_OFFSET, params.sun_toward, params.sun_k,
-            );
-        }
+        // Every near-surface voxel is marched, including ones whose normal
+        // here faces away from the sun: the color takes its normal from the
+        // nearest instance, this from the composed field, and at junctions
+        // they differ. Skipping those (visibility 1, "no color anyway") put
+        // the floor's unshadowed sunlit color, times 1, along the base of
+        // walls facing away from the sun: light leaking into room corners.
+        let surface = pos - n * d;
+        visibility = sun_visibility(
+            params.clipmap, tier0, tier1, tier2, clipmap_sampler,
+            surface + n * START_OFFSET, params.sun_toward, params.sun_k,
+        );
     }
     textureStore(shadow_out, texel, vec4(visibility, 0.0, 0.0, 0.0));
 }
