@@ -28,6 +28,8 @@ struct Params {
     ref_rays: u32,
     exposure: f32,
     diff_gain: f32,
+    // Warm light center; draggable.
+    light_pos: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -71,11 +73,11 @@ fn closer(a: SceneSample, dist: f32, emission: vec3<f32>) -> SceneSample {
 fn scene(p: vec2<f32>) -> SceneSample {
     var s = SceneSample(1e9, vec3(0.0));
     // Lights.
-    s = closer(s, sd_circle(p, vec2(110.0, 400.0), 22.0), vec3(8.0, 4.5, 1.5));
+    s = closer(s, sd_circle(p, params.light_pos, 22.0), vec3(8.0, 4.5, 1.5));
     s = closer(s, sd_circle(p, vec2(420.0, 100.0), 14.0), vec3(1.5, 3.5, 10.0));
     s = closer(s, sd_box(p, vec2(400.0, 490.0), vec2(80.0, 3.0)), vec3(0.4, 3.0, 0.8));
-    // Thin wall right of the warm light: the leak test. Anything warm to
-    // its right is light that got interpolated through it.
+    // Thin wall right of the warm light's start position: the leak test.
+    // Anything warm to its right is light that got interpolated through it.
     s = closer(s, sd_box(p, vec2(200.0, 400.0), vec2(1.5, 75.0)), vec3(0.0));
     // Occluders for penumbrae at varying distances from the lights.
     s = closer(s, sd_box(p, vec2(256.0, 256.0), vec2(60.0, 12.0)), vec3(0.0));

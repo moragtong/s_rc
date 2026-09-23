@@ -9,6 +9,10 @@
 //! - `B`: toggle plain bilinear merge vs. bilinear fix
 //! - `Up` / `Down`: double / halve the cascade-0 interval scale `b`
 //! - `R`: restart reference accumulation
+//! - Left-drag: move the warm light (restarts the reference)
+//!
+//! Every 2s it also logs per-stage GPU time from timestamp queries, when the
+//! adapter supports timestamps inside compute passes.
 //!
 //! The reference converges over time (noise ~ 1/sqrt(rays)); RMSE figures
 //! are only trustworthy once its ray count is in the thousands.
@@ -25,14 +29,21 @@
 //! Plain merge leaks warm light through the thin wall and rings at interval
 //! boundaries; the bilinear fix removes the leak and most of the ringing.
 //! What's left is streaking along shadow edges (angular resolution).
+//!
+//! GPU cost on Iris Xe at b = 0.5: all 6 cascades ~19-24 ms per frame with
+//! either merge; the fix's 4x traces didn't separate from run-to-run noise.
+//! Cascade 0 alone is ~3 ms despite 2px rays, so this is memory-bound
+//! (4WH vec4<f32> written per cascade, 16 read per ray), not trace-bound.
 
 use bevy::{
     asset::RenderAssetUsages,
+    diagnostic::{DiagnosticPath, DiagnosticsStore},
     core_pipeline::{Core2d, Core2dSystems, tonemapping::Tonemapping},
     image::ImageSampler,
     prelude::*,
     render::{
         RenderApp, RenderStartup,
+        diagnostic::{RecordDiagnostics, RenderDiagnosticsPlugin},
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         gpu_readback::{Readback, ReadbackComplete},
         render_asset::RenderAssets,
@@ -82,9 +93,13 @@ struct Rc2dSettings {
     bilinear_fix: bool,
     base_interval: f32,
     ref_frame: u32,
+    /// Makes the next extracted frame overwrite the reference instead of
+    /// accumulating onto it.
+    reset_reference: bool,
     ref_rays: u32,
     exposure: f32,
     diff_gain: f32,
+    light_pos: Vec2,
 }
 
 impl Default for Rc2dSettings {
@@ -96,9 +111,11 @@ impl Default for Rc2dSettings {
             // for both merge modes on this scene; see the module docs.
             base_interval: 0.5,
             ref_frame: 0,
+            reset_reference: true,
             ref_rays: 16,
             exposure: 2.0,
             diff_gain: 8.0,
+            light_pos: Vec2::new(110.0, 400.0),
         }
     }
 }
@@ -126,16 +143,27 @@ struct Rc2dBuffers {
 #[derive(Resource, Deref, DerefMut)]
 struct ErrorLogTimer(Timer);
 
+/// GPU timing span names; also the `render/<name>/elapsed_gpu` diagnostics.
+fn cascade_span(cascade: u32) -> String {
+    format!("rc2d_cascade_{cascade}")
+}
+const REFERENCE_SPAN: &str = "rc2d_reference";
+const RESOLVE_SPAN: &str = "rc2d_resolve";
+
 impl Plugin for Rc2dPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Rc2dSettings>()
             .insert_resource(ErrorLogTimer(Timer::from_seconds(2.0, TimerMode::Repeating)))
             .add_plugins((
+                RenderDiagnosticsPlugin,
                 ExtractResourcePlugin::<Rc2dSettings>::default(),
                 ExtractResourcePlugin::<Rc2dBuffers>::default(),
             ))
             .add_systems(Startup, setup)
-            .add_systems(Update, (input, advance_reference, request_error_readback).chain());
+            .add_systems(
+                Update,
+                (input, advance_reference, request_error_readback, log_gpu_timings).chain(),
+            );
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -185,10 +213,29 @@ fn setup(
     commands.spawn((Camera2d, Tonemapping::None));
     commands.spawn(Sprite::from_image(display));
 
-    info!("rc2d: 1/2/3 view, B bilinear fix, Up/Down interval, R reset reference");
+    info!("rc2d: 1/2/3 view, B bilinear fix, Up/Down interval, R reset reference, drag light");
 }
 
-fn input(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<Rc2dSettings>) {
+fn input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut cursor_moved: MessageReader<CursorMoved>,
+    mut cursor: Local<Option<Vec2>>,
+    mut settings: ResMut<Rc2dSettings>,
+) {
+    // Window coordinates are y-down with a 1:1 scale factor, same as the
+    // canvas, so the cursor position is directly a scene position.
+    if let Some(moved) = cursor_moved.read().last() {
+        *cursor = Some(moved.position);
+    }
+    if mouse.pressed(MouseButton::Left)
+        && let Some(pos) = *cursor
+        && pos != settings.light_pos
+    {
+        settings.light_pos = pos;
+        settings.reset_reference = true;
+    }
+
     for (key, mode) in [(KeyCode::Digit1, 0), (KeyCode::Digit2, 1), (KeyCode::Digit3, 2)] {
         if keys.just_pressed(key) {
             settings.view_mode = mode;
@@ -204,7 +251,7 @@ fn input(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<Rc2dSettings>) {
         settings.base_interval = (settings.base_interval * 0.5).max(1.0 / 16.0);
     }
     if keys.just_pressed(KeyCode::KeyR) {
-        settings.ref_frame = 0;
+        settings.reset_reference = true;
     }
     if settings.is_changed() && keys.get_just_pressed().next().is_some() {
         info!(
@@ -217,10 +264,61 @@ fn input(keys: Res<ButtonInput<KeyCode>>, mut settings: ResMut<Rc2dSettings>) {
     }
 }
 
-/// The frame just extracted used `ref_frame`; the next one accumulates on
-/// top of it.
+/// Runs after `input`, so a reset requested this frame is what gets
+/// extracted: `ref_frame == 0` tells the shader to overwrite. (Resetting
+/// `ref_frame` in `input` directly got incremented away before extraction.)
 fn advance_reference(mut settings: ResMut<Rc2dSettings>) {
-    settings.ref_frame += 1;
+    if settings.reset_reference {
+        settings.ref_frame = 0;
+        settings.reset_reference = false;
+    } else {
+        settings.ref_frame += 1;
+    }
+}
+
+fn log_gpu_timings(
+    time: Res<Time>,
+    mut timer: Local<Option<Timer>>,
+    settings: Res<Rc2dSettings>,
+    store: Res<DiagnosticsStore>,
+) {
+    let timer = timer.get_or_insert_with(|| Timer::from_seconds(2.0, TimerMode::Repeating));
+    if !timer.tick(time.delta()).just_finished() {
+        return;
+    }
+    let gpu_ms = |span: &str| {
+        store
+            .get(&DiagnosticPath::new(format!("render/{span}/elapsed_gpu")))
+            .and_then(|d| d.smoothed())
+    };
+
+    let mut stages: Vec<(String, f64)> = Vec::new();
+    for span in [REFERENCE_SPAN.to_string()]
+        .into_iter()
+        .chain((0..settings.cascade_count()).rev().map(cascade_span))
+        .chain([RESOLVE_SPAN.to_string()])
+    {
+        let Some(ms) = gpu_ms(&span) else {
+            info!("GPU timings unavailable (no timestamp queries inside passes on this adapter?)");
+            return;
+        };
+        stages.push((span.trim_start_matches("rc2d_").to_string(), ms));
+    }
+
+    let cascades: f64 = stages
+        .iter()
+        .filter(|(name, _)| name.starts_with("cascade"))
+        .map(|(_, ms)| ms)
+        .sum();
+    let breakdown: Vec<String> = stages
+        .iter()
+        .map(|(name, ms)| format!("{name} {ms:.2}"))
+        .collect();
+    info!(
+        "GPU ms | cascades total {cascades:.2} (bilinear_fix={}) | {}",
+        settings.bilinear_fix,
+        breakdown.join(", ")
+    );
 }
 
 fn request_error_readback(
@@ -235,9 +333,17 @@ fn request_error_readback(
     commands
         .spawn(Readback::buffer(buffers.error.clone()))
         .observe(
-            |event: On<ReadbackComplete>, settings: Res<Rc2dSettings>, mut commands: Commands| {
-                // Readback repeats every frame while the entity lives, and a
+            |event: On<ReadbackComplete>,
+             settings: Res<Rc2dSettings>,
+             mut commands: Commands,
+             mut handled: Local<bool>| {
+                // Readback repeats every frame while the entity lives, so a
                 // second result can already be in flight when this runs.
+                // Each request gets its own observer, so `handled` is per
+                // request.
+                if std::mem::replace(&mut *handled, true) {
+                    return;
+                }
                 commands.entity(event.entity).try_despawn();
 
                 let (mut err, mut reference, mut pixels, mut rays) = (0.0f64, 0.0f64, 0u32, 0.0f32);
@@ -279,6 +385,7 @@ struct Params {
     ref_rays: u32,
     exposure: f32,
     diff_gain: f32,
+    light_pos: Vec2,
 }
 
 #[derive(Resource)]
@@ -374,6 +481,7 @@ fn run_rc2d(
         ref_rays: settings.ref_rays,
         exposure: settings.exposure,
         diff_gain: settings.diff_gain,
+        light_pos: settings.light_pos,
     };
     params.clear();
     // Offsets [0..cascade_count) are per-cascade; the last one is shared by
@@ -408,6 +516,8 @@ fn run_rc2d(
     let writes_b = bind_group(&a.buffer, &b.buffer);
 
     let pixel_groups = SIZE.div_ceil(8);
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
     let mut pass = ctx
         .command_encoder()
         .begin_compute_pass(&ComputePassDescriptor {
@@ -415,19 +525,25 @@ fn run_rc2d(
             timestamp_writes: None,
         });
 
+    let span = diagnostics.pass_span(&mut pass, REFERENCE_SPAN);
     pass.set_pipeline(reference_pipeline);
     pass.set_bind_group(0, &writes_a, &[shared_offset]);
     pass.dispatch_workgroups(pixel_groups, pixel_groups, 1);
+    span.end(&mut pass);
 
     pass.set_pipeline(cascade_pipeline);
     for cascade in (0..cascade_count).rev() {
+        let span = diagnostics.pass_span(&mut pass, cascade_span(cascade));
         let group = if cascade % 2 == 0 { &writes_a } else { &writes_b };
         pass.set_bind_group(0, group, &[cascade_offsets[cascade as usize]]);
         pass.dispatch_workgroups((CASCADE_ENTRIES as u32).div_ceil(64), 1, 1);
+        span.end(&mut pass);
     }
 
     // Reads cascade 0 (in A) as `src`.
+    let span = diagnostics.pass_span(&mut pass, RESOLVE_SPAN);
     pass.set_pipeline(resolve_pipeline);
     pass.set_bind_group(0, &writes_b, &[shared_offset]);
     pass.dispatch_workgroups(pixel_groups, pixel_groups, 1);
+    span.end(&mut pass);
 }
