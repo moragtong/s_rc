@@ -63,6 +63,19 @@ fn march(
     dir: vec3<f32>,
     max_t: f32,
 ) -> March {
+    return march_eps(clipmap, sdf, s, origin, dir, max_t, hit_eps(clipmap));
+}
+
+// `march` with an explicit hit threshold.
+fn march_eps(
+    clipmap: Clipmap,
+    sdf: texture_3d<f32>,
+    s: sampler,
+    origin: vec3<f32>,
+    dir: vec3<f32>,
+    max_t: f32,
+    eps: f32,
+) -> March {
     var t = 0.0;
     var steps = 0u;
     for (; steps < MAX_STEPS; steps++) {
@@ -71,7 +84,7 @@ fn march(
             break;
         }
         let d = sample_sdf(clipmap, sdf, s, p);
-        if d < hit_eps(clipmap) {
+        if d < eps {
             return March(true, t, steps);
         }
         t += max(d, MIN_STEP);

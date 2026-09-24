@@ -17,7 +17,7 @@
 // the shading point itself is computed there, not by the cascades.
 // Each dispatch describes its own probes and children in Params.
 
-#import s_rc::clipmap_sample::{Clipmap, grid_uvw, in_grid, march, sample_sdf, sun_visibility}
+#import s_rc::clipmap_sample::{Clipmap, grid_uvw, hit_eps, in_grid, march_eps, sample_sdf, sun_visibility}
 
 struct Params {
     clipmap: Clipmap,
@@ -196,11 +196,21 @@ fn segment(world: vec3<i32>, ray: u32, k: u32) -> Segment {
     return Segment(a, center + dir * range.y);
 }
 
+// Hit threshold for cascade rays: the grid's (a quarter voxel), but at
+// least 3.1 cm. Below that, at 6.25-7.5 cm voxels, cascade 1 brought in
+// light it shouldn't (+27% indirect at 6.25 cm); camera rays keep the
+// quarter voxel for sharp silhouettes.
+const CASCADE_MIN_EPS: f32 = 0.03125;
+
+fn cascade_eps() -> f32 {
+    return max(hit_eps(params.clipmap), CASCADE_MIN_EPS);
+}
+
 // First hit along the segment, as a fraction of it.
 fn march_fraction(seg: Segment) -> f32 {
     let delta = seg.b - seg.a;
     let len = length(delta);
-    let m = march(params.clipmap, sdf, clipmap_sampler, seg.a, delta / len, len);
+    let m = march_eps(params.clipmap, sdf, clipmap_sampler, seg.a, delta / len, len, cascade_eps());
     if !m.hit || m.t >= len {
         return 1.0;
     }
@@ -408,7 +418,7 @@ fn reachable_children(world: vec3<i32>) -> u32 {
         }
         let delta = child - center;
         let len = length(delta);
-        if len < 1e-4 || !march(params.clipmap, sdf, clipmap_sampler, center, delta / len, len).hit {
+        if len < 1e-4 || !march_eps(params.clipmap, sdf, clipmap_sampler, center, delta / len, len, cascade_eps()).hit {
             mask |= 1u << k;
         }
     }
