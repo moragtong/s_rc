@@ -217,11 +217,11 @@ fn init_cascades_gpu(
 ) {
     let layout = Layout::new();
     info!(
-        "cascades3d: {} cascades, rays per window {:?}, hits {:.0} MB, radiance 2 x {:.0} MB",
+        "cascades3d: {} cascades, rays per window {:?}, hits {:.0} MB, radiance {:.0} MB",
         CASCADES,
         layout.cascades.iter().map(CascadeWindow::rays).collect::<Vec<_>>(),
         layout.hit_words as f64 * 4.0 / 1e6,
-        layout.max_rays as f64 * 8.0 / 1e6,
+        layout.cascades.iter().map(CascadeWindow::rays).sum::<u64>() as f64 * 8.0 / 1e6,
     );
 
     let mut angles = Vec::new();

@@ -5,15 +5,21 @@ use bevy::math::{Vec2, Vec3, Vec4};
 
 pub const CASCADES: u32 = 4;
 /// Cascade-0 probe spacing, m. Doubles per cascade.
-pub const SPACING0: f32 = 0.5;
+/// Spacing and directions have to grow together: against Mitsuba, indirect
+/// RMSE was 49.5% at 0.5 m and 4x4 directions, 52% with only the spacing
+/// halved, 54% with only 4x the directions, and 35% with both (median
+/// pixel error 68% -> 34%).
+pub const SPACING0: f32 = 0.25;
 /// Cascade-0 directions: an OCTA_SIDE0^2 octahedral map. The side doubles
 /// per cascade (4x directions).
-pub const OCTA_SIDE0: u32 = 4;
+pub const OCTA_SIDE0: u32 = 8;
 /// End of cascade 0's interval, m; cascade n covers
 /// [INTERVAL0 * 2^(n-1), INTERVAL0 * 2^n] (cascade 0 from 0).
 pub const INTERVAL0: f32 = 1.5;
-/// Cascade-0 probes exist within this distance of the camera.
-pub const RADIUS0: f32 = 15.0;
+/// Cascade-0 probes exist within this distance of the camera: 10.5 m holds
+/// the room from inside it, and is what fits in memory at this density
+/// (1.9 GB of cached hits, 1.2 GB of radiance).
+pub const RADIUS0: f32 = 10.5;
 /// Sub-samples per axis of each cascade-0 direction cell, for exact cosine
 /// weighting when shading from 16 directions.
 pub const SHADE_SUBSAMPLES: u32 = 4;
