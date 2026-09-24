@@ -42,12 +42,12 @@ use bevy::{
 use crate::scene3d::SceneBoxMesh;
 use crate::sdf_bake::{self, SdfGrid};
 
-/// Voxels per axis: 640 at 7.5 cm spans 48 m, +-24 m around the camera,
+/// Voxels per axis: 384 at 12.5 cm spans 48 m, +-24 m around the camera,
 /// which holds the whole 24 m ground slab from anywhere around the room.
-/// The finest this hardware holds at that reach: 16 bytes per voxel is
-/// 4.2 GB of the Iris Xe's shared memory.
-pub const RESOLUTION: i32 = 640;
-pub const VOXEL: f32 = 0.075;
+/// (640 at 7.5 cm, 4.2 GB, is the finest this hardware holds at that
+/// reach; it gained little.)
+pub const RESOLUTION: i32 = 384;
+pub const VOXEL: f32 = 0.125;
 pub const FORMAT: TextureFormat = TextureFormat::R16Float;
 pub const ALBEDO_FORMAT: TextureFormat = TextureFormat::Rgba8Unorm;
 pub const COLOR_FORMAT: TextureFormat = TextureFormat::Rgba16Float;
