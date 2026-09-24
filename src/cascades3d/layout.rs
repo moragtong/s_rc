@@ -45,8 +45,6 @@ pub struct Layout {
     pub cascades: Vec<CascadeWindow>,
     pub tag_words: u64,
     pub hit_words: u64,
-    /// Largest window in rays, which sizes the ping-pong radiance buffers.
-    pub max_rays: u64,
 }
 
 pub fn spacing(n: u32) -> f32 {
@@ -119,8 +117,7 @@ impl Layout {
             cascades.push(w);
         }
 
-        let max_rays = cascades.iter().map(CascadeWindow::rays).max().unwrap_or(0);
-        Self { cascades, tag_words: tag_base, hit_words: hit_base, max_rays }
+        Self { cascades, tag_words: tag_base, hit_words: hit_base }
     }
 }
 
