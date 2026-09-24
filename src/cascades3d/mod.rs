@@ -143,6 +143,11 @@ struct Params {
     force: u32,
     /// DEBUG: the top-cascade slot RC3D_TEST_ONE applies to.
     test_slot: u32,
+    sun_toward: Vec3,
+    sun_k: f32,
+    /// 1 = shadow rays at hits instead of the shadow grid
+    /// (RC3D_CASCADE_SHADOW=rays), for comparison.
+    shadow_rays: u32,
 }
 
 /// GPU state shared with the SDF view, which shades from cascade 0.
@@ -325,6 +330,7 @@ fn run_cascades(
     frame: Res<Cascades3dFrame>,
     gpu: Option<Res<Cascades3dGpu>>,
     textures: Option<Res<ClipmapTextures>>,
+    sun: Option<Res<crate::clipmap::SunLight>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -334,7 +340,8 @@ fn run_cascades(
     mut frame_count: Local<u32>,
     mut ctx: RenderContext,
 ) {
-    let (Some(gpu), Some(textures)) = (gpu, textures) else { return };
+    let (Some(gpu), Some(textures), Some(sun)) = (gpu, textures, sun) else { return };
+    let shadow_rays = std::env::var("RC3D_CASCADE_SHADOW").is_ok_and(|s| s == "rays");
     if !frame.active {
         return;
     }
@@ -412,6 +419,9 @@ fn run_cascades(
             frame: *frame_count,
             force: force as u32,
             test_slot,
+            sun_toward: sun.toward,
+            sun_k: sun.k,
+            shadow_rays: shadow_rays as u32,
         }
     };
     let offsets: Vec<u32> = windows.iter().enumerate().map(|(i, own)| params.push(&make(i, own))).collect();

@@ -17,7 +17,7 @@
 // the shading point itself is computed there, not by the cascades.
 // Each dispatch describes its own probes and children in Params.
 
-#import s_rc::clipmap_sample::{Clipmap, grid_uvw, in_grid, march, sample_sdf}
+#import s_rc::clipmap_sample::{Clipmap, grid_uvw, in_grid, march, sample_sdf, sun_visibility}
 
 struct Params {
     clipmap: Clipmap,
@@ -49,6 +49,12 @@ struct Params {
     force: u32,
     // DEBUG: with debug 3, the one slot debug 2 applies to.
     test_slot: u32,
+    sun_toward: vec3<f32>,
+    // Cone factor 1 / tan(sun angular radius).
+    sun_k: f32,
+    // 1 = sun visibility at hits from a shadow ray instead of the shadow
+    // grid (RC3D_CASCADE_SHADOW=rays), for comparison.
+    shadow_rays: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -211,8 +217,27 @@ fn surface_radiance(hit: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         return vec3(0.0);
     }
     let uvw = grid_uvw(params.clipmap, p);
-    return textureSampleLevel(color, clipmap_sampler, uvw, 0.0).rgb
-        * textureSampleLevel(shadow, clipmap_sampler, uvw, 0.0).r;
+    let c = textureSampleLevel(color, clipmap_sampler, uvw, 0.0).rgb;
+    if params.shadow_rays == 0u {
+        return c * textureSampleLevel(shadow, clipmap_sampler, uvw, 0.0).r;
+    }
+    if all(c <= vec3(0.0)) {
+        return vec3(0.0);
+    }
+    // A shadow ray from just off the surface at the hit (same 7 cm start
+    // as the shadow grid's marches), normal from the distance field.
+    let e = 0.5 * params.clipmap.voxel;
+    let n = normalize(vec3(
+        sdf_at(hit + vec3(e, 0.0, 0.0)) - sdf_at(hit - vec3(e, 0.0, 0.0)),
+        sdf_at(hit + vec3(0.0, e, 0.0)) - sdf_at(hit - vec3(0.0, e, 0.0)),
+        sdf_at(hit + vec3(0.0, 0.0, e)) - sdf_at(hit - vec3(0.0, 0.0, e)),
+    ));
+    let start = hit + n * max(0.07 - sdf_at(hit), 0.0);
+    return c * sun_visibility(params.clipmap, sdf, clipmap_sampler, start, params.sun_toward, params.sun_k);
+}
+
+fn sdf_at(p: vec3<f32>) -> f32 {
+    return sample_sdf(params.clipmap, sdf, clipmap_sampler, p);
 }
 
 fn hit_word(ray_slot: u32, k: u32) -> u32 {
