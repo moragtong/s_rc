@@ -124,8 +124,6 @@ def main():
             top = np.argsort(counts)[::-1][:12]
             print("    top locations (25 cm cells, count):", [(tuple(np.round(cells[i], 2)), int(counts[i])) for i in top])
 
-if __name__ == "__main__":
-    main()
 
 def overestimates():
     """Where the stored value exceeds the true distance outside the solid
@@ -153,4 +151,6 @@ def overestimates():
         print(f"  at {np.round(centers[i], 3)}: stored {stored[i]*100:.1f} cm, true {exact[i]*100:.1f} cm; "
               f"nearest box {nearest} (half {boxes[nearest][1]}) sampled {per[i, nearest]*100:.1f} cm (its error {own_err*100:+.1f} cm)")
 
-overestimates()
+if __name__ == "__main__":
+    main()
+    overestimates()
