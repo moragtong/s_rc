@@ -177,7 +177,11 @@ fn cascade_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
         let slot = c0_slot(world);
         let live = distance(center, view.camera) <= view.c0_radius
             && tags[view.c0_tag_base + slot] == pack_tag(world);
-        let empty = in_grid(clipmap(), center) && sample_at(center) > 0.0;
+        // In empty space, and not within the cascades' hit threshold of a
+        // surface (3.1 cm): such a probe's rays all hit at once, so it's
+        // black (at 0.25 m spacing, every probe next to the walls at +-3.9 m
+        // sits 2.5 cm off them, darkening the adjoining creases).
+        let empty = in_grid(clipmap(), center) && sample_at(center) > max(hit_eps(clipmap()), 0.03125);
         let w3 = mix(1.0 - f, f, vec3<f32>(corner));
         let w = w3.x * w3.y * w3.z;
         // In front of the line test's start, and nothing in between.

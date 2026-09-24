@@ -413,7 +413,9 @@ fn reachable_children(world: vec3<i32>) -> u32 {
     var mask = 0u;
     for (var k = 0u; k < 8u; k++) {
         let child = probe_center(t.base + corner(k), params.child_spacing);
-        if !in_grid(params.clipmap, child) || sample_sdf(params.clipmap, sdf, clipmap_sampler, child) <= 0.0 {
+        // A child within the hit threshold of a surface is as good as
+        // inside: every ray it starts hits at once, so it's black.
+        if !in_grid(params.clipmap, child) || sample_sdf(params.clipmap, sdf, clipmap_sampler, child) <= cascade_eps() {
             continue;
         }
         let delta = child - center;
