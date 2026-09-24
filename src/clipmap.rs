@@ -121,6 +121,9 @@ pub struct GpuInstance {
     pub offset: u32,
     /// Linear albedo in rgb.
     pub albedo: Vec4,
+    /// The mesh's local bounds: outside its grid, distances are to these.
+    pub mesh_min: Vec3,
+    pub mesh_max: Vec3,
 }
 
 /// An axis-aligned block of world voxels.
@@ -235,15 +238,23 @@ fn bake_scene(
     for (mesh, material, transform) in &boxes {
         let (Some(mesh), Some(material)) = (meshes.get(&mesh.0), materials.get(&material.0)) else { return };
         let albedo = material.base_color.to_linear();
-        let grid: SdfGrid = match sdf_bake::mesh_triangles(mesh)
-            .and_then(|(p, i)| sdf_bake::bake_cached(&p, &i, BAKE_VOXEL, BAKE_PADDING, cache))
-        {
+        let (positions, indices) = match sdf_bake::mesh_triangles(mesh) {
+            Ok(t) => t,
+            Err(e) => {
+                error!("SDF bake failed: {e}");
+                return;
+            }
+        };
+        let grid: SdfGrid = match sdf_bake::bake_cached(&positions, &indices, BAKE_VOXEL, BAKE_PADDING, cache) {
             Ok(grid) => grid,
             Err(e) => {
                 error!("SDF bake failed: {e}");
                 return;
             }
         };
+        let (mesh_min, mesh_max) = positions
+            .iter()
+            .fold((Vec3::MAX, Vec3::MIN), |(lo, hi), p| (lo.min(Vec3::from(*p)), hi.max(Vec3::from(*p))));
         scene.instances.push(GpuInstance {
             world_to_local: transform.to_matrix().inverse(),
             grid_min: grid.min,
@@ -251,6 +262,8 @@ fn bake_scene(
             dims: grid.dims,
             offset: scene.values.len() as u32,
             albedo: Vec4::new(albedo.red, albedo.green, albedo.blue, 0.0),
+            mesh_min,
+            mesh_max,
         });
         scene.values.extend_from_slice(&grid.values);
     }

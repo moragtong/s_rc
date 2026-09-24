@@ -13,6 +13,9 @@ struct Instance {
     dims: vec3<u32>,
     offset: u32,
     albedo: vec4<f32>,
+    // The mesh's local bounds.
+    mesh_min: vec3<f32>,
+    mesh_max: vec3<f32>,
 }
 
 struct ComposeParams {
@@ -47,13 +50,18 @@ fn grid_value(inst: Instance, cell: vec3<i32>) -> f32 {
 }
 
 // Trilinear inside the grid (values live at voxel centers). Outside it, the
-// distance to the grid's sample bounds plus the value there: an upper bound
-// on the true distance, exact when the nearest surface is straight through
-// the nearest bound point, which the bake's padding makes the common case.
+// distance to the mesh's bounds: never more
+// than the true distance, so sphere tracing can't step past a surface, and
+// exact for boxes. (It was the distance to the grid's edge plus the value
+// there, an upper bound that overshot by up to 14% diagonally past corners:
+// 9.5 cm outside the ceiling's corners.)
 fn sample_instance(inst: Instance, p: vec3<f32>) -> f32 {
     let lo = inst.grid_min + 0.5 * inst.voxel;
     let hi = inst.grid_min + (vec3<f32>(inst.dims) - 0.5) * inst.voxel;
-    let q = clamp(p, lo, hi);
+    if any(p < lo) || any(p > hi) {
+        return length(max(max(inst.mesh_min - p, p - inst.mesh_max), vec3(0.0)));
+    }
+    let q = p;
     let g = (q - inst.grid_min) / inst.voxel - 0.5;
     let c = vec3<i32>(floor(g));
     let f = g - floor(g);

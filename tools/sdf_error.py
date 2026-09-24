@@ -1,6 +1,7 @@
 """Where the SDF grid is wrong: rebuilds the stored field on the CPU exactly
 as the GPU composes it (per-mesh baked grids from target/sdf_cache, sampled
-like clipmap_compose.wgsl's sample_instance, min over instances at voxel
+like clipmap_compose.wgsl's sample_instance (outside a grid, the distance
+to the mesh's bounds, here the box itself), min over instances at voxel
 centers, rounded to f16), then filters it trilinearly like the samplers
 tracing it do, and compares both with the exact box distances.
 
@@ -28,10 +29,13 @@ def load_grids():
         grids.append((mn.astype(np.float64), float(vox), dims, vals))
     return grids
 
-def sample_instance(g, p):
+def sample_instance(g, p, half):
     """clipmap_compose.wgsl sample_instance, vectorised; p (N,3) local."""
     mn, v, dims, vals = g
     lo = mn + 0.5 * v; hi = mn + (dims - 0.5) * v
+    outside = np.any((p < lo) | (p > hi), axis=1)
+    mesh_lo, mesh_hi = -half, half
+    bounds = np.linalg.norm(np.maximum(np.maximum(mesh_lo - p, p - mesh_hi), 0), axis=1)
     q = np.clip(p, lo, hi)
     gq = (q - mn) / v - 0.5
     c = np.floor(gq).astype(int); f = gq - c
@@ -43,7 +47,7 @@ def sample_instance(g, p):
     x01 = val(0,0,1) * (1-f[:,0]) + val(1,0,1) * f[:,0]
     x11 = val(0,1,1) * (1-f[:,0]) + val(1,1,1) * f[:,0]
     d = (x00 * (1-f[:,1]) + x10 * f[:,1]) * (1-f[:,2]) + (x01 * (1-f[:,1]) + x11 * f[:,1]) * f[:,2]
-    return np.linalg.norm(p - q, axis=1) + d
+    return np.where(outside, bounds, d)
 
 def box_sdf(p, c, h):
     q = np.abs(p - c) - h
@@ -68,7 +72,7 @@ def main():
     ks = [np.arange(np.floor(lo[a] / VOXEL), np.ceil(hi[a] / VOXEL)) for a in range(3)]
     kx, ky, kz = np.meshgrid(*ks, indexing="ij")
     centers = (np.stack([kx, ky, kz], -1).reshape(-1, 3) + 0.5) * VOXEL
-    stored = np.min([sample_instance(g, centers - c) for c, h, g in inst], axis=0)
+    stored = np.min([sample_instance(g, centers - c, h) for c, h, g in inst], axis=0)
     stored16 = stored.astype(np.float16).astype(np.float64)
     exact_c = np.min([box_sdf(centers, c, h) for c, h, g in inst], axis=0)
     shape = kx.shape
@@ -134,7 +138,7 @@ def overestimates():
     ks = [np.arange(np.floor(lo[a] / VOXEL), np.ceil(hi[a] / VOXEL)) for a in range(3)]
     kx, ky, kz = np.meshgrid(*ks, indexing="ij")
     centers = (np.stack([kx, ky, kz], -1).reshape(-1, 3) + 0.5) * VOXEL
-    per = np.stack([sample_instance(g, centers - c) for c, h, g in inst], 1)
+    per = np.stack([sample_instance(g, centers - c, h) for c, h, g in inst], 1)
     exact_per = np.stack([box_sdf(centers, c, h) for c, h, g in inst], 1)
     stored = per.min(1); exact = exact_per.min(1)
     over = stored - exact
