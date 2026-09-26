@@ -34,7 +34,7 @@ pub struct LayoutInputs {
     pub probe0_log2: u32,
     pub cascade_count: u32,
     pub per_direction_levels: u32,
-    pub bilinear_fix: bool,
+    pub bilinear_fix: u32,
     pub radius: f32,
 }
 
@@ -84,7 +84,15 @@ impl CacheLayout {
 /// u32 words of cached hits per stored ray; mirrors the shader.
 fn hit_words(inputs: &LayoutInputs, n: u32) -> u32 {
     let has_children = n + 1 < inputs.cascade_count;
-    let subs = if has_children && n < inputs.per_direction_levels { 4 } else { 1 };
-    let segments = if has_children && inputs.bilinear_fix { 4 } else { 1 };
+    let subs = if has_children && n < inputs.per_direction_levels {
+        4
+    } else {
+        1
+    };
+    let segments = if has_children && inputs.bilinear_fix == 1 {
+        4
+    } else {
+        1
+    };
     (subs * segments + 1) / 2
 }

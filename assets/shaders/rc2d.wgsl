@@ -27,7 +27,7 @@ struct Params {
     cascade: u32,
     cascade_count: u32,
     base_interval: f32,
-    // 0 = plain bilinear merge, 1 = bilinear fix.
+    // 0 = plain bilinear merge, 1 = bilinear fix, 2 = plain bilinear merge marching from center [0, r1].
     merge_mode: u32,
     // 0 = cascades, 1 = reference, 2 = |cascades - reference|.
     view_mode: u32,
@@ -184,19 +184,6 @@ fn trace_hit(origin: vec2<f32>, dir: vec2<f32>, t0: f32, t1: f32) -> Hit {
 }
 
 // ---------------------------------------------------------- probe window
-//
-// Probes only exist inside a circle (eventually the camera's region). Each
-// cascade stores its probes in a `window` x `window` grid of slots, mapped
-// toroidally: world probe w lives in slot w mod window. When the circle
-// moves, most probes keep their slot, and so their cached hits; only slots
-// whose world probe changed get re-marched. Cascade n's circle is larger
-// than n-1's by 1.5 of its own spacings, so every valid probe's 4 bilinear
-// children exist.
-//
-// A slot's tag records which world probe its cached hits belong to
-// (packed coordinates + 1; 0 = nothing cached). The trace pass re-marches
-// valid slots whose tag doesn't match, and a separate commit pass updates
-// the tags afterwards, so no thread reads a tag another thread is writing.
 
 struct Window {
     size: u32,
@@ -217,8 +204,6 @@ fn c0_window() -> Window {
 }
 
 fn slot_world(slot: vec2<u32>, n: u32, window: u32) -> vec2<i32> {
-    // A window spanning the whole canvas grid holds every probe as-is;
-    // centering it on the circle would wrap canvas probes out of range.
     if window >= probe_grid(n).x {
         return vec2<i32>(slot);
     }
@@ -257,26 +242,10 @@ fn probe_ready(world: vec2<i32>, n: u32, window: Window) -> bool {
 
 // -------------------------------------------------------------- bounces
 
-// 2D Lambertian: L_out = (albedo / 2) * integral of L_in cos(theta) over
-// the half-circle around the normal. With uniform L_in that's albedo * L_in,
-// which is also what the reference's cosine-sampled estimator gives.
-// This returns L_out / albedo from cascade-0 probes: the previous pass's
-// (bounce_src) while gathering, or this pass's final result (cascade_src, in
-// the resolve) to draw wall faces.
-//
-// Only probes in empty space on the normal's side of the surface count. A
-// 2px wall is thinner than 2px probe spacing, so the plain bilinear
-// footprint straddles it and would light the inner face with the outer
-// face's light. With no valid probe (including outside the circle) the
-// bounce is dropped: missing coverage loses energy rather than leaking it.
 fn bounce_radiance(pos: vec2<f32>, final_pass: bool) -> vec3<f32> {
     let n = scene_normal(pos);
     let spacing = probe_spacing(0u);
     let window = c0_window();
-    // Sample the probe grid half a spacing off the surface. Exactly on it,
-    // the footprint can hold only the probe rows centered on the wall's two
-    // faces, which the side test rejects, and the face goes black; half a
-    // spacing out, one bracketing row is always strictly in front.
     let probes = bilinear(pos + n * 0.5 * spacing, 0u);
     var sum = vec3(0.0);
     var weight = 0.0;
@@ -292,9 +261,6 @@ fn bounce_radiance(pos: vec2<f32>, final_pass: bool) -> vec3<f32> {
     return select(vec3(0.0), sum / weight, weight > 0.0);
 }
 
-// (1/2) * integral of L_in cos over the half-circle around n, from one
-// cascade-0 probe's 4 arc-averaged rays. Each arc's cosine weight is exact:
-// sin(hi) - sin(lo) over the part of the arc inside [-90, 90] degrees.
 fn cosine_weighted(slot: u32, n: vec2<f32>, final_pass: bool) -> vec3<f32> {
     let normal_angle = atan2(n.y, n.x);
     var sum = vec3(0.0);
@@ -324,8 +290,6 @@ fn probe_grid(n: u32) -> vec2<u32> {
     return params.size >> vec2(n + params.probe0_log2);
 }
 
-// Cell-centered bilinear footprint of cascade n's probes at `pos`, in world
-// probe coordinates (unclamped).
 struct Bilinear {
     base: vec2<i32>,
     weights: vec4<f32>,
@@ -347,13 +311,17 @@ fn bilinear(pos: vec2<f32>, n: u32) -> Bilinear {
     );
 }
 
-// Bilinear neighbor k, clamped into the canvas probe grid.
 fn bilinear_probe(b: Bilinear, k: u32, n: u32) -> vec2<i32> {
     return clamp(b.base + BILINEAR_OFFSETS[k], vec2(0), vec2<i32>(probe_grid(n)) - 1);
 }
 
 fn interval(n: u32) -> vec2<f32> {
-    let start = select(params.base_interval * f32(1u << (2u * n)), 0.0, n == 0u);
+    // Mode 2 starts marching from 0.0 for every cascade.
+    let start = select(
+        select(params.base_interval * f32(1u << (2u * n)), 0.0, n == 0u),
+        0.0,
+        params.merge_mode == 2u
+    );
     let end = params.base_interval * f32(1u << (2u * n + 2u));
     return vec2(start, end);
 }
@@ -376,17 +344,12 @@ fn merge(near: vec4<f32>, far: vec4<f32>) -> vec4<f32> {
     return vec4(near.rgb + near.a * far.rgb, near.a * far.a);
 }
 
-// Average of rays 4*ray .. 4*ray+3 of the probe in `slot` of cascade n: for a
-// cascade n+1 probe, that's the arc of parent ray `ray`; for cascade 0 with
-// ray = 0, it's the probe's whole fluence.
 fn probe_arc(slot: u32, n: u32, ray: u32) -> vec4<f32> {
     let base = slot * ray_count(n) + ray * 4u;
     return 0.25 * (load_ray(base) + load_ray(base + 1u)
         + load_ray(base + 2u) + load_ray(base + 3u));
 }
 
-// Far field for one sub-direction: the child ray itself when merging per
-// direction, else the pre-averaged arc of the parent ray.
 fn child_value(slot: u32, n1: u32, parent_ray: u32, child_ray: u32, per_direction: bool) -> vec4<f32> {
     if per_direction {
         return load_ray(slot * ray_count(n1) + child_ray);
@@ -395,28 +358,6 @@ fn child_value(slot: u32, n1: u32, parent_ray: u32, child_ray: u32, per_directio
 }
 
 // ------------------------------------------------------ segments and hits
-//
-// Each stored ray of cascade n marches `sub_count(n) * segment_count(n)`
-// segments, and the trace pass caches where each one first hit (as a
-// fraction of the segment, unorm16; 1.0 = miss). The segments depend only
-// on the probe's world position, its children's positions and the ray
-// direction, never on lighting, so the cache stays valid until geometry or
-// cascade settings change.
-//
-// Per-direction merge: a stored ray covers an arc, and tracing its near
-// segment only along the arc's center makes near visibility all-or-nothing
-// for the whole arc. Next to a bright surface that's biased bright:
-// directions that hit are always counted (a child interval that starts
-// inside the surface reports its emission), and a center hit also claims
-// the arc's directions that miss. So cascades n < per_direction_levels
-// trace each of the 4 child directions separately and average after the
-// merge; an average of products isn't the product of averages.
-//
-// Bilinear fix: instead of one near segment merged with the interpolated
-// far field (which leaks: the 4 child probes can sit on the far side of an
-// occluder the near segment never saw), trace from this probe's interval
-// start to where each child probe's interval starts, so each near segment
-// actually connects to the far field it's merged with.
 
 fn has_children(n: u32) -> bool {
     return n + 1u < params.cascade_count;
@@ -426,11 +367,11 @@ fn sub_count(n: u32) -> u32 {
     return select(1u, 4u, has_children(n) && n < params.per_direction_levels);
 }
 
+// 4 segments only in bilinear fix mode (1); 1 segment for plain (0) and center-march (2).
 fn segment_count(n: u32) -> u32 {
     return select(1u, 4u, has_children(n) && params.merge_mode == 1u);
 }
 
-// u32 words per stored ray: two unorm16 hit fractions each.
 fn hit_words(n: u32) -> u32 {
     return (sub_count(n) * segment_count(n) + 1u) / 2u;
 }
@@ -440,7 +381,6 @@ struct Segment {
     b: vec2<f32>,
 }
 
-// Segment k of sub-direction j of `ray` from world probe `world`.
 fn segment(n: u32, world: vec2<i32>, ray: u32, j: u32, k: u32) -> Segment {
     let center = (vec2<f32>(world) + 0.5) * probe_spacing(n);
     let range = interval(n);
@@ -463,7 +403,6 @@ fn march_fraction(seg: Segment) -> f32 {
     if !h.hit {
         return 1.0;
     }
-    // Keep hits strictly below the 1.0 miss code after unorm16 rounding.
     return min(distance(seg.a, h.pos) / len, 65534.0 / 65535.0);
 }
 
@@ -471,9 +410,6 @@ fn hit_word(ray_slot: u32, n: u32, h: u32) -> u32 {
     return params.hit_base + ray_slot * hit_words(n) + h / 2u;
 }
 
-// Radiance and visibility along a cached segment. Lighting is evaluated
-// here, at gather time: emission (the spot's cone uses the segment's
-// direction) and, in bounce passes, bounce light at the hit.
 fn cached_near(ray_slot: u32, n: u32, h: u32, seg: Segment) -> vec4<f32> {
     let fractions = unpack2x16unorm(hits[hit_word(ray_slot, n, h)]);
     let fraction = select(fractions.x, fractions.y, h % 2u == 1u);
@@ -489,8 +425,6 @@ fn cached_near(ray_slot: u32, n: u32, h: u32, seg: Segment) -> vec4<f32> {
     return vec4(radiance, 0.0);
 }
 
-// Re-march the rays of probes that entered the circle (or everything, after
-// the CPU clears the tags). One thread per (slot, ray).
 @compute @workgroup_size(64, 1, 1)
 fn cascade_trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = params.cascade;
@@ -521,7 +455,6 @@ fn cascade_trace(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
-// After every cascade's trace: record which world probe each slot now holds.
 @compute @workgroup_size(64, 1, 1)
 fn cascade_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = params.cascade;
@@ -533,8 +466,6 @@ fn cascade_commit(@builtin(global_invocation_id) id: vec3<u32>) {
     tags[window.tag_base + id.x] = select(0u, pack_tag(world), probe_valid(world, n, window.radius));
 }
 
-// Radiance for every valid (slot, ray) from its cached hits and the next
-// cascade. Runs every frame, once per bounce pass.
 @compute @workgroup_size(64, 1, 1)
 fn cascade_gather(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = params.cascade;
@@ -608,9 +539,6 @@ fn pcg(v: u32) -> u32 {
     return (word >> 22u) ^ word;
 }
 
-// Radiance arriving along one ray, path traced through up to `bounces`
-// diffuse bounces with cosine-weighted directions (pdf cos/2 in 2D), so each
-// bounce's estimator is albedo * L_in, matching bounce_radiance.
 fn path_radiance(start: vec2<f32>, start_dir: vec2<f32>, rng: ptr<function, u32>) -> vec3<f32> {
     var origin = start;
     var dir = start_dir;
@@ -630,15 +558,11 @@ fn path_radiance(start: vec2<f32>, start_dir: vec2<f32>, rng: ptr<function, u32>
         *rng = pcg(*rng);
         let theta = asin(2.0 * f32(*rng) / 4294967296.0 - 1.0);
         dir = cos(theta) * n + sin(theta) * vec2(-n.y, n.x);
-        // HIT_EPS is 0.05; start clear of the surface.
         origin = h.pos + n * 0.1;
     }
     return radiance;
 }
 
-// Per-pixel fluence by brute force: stratified angles with a per-pixel,
-// per-frame random rotation, so it converges to the continuous integral
-// rather than to any fixed set of directions the cascades might share.
 @compute @workgroup_size(8, 8, 1)
 fn reference_accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy >= params.size) {
@@ -650,10 +574,6 @@ fn reference_accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
 
     var rng = pcg(id.x ^ pcg(id.y ^ pcg(params.ref_frame + 0x9e3779b9u)));
 
-    // Wall pixels: the lit color of the nearest face, i.e. albedo times
-    // cosine-weighted incoming light there. Cosine-distributed stratified
-    // directions (u stratified, theta = asin(2u - 1)) make that estimator
-    // albedo * L_in, like the cascades' bounce_radiance.
     let here = scene(center);
     let on_wall = here.dist <= 0.0 && any(here.albedo > vec3(0.0));
     let face = nearest_face(center, here.dist);
@@ -665,7 +585,6 @@ fn reference_accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
             let theta = asin(2.0 * u - 1.0);
             let n = face.normal;
             let dir = cos(theta) * n + sin(theta) * vec2(-n.y, n.x);
-            // HIT_EPS is 0.05; start clear of the surface.
             sum += here.albedo * path_radiance(face.pos + n * 0.1, dir, &rng);
         } else {
             let angle = u * TAU;
@@ -683,7 +602,6 @@ fn tonemap(v: vec3<f32>) -> vec3<f32> {
     return 1.0 - exp(-v * params.exposure);
 }
 
-// Reads cascade 0 from cascade_src.
 @compute @workgroup_size(8, 8, 1)
 fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy >= params.size) {
@@ -691,14 +609,6 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let i = id.y * params.size.x + id.x;
 
-    // Bilinear over the 4 nearest cascade-0 probes. At s0 = 1 the pixel
-    // center is exactly on its own probe, so this is just that probe.
-    // Probes centered inside a shape report that shape's emission, not the
-    // light field around it; blending them in paints a halo around every
-    // shape edge, so they're dropped and the remaining weights renormalized.
-    // (A pixel inside a shape keeps them all: it wants the emission.)
-    // Only pixels inside the circle of live probes are resolved and
-    // measured; outside, the reference is shown dimmed for context.
     let pixel_center = vec2<f32>(id.xy) + 0.5;
     let circle_distance = distance(pixel_center, params.circle_center);
     let in_circle = circle_distance <= params.c0_radius;
@@ -725,11 +635,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
             weight += probes.weights[k];
         }
     }
-    // All 4 inside shapes (a gap thinner than the probe spacing): nothing
-    // better to go on than the plain blend.
     rc = select(select(vec3(0.0), rc_all / weight_all, weight_all > 0.0), rc / weight, weight > 0.0);
-    // Wall pixels show their nearest face's lit color from this pass's
-    // cascade 0, looked up from that face's side only, like the bounces.
     if on_wall {
         let face = nearest_face(pixel_center, here.dist);
         rc = here.albedo * bounce_radiance(face.pos, true);
@@ -743,8 +649,6 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     let ref_value = acc.rgb / max(acc.a, 1.0);
     let e = rc - ref_value;
 
-    // The main metric covers empty space only; inside lights both sides just
-    // report the emission. Wall faces are flagged for their own metric.
     error[2u * i] = vec4(
         dot(e, e),
         dot(ref_value, ref_value),

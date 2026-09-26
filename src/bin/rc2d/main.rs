@@ -144,8 +144,8 @@
 
 use bevy::{
     asset::RenderAssetUsages,
-    diagnostic::{DiagnosticPath, DiagnosticsStore},
     core_pipeline::{Core2d, Core2dSystems, tonemapping::Tonemapping},
+    diagnostic::{DiagnosticPath, DiagnosticsStore},
     image::ImageSampler,
     prelude::*,
     render::{
@@ -155,7 +155,10 @@ use bevy::{
         gpu_readback::{Readback, ReadbackComplete},
         render_asset::RenderAssets,
         render_resource::{
-            binding_types::{storage_buffer_read_only_sized, storage_buffer_sized, texture_storage_2d, uniform_buffer},
+            binding_types::{
+                storage_buffer_read_only_sized, storage_buffer_sized, texture_storage_2d,
+                uniform_buffer,
+            },
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -218,7 +221,7 @@ struct Rc2dPlugin;
 #[derive(Resource, Clone, Copy, ExtractResource)]
 struct Rc2dSettings {
     view_mode: u32,
-    bilinear_fix: bool,
+    bilinear_fix: u32,
     base_interval: f32,
     ref_frame: u32,
     /// Makes the next extracted frame overwrite the reference instead of
@@ -253,7 +256,7 @@ impl Default for Rc2dSettings {
     fn default() -> Self {
         Self {
             view_mode: 0,
-            bilinear_fix: true,
+            bilinear_fix: 2,
             // With s0 = 2 px: cascade 0 covers [0, 4px]. Measured best at
             // this spacing; see the module docs.
             base_interval: 1.0,
@@ -279,7 +282,7 @@ impl Default for Rc2dSettings {
 
 /// Everything the cached hits depend on: geometry (scene and the light,
 /// which also occludes) and which segments each ray marches.
-type HitCacheKey = (u32, bool, u32, u32, [u32; 2], u32, u32);
+type HitCacheKey = (u32, u32, u32, u32, [u32; 2], u32, u32);
 /// Everything the displayed cascades depend on; restarts the jitter average.
 type CascadeKey = (HitCacheKey, bool, u32, [u32; 2]);
 
@@ -308,7 +311,11 @@ impl Rc2dSettings {
     }
 
     fn effective_bounces(&self) -> u32 {
-        if self.scene == room::SCENE_ID { self.bounces } else { 0 }
+        if self.scene == room::SCENE_ID {
+            self.bounces
+        } else {
+            0
+        }
     }
 
     /// Everything the cascades' output depends on; a change restarts the
@@ -318,7 +325,10 @@ impl Rc2dSettings {
             self.hit_cache_key(),
             self.jitter,
             self.effective_bounces(),
-            [self.circle_center.x.to_bits(), self.circle_center.y.to_bits()],
+            [
+                self.circle_center.x.to_bits(),
+                self.circle_center.y.to_bits(),
+            ],
         )
     }
 
@@ -380,7 +390,10 @@ const RESOLVE_SPAN: &str = "rc2d_resolve";
 impl Plugin for Rc2dPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Rc2dSettings>()
-            .insert_resource(ErrorLogTimer(Timer::from_seconds(2.0, TimerMode::Repeating)))
+            .insert_resource(ErrorLogTimer(Timer::from_seconds(
+                2.0,
+                TimerMode::Repeating,
+            )))
             .add_plugins((
                 RenderDiagnosticsPlugin,
                 ExtractResourcePlugin::<Rc2dSettings>::default(),
@@ -451,7 +464,10 @@ fn setup(
     });
 
     commands.insert_resource(ShaderLibraries(
-        SHADER_LIBRARIES.iter().map(|path| asset_server.load(*path)).collect(),
+        SHADER_LIBRARIES
+            .iter()
+            .map(|path| asset_server.load(*path))
+            .collect(),
     ));
 
     commands.spawn((Camera2d, Tonemapping::None));
@@ -498,8 +514,9 @@ fn input(
     }
     if step != Vec2::ZERO {
         let speed = 120.0;
-        settings.circle_center = (settings.circle_center + step.normalize() * speed * time.delta_secs())
-            .clamp(Vec2::ZERO, Vec2::splat(SIZE as f32));
+        settings.circle_center = (settings.circle_center
+            + step.normalize() * speed * time.delta_secs())
+        .clamp(Vec2::ZERO, Vec2::splat(SIZE as f32));
     }
     if keys.just_pressed(KeyCode::Minus) {
         settings.circle_radius = (settings.circle_radius - 16.0).max(32.0);
@@ -511,13 +528,17 @@ fn input(
         settings.cache_generation += 1;
     }
 
-    for (key, mode) in [(KeyCode::Digit1, 0), (KeyCode::Digit2, 1), (KeyCode::Digit3, 2)] {
+    for (key, mode) in [
+        (KeyCode::Digit1, 0),
+        (KeyCode::Digit2, 1),
+        (KeyCode::Digit3, 2),
+    ] {
         if keys.just_pressed(key) {
             settings.view_mode = mode;
         }
     }
     if keys.just_pressed(KeyCode::KeyB) {
-        settings.bilinear_fix = !settings.bilinear_fix;
+        settings.bilinear_fix = (settings.bilinear_fix + 1) % 3;
     }
     if keys.just_pressed(KeyCode::ArrowUp) {
         settings.base_interval = (settings.base_interval * 2.0).min(16.0);
@@ -532,7 +553,11 @@ fn input(
         settings.reference_paused = !settings.reference_paused;
         info!(
             "reference {}",
-            if settings.reference_paused { "paused" } else { "resumed" }
+            if settings.reference_paused {
+                "paused"
+            } else {
+                "resumed"
+            }
         );
     }
     if keys.just_pressed(KeyCode::KeyP) {
@@ -758,29 +783,34 @@ fn request_remarch_readback(
     if !timer.tick(time.delta()).just_finished() {
         return;
     }
-    commands.spawn(Readback::buffer(buffers.remarched.clone())).observe(
-        |event: On<ReadbackComplete>,
-         settings: Res<Rc2dSettings>,
-         mut commands: Commands,
-         mut handled: Local<bool>| {
-            if std::mem::replace(&mut *handled, true) {
-                return;
-            }
-            commands.entity(event.entity).try_despawn();
-            let layout = settings.cache_layout();
-            let counts: Vec<String> = event
-                .data
-                .chunks_exact(4)
-                .zip(&layout.cascades)
-                .enumerate()
-                .map(|(n, (word, window))| {
-                    let count = u32::from_le_bytes(word.try_into().unwrap());
-                    format!("c{n} {count}/{}", window.size * window.size)
-                })
-                .collect();
-            info!("re-marched probes this frame (of window slots): {}", counts.join(", "));
-        },
-    );
+    commands
+        .spawn(Readback::buffer(buffers.remarched.clone()))
+        .observe(
+            |event: On<ReadbackComplete>,
+             settings: Res<Rc2dSettings>,
+             mut commands: Commands,
+             mut handled: Local<bool>| {
+                if std::mem::replace(&mut *handled, true) {
+                    return;
+                }
+                commands.entity(event.entity).try_despawn();
+                let layout = settings.cache_layout();
+                let counts: Vec<String> = event
+                    .data
+                    .chunks_exact(4)
+                    .zip(&layout.cascades)
+                    .enumerate()
+                    .map(|(n, (word, window))| {
+                        let count = u32::from_le_bytes(word.try_into().unwrap());
+                        format!("c{n} {count}/{}", window.size * window.size)
+                    })
+                    .collect();
+                info!(
+                    "re-marched probes this frame (of window slots): {}",
+                    counts.join(", ")
+                );
+            },
+        );
 }
 
 // ---------------------------------------------------------------- render
@@ -845,7 +875,10 @@ fn init_pipelines(
                 storage_buffer_read_only_sized(false, cascade_size),
                 storage_buffer_sized(false, cascade_size),
                 storage_buffer_sized(false, pixel_size),
-                storage_buffer_sized(false, std::num::NonZero::new(PIXELS * ERROR_BYTES_PER_PIXEL)),
+                storage_buffer_sized(
+                    false,
+                    std::num::NonZero::new(PIXELS * ERROR_BYTES_PER_PIXEL),
+                ),
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
                 storage_buffer_sized(false, pixel_size),
                 storage_buffer_read_only_sized(false, cascade_size),
@@ -891,17 +924,35 @@ fn run_rc2d(
     mut cleared_generation: Local<Option<u32>>,
     mut ctx: RenderContext,
 ) {
-    let (Some(trace_pipeline), Some(commit_pipeline), Some(gather_pipeline), Some(reference_pipeline), Some(resolve_pipeline)) = (
+    let (
+        Some(trace_pipeline),
+        Some(commit_pipeline),
+        Some(gather_pipeline),
+        Some(reference_pipeline),
+        Some(resolve_pipeline),
+    ) = (
         pipeline_cache.get_compute_pipeline(pipelines.trace),
         pipeline_cache.get_compute_pipeline(pipelines.commit),
         pipeline_cache.get_compute_pipeline(pipelines.gather),
         pipeline_cache.get_compute_pipeline(pipelines.reference),
         pipeline_cache.get_compute_pipeline(pipelines.resolve),
-    ) else {
+    )
+    else {
         return;
     };
     let gpu = |handle: &Handle<ShaderBuffer>| gpu_buffers.get(handle).map(|b| b.buffer.clone());
-    let (Some(a), Some(b), Some(reference), Some(error), Some(rc_history), Some(bounce_src), Some(hits), Some(tags), Some(remarched), Some(display)) = (
+    let (
+        Some(a),
+        Some(b),
+        Some(reference),
+        Some(error),
+        Some(rc_history),
+        Some(bounce_src),
+        Some(hits),
+        Some(tags),
+        Some(remarched),
+        Some(display),
+    ) = (
         gpu(&buffers.cascade_a),
         gpu(&buffers.cascade_b),
         gpu(&buffers.reference),
@@ -912,7 +963,8 @@ fn run_rc2d(
         gpu(&buffers.tags),
         gpu(&buffers.remarched),
         gpu_images.get(&buffers.display),
-    ) else {
+    )
+    else {
         return;
     };
 
@@ -925,7 +977,7 @@ fn run_rc2d(
         cascade: 0,
         cascade_count,
         base_interval: settings.base_interval,
-        merge_mode: settings.bilinear_fix as u32,
+        merge_mode: settings.bilinear_fix,
         view_mode: settings.view_mode,
         ref_frame: settings.ref_frame,
         ref_rays: settings.ref_rays,
@@ -958,7 +1010,10 @@ fn run_rc2d(
     let passes = settings.effective_bounces() + 1;
     let cascade_params = |cascade: u32, bounce_iteration: u32| {
         let own = windows[cascade as usize];
-        let child = windows.get(cascade as usize + 1).copied().unwrap_or_default();
+        let child = windows
+            .get(cascade as usize + 1)
+            .copied()
+            .unwrap_or_default();
         Params {
             cascade,
             bounce_iteration,
@@ -1061,11 +1116,16 @@ fn run_rc2d(
         let last = iteration + 1 == passes;
         {
             let mut pass = ctx.command_encoder().begin_compute_pass(&pass_descriptor);
-            let whole = (!last).then(|| diagnostics.pass_span(&mut pass, bounce_pass_span(iteration)));
+            let whole =
+                (!last).then(|| diagnostics.pass_span(&mut pass, bounce_pass_span(iteration)));
             pass.set_pipeline(gather_pipeline);
             for cascade in (0..cascade_count).rev() {
                 let span = last.then(|| diagnostics.pass_span(&mut pass, cascade_span(cascade)));
-                let group = if cascade % 2 == 0 { &writes_a } else { &writes_b };
+                let group = if cascade % 2 == 0 {
+                    &writes_a
+                } else {
+                    &writes_b
+                };
                 pass.set_bind_group(0, group, &[offsets[iteration as usize][cascade as usize]]);
                 pass.dispatch_workgroups((slots(cascade) * rays(cascade)).div_ceil(64), 1, 1);
                 if let Some(span) = span {
