@@ -33,7 +33,7 @@ pub struct CascadeWindow {
     /// The cascade it merges with (its children); None for the top one.
     pub child: Option<u32>,
     /// Slots per axis (the window is size^3 probes, mapped toroidally).
-    pub size: u32,
+    pub size: bevy::math::UVec2,
     /// Probes within this distance of the camera are live.
     pub radius: f32,
     pub tag_base: u32,
@@ -68,7 +68,7 @@ impl CascadeWindow {
     /// Segments marched per stored ray: the 3D bilinear fix traces one per
     /// trilinear child; the top cascade has no children.
     pub fn segments(&self) -> u32 {
-        if self.child.is_some() { 8 } else { 1 }
+        if self.child.is_some() { 4 } else { 1 }
     }
 
     /// u32 words of cached hits per ray (two unorm16 fractions each).
@@ -77,7 +77,7 @@ impl CascadeWindow {
     }
 
     pub fn rays(&self) -> u64 {
-        (self.size as u64).pow(3) * self.rays_per_probe() as u64
+        (self.size.x as u64 * self.size.y as u64) * self.rays_per_probe() as u64
     }
 }
 
@@ -90,7 +90,7 @@ impl Layout {
         let mut allocate = |w: &mut CascadeWindow| {
             w.tag_base = tag_base as u32;
             w.hit_base = hit_base as u32;
-            tag_base += (w.size as u64).pow(3);
+            tag_base += (w.size.x as u64 * w.size.y as u64);
             hit_base += w.rays() * w.hit_words() as u64;
         };
 
@@ -108,7 +108,7 @@ impl Layout {
                 octa_side: octa_side(n),
                 interval: interval(n),
                 child: (n + 1 < CASCADES).then_some(n + 1),
-                size: window(radius, s),
+                size: bevy::math::UVec2::splat(window(radius, s)),
                 radius,
                 tag_base: 0,
                 hit_base: 0,
@@ -117,7 +117,11 @@ impl Layout {
             cascades.push(w);
         }
 
-        Self { cascades, tag_words: tag_base, hit_words: hit_base }
+        Self {
+            cascades,
+            tag_words: tag_base,
+            hit_words: hit_base,
+        }
     }
 }
 
@@ -195,7 +199,10 @@ mod tests {
     fn octahedral_cells_cover_the_sphere() {
         for side in [4, 8, 16] {
             let total: f32 = octa_solid_angles(side).iter().sum();
-            assert!((total - 4.0 * std::f32::consts::PI).abs() < 1e-3, "side {side}: {total}");
+            assert!(
+                (total - 4.0 * std::f32::consts::PI).abs() < 1e-3,
+                "side {side}: {total}"
+            );
         }
     }
 

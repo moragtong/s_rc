@@ -39,6 +39,7 @@ impl SceneBox {
 
 /// A sun: a distant disk light.
 #[derive(Clone, Copy, Debug)]
+#[derive(Resource)]
 pub struct Sun {
     /// Unit vector from the scene toward the sun.
     pub toward: Vec3,
