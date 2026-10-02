@@ -44,7 +44,7 @@ fn setup_view(
     heightmap_res: Res<Heightmap>,
 ) {
     // Spawning a highly subdivided plane so we can do vertex displacement!
-    let mut mesh = Plane3d::default().mesh().size(16.0, 16.0).subdivisions(256).build();
+    let mut mesh = Plane3d::default().mesh().size(40.0, 32.0).subdivisions(256).build();
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials.add(HeightmapMaterial {

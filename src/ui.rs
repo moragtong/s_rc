@@ -56,7 +56,7 @@ fn setup_ui(mut commands: Commands) {
                     ActionButton(Action::ToggleHeightmap),
                 ))
                 .with_child((
-                    Text::new("Toggle Heightmap (H)"),
+                    Text::new("Toggle Heightmap (M)"),
                     TextColor(Color::WHITE),
                 ));
             
@@ -88,7 +88,7 @@ fn button_system(
     mut heightmap_query: Query<&mut Visibility, With<crate::heightmap_view::HeightmapViewMesh>>,
     mut lighting_state: ResMut<LightingState>,
 ) {
-    let mut toggle_h = keys.just_pressed(KeyCode::KeyH);
+    let mut toggle_h = keys.just_pressed(KeyCode::KeyM);
     let mut toggle_i = keys.just_pressed(KeyCode::KeyI);
 
     for (interaction, mut color, action) in &mut interaction_query {
