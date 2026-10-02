@@ -18,6 +18,7 @@ use bevy::render::render_asset::RenderAssets;
 use crate::heightmap::Heightmap;
 
 const SHADER_PATH: &str = "shaders/cascades2_5d.wgsl";
+const GATHER_SHADER_PATH: &str = "shaders/gather_cascades.wgsl";
 const WORKGROUP_SIZE: u32 = 8; // 8x8 in compute shader
 
 pub struct Cascades2_5dPlugin;
@@ -38,10 +39,11 @@ impl Default for CascadesLayout {
 // Stores the pipeline and the global layout.
 #[derive(Resource)]
 struct CascadesPipeline {
-    layout: BindGroupLayoutDescriptor,
-    pipeline_id: CachedComputePipelineId,
+    raymarch_layout: BindGroupLayoutDescriptor,
+    raymarch_pipeline_id: CachedComputePipelineId,
+    gather_layout: BindGroupLayoutDescriptor,
+    gather_pipeline_id: CachedComputePipelineId,
 }
-
 
 #[derive(bevy::render::render_resource::ShaderType, Clone, Copy)]
 pub struct CascadesUniforms {
@@ -50,17 +52,17 @@ pub struct CascadesUniforms {
     hmap_res: UVec2,
     spacing: f32,
     octa_side: u32,
-    _pad1: u32,
-    _pad2: u32,
+    grid_size: UVec2,
 }
 
 #[derive(Resource)]
 struct CascadesRenderData {
-    probes_buffer: Buffer,
+    hit_buffer: Buffer,
+    sh_probes_buffer: Buffer,
     uniform_buffer: Buffer,
-    bind_group: BindGroup,
+    raymarch_bind_group: BindGroup,
+    gather_bind_group: BindGroup,
 }
-
 
 impl Plugin for Cascades2_5dPlugin {
     fn build(&self, app: &mut App) {
@@ -79,7 +81,7 @@ impl Plugin for Cascades2_5dPlugin {
             )
             .add_systems(
                 Core3d,
-                dispatch_cascade0.in_set(Core3dSystems::Prepass),
+                dispatch_raymarch.in_set(Core3dSystems::Prepass),
             );
     }
 }
@@ -89,8 +91,8 @@ fn setup_pipelines(
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let layout = BindGroupLayoutDescriptor::new(
-        "cascades2_5d_layout",
+    let raymarch_layout = BindGroupLayoutDescriptor::new(
+        "cascades_raymarch_layout",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
@@ -101,17 +103,47 @@ fn setup_pipelines(
         ),
     );
 
-    let shader = asset_server.load(SHADER_PATH);
-    let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("cascades2_5d_cascade0".into()),
-        layout: vec![layout.clone()],
-        shader,
+    let raymarch_shader = asset_server.load(SHADER_PATH);
+    let raymarch_pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("cascades2_5d_raymarch".into()),
+        layout: vec![raymarch_layout.clone()],
+        shader: raymarch_shader,
         shader_defs: vec![],
         entry_point: Some("cascade0".into()),
         ..default()
     });
 
-    commands.insert_resource(CascadesPipeline { layout, pipeline_id });
+    let gather_layout = BindGroupLayoutDescriptor::new(
+        "cascades_gather_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_2d(TextureSampleType::Float { filterable: false }), // heightmap
+                texture_2d(TextureSampleType::Float { filterable: false }), // metadata_min
+                texture_2d(TextureSampleType::Float { filterable: false }), // metadata_max
+                storage_buffer::<f32>(false), // hits
+                storage_buffer::<Vec4>(false), // sh_probes
+                uniform_buffer::<CascadesUniforms>(false),
+            ),
+        ),
+    );
+
+    let gather_shader = asset_server.load(GATHER_SHADER_PATH);
+    let gather_pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("cascades2_5d_gather".into()),
+        layout: vec![gather_layout.clone()],
+        shader: gather_shader,
+        shader_defs: vec![],
+        entry_point: Some("gather".into()),
+        ..default()
+    });
+
+    commands.insert_resource(CascadesPipeline { 
+        raymarch_layout, 
+        raymarch_pipeline_id,
+        gather_layout,
+        gather_pipeline_id,
+    });
 }
 
 fn prepare_buffers(
@@ -121,17 +153,32 @@ fn prepare_buffers(
     pipeline: Res<CascadesPipeline>,
     layout: Res<CascadesLayout>,
     heightmap: Option<Res<Heightmap>>,
-    mut existing_data: Option<ResMut<CascadesRenderData>>,
+    existing_data: Option<Res<CascadesRenderData>>,
     gpu_images: Res<RenderAssets<GpuImage>>,
 ) {
     let Some(heightmap) = heightmap else { return; };
     let Some(image) = gpu_images.get(&heightmap.texture) else { return; };
+    let Some(meta_min_img) = gpu_images.get(&heightmap.metadata_min) else { return; };
+    let Some(meta_max_img) = gpu_images.get(&heightmap.metadata_max) else { return; };
+
+    let c0 = &layout.layout.cascades[0];
+    let grid_size = c0.size;
 
     if existing_data.is_none() {
-        let buffer_size = (layout.layout.hit_words * 4) as u64;
-        let probes_buffer = render_device.create_buffer(&BufferDescriptor {
+        let hit_buffer_size = (layout.layout.hit_words * 4) as u64;
+        let num_nodes = (c0.size.x * c0.size.y) as u64;
+        let sh_buffer_size = num_nodes * 9 * 16; // 9 vec4s
+
+        let hit_buffer = render_device.create_buffer(&BufferDescriptor {
             label: Some("cascades_probes_buffer"),
-            size: buffer_size,
+            size: hit_buffer_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let sh_probes_buffer = render_device.create_buffer(&BufferDescriptor {
+            label: Some("cascades_sh_probes_buffer"),
+            size: sh_buffer_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -142,8 +189,7 @@ fn prepare_buffers(
             hmap_res: heightmap.resolution,
             spacing: layout.layout.cascades[0].spacing,
             octa_side: layout.layout.cascades[0].octa_side,
-            _pad1: 0,
-            _pad2: 0,
+            grid_size,
         };
 
         let mut uniform_buffer = bevy::render::render_resource::encase::UniformBuffer::new(Vec::new());
@@ -155,26 +201,42 @@ fn prepare_buffers(
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
 
-        let bind_group_layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
-        let bind_group = render_device.create_bind_group(
-            "cascades_bind_group",
-            &bind_group_layout,
+        let rm_layout = pipeline_cache.get_bind_group_layout(&pipeline.raymarch_layout);
+        let raymarch_bind_group = render_device.create_bind_group(
+            "cascades_raymarch_bind_group",
+            &rm_layout,
             &BindGroupEntries::sequential((
                 &image.texture_view,
-                probes_buffer.as_entire_binding(),
+                hit_buffer.as_entire_binding(),
+                u_buffer.as_entire_binding(),
+            )),
+        );
+
+        let gth_layout = pipeline_cache.get_bind_group_layout(&pipeline.gather_layout);
+        let gather_bind_group = render_device.create_bind_group(
+            "cascades_gather_bind_group",
+            &gth_layout,
+            &BindGroupEntries::sequential((
+                &image.texture_view, // heightmap needed for origin reconstruction
+                &meta_min_img.texture_view,
+                &meta_max_img.texture_view,
+                hit_buffer.as_entire_binding(),
+                sh_probes_buffer.as_entire_binding(),
                 u_buffer.as_entire_binding(),
             )),
         );
 
         commands.insert_resource(CascadesRenderData {
-            probes_buffer,
+            hit_buffer,
+            sh_probes_buffer,
             uniform_buffer: u_buffer,
-            bind_group,
+            raymarch_bind_group,
+            gather_bind_group,
         });
     }
 }
 
-fn dispatch_cascade0(
+fn dispatch_raymarch(
     pipeline_cache: Res<PipelineCache>,
     pipeline: Res<CascadesPipeline>,
     render_data: Option<Res<CascadesRenderData>>,
@@ -182,7 +244,10 @@ fn dispatch_cascade0(
     mut ctx: RenderContext,
 ) {
     let Some(render_data) = render_data else { return; };
-    let Some(compute_pipeline) = pipeline_cache.get_compute_pipeline(pipeline.pipeline_id) else {
+    let Some(raymarch_pipeline) = pipeline_cache.get_compute_pipeline(pipeline.raymarch_pipeline_id) else {
+        return;
+    };
+    let Some(gather_pipeline) = pipeline_cache.get_compute_pipeline(pipeline.gather_pipeline_id) else {
         return;
     };
 
@@ -192,42 +257,23 @@ fn dispatch_cascade0(
     let mut pass = ctx
         .command_encoder()
         .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("cascades2_5d_cascade0"),
+            label: Some("cascades2_5d_compute"),
             timestamp_writes: None,
         });
 
-    pass.set_pipeline(compute_pipeline);
-    pass.set_bind_group(0, &render_data.bind_group, &[]);
-    
+    pass.set_pipeline(raymarch_pipeline);
+    pass.set_bind_group(0, &render_data.raymarch_bind_group, &[]);
     pass.dispatch_workgroups(
         grid_size.x.div_ceil(WORKGROUP_SIZE),
         grid_size.y.div_ceil(WORKGROUP_SIZE),
         1,
     );
-}
-
-pub fn setup_shading(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    pipeline_cache: Res<PipelineCache>,
-) {
-    let shading_layout = BindGroupLayoutDescriptor::new(
-        "cascades_shading_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                texture_2d(TextureSampleType::Float { filterable: false }),
-                storage_buffer::<f32>(false),
-            ),
-        ),
+    
+    pass.set_pipeline(gather_pipeline);
+    pass.set_bind_group(0, &render_data.gather_bind_group, &[]);
+    pass.dispatch_workgroups(
+        grid_size.x.div_ceil(WORKGROUP_SIZE),
+        grid_size.y.div_ceil(WORKGROUP_SIZE),
+        1,
     );
-    let shader = asset_server.load("shaders/shade_cascades.wgsl");
-    let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some("cascades2_5d_shading".into()),
-        layout: vec![shading_layout.clone()],
-        shader,
-        shader_defs: vec![],
-        entry_point: Some("shade".into()),
-        ..default()
-    });
 }
