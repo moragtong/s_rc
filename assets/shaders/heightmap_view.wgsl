@@ -24,7 +24,7 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     
     var local_pos = vertex.position;
     // displace up by max_h
-    local_pos.y += max_h;
+    local_pos.y += ht.x;
     
     out.uv = uv;
     out.position = mesh_position_local_to_clip(get_world_from_local(vertex.instance_index), vec4<f32>(local_pos, 1.0));

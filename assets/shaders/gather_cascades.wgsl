@@ -52,15 +52,15 @@ fn sample_radiance(hit_pos: vec3<f32>, ray_dy: f32) -> vec3<f32> {
     let tex_x = u32(clamp(uv_x * f32(uniforms.hmap_res.x), 0.0, f32(uniforms.hmap_res.x - 1u)));
     let tex_y = u32(clamp(uv_y * f32(uniforms.hmap_res.y), 0.0, f32(uniforms.hmap_res.y - 1u)));
     
-    var meta = vec4<f32>(0.0);
+    var metadata = vec4<f32>(0.0);
     if ray_dy > 0.0 {
-        meta = textureLoad(metadata_min, vec2<u32>(tex_x, tex_y), 0);
+        metadata = textureLoad(metadata_min, vec2<u32>(tex_x, tex_y), 0);
     } else {
-        meta = textureLoad(metadata_max, vec2<u32>(tex_x, tex_y), 0);
+        metadata = textureLoad(metadata_max, vec2<u32>(tex_x, tex_y), 0);
     }
     
-    let normal = normalize(meta.xyz);
-    let albedo = meta.w; // simplified to scalar luminance/base shade
+    let normal = normalize(metadata.xyz);
+    let albedo = metadata.w; // simplified to scalar luminance/base shade
     
     // Simple mock lighting (sun light from (-1, 0.75, -0.35))
     let sun_dir = normalize(vec3<f32>(-1.0, 0.75, -0.35));
