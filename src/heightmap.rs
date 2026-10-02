@@ -37,34 +37,9 @@ fn setup_heightmap(
     
     // Create the image
     let mut data = vec![0.0f32; (resolution.x * resolution.y * 2) as usize];
-    let scene = Scene3d::room(0.2);
-    
-    for y in 0..resolution.y {
-        for x in 0..resolution.x {
-            let px = min_bounds.x + (x as f32 + 0.5) / resolution.x as f32 * (max_bounds.x - min_bounds.x);
-            let pz = min_bounds.y + (y as f32 + 0.5) / resolution.y as f32 * (max_bounds.y - min_bounds.y);
-            
-            let mut min_h = f32::INFINITY;
-            let mut max_h = f32::NEG_INFINITY;
-            
-            for b in &scene.boxes {
-                if (px - b.center.x).abs() <= b.half_size.x && (pz - b.center.z).abs() <= b.half_size.z {
-                    let top = b.center.y + b.half_size.y;
-                    let bottom = b.center.y - b.half_size.y;
-                    if bottom < min_h { min_h = bottom; }
-                    if top > max_h { max_h = top; }
-                }
-            }
-            
-            if min_h == f32::INFINITY {
-                min_h = 0.0;
-                max_h = 0.0; // fallback if outside
-            }
-            
-            let idx = ((y * resolution.x + x) * 2) as usize;
-            data[idx] = min_h;
-            data[idx + 1] = max_h;
-        }
+    for i in 0..(resolution.x * resolution.y) as usize {
+        data[i * 2] = -100.0;
+        data[i * 2 + 1] = -100.0;
     }
     
     let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_ne_bytes()).collect();
@@ -105,12 +80,13 @@ pub fn bake_dynamic_mesh(
     meshes: Res<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     heightmap_res: Res<Heightmap>,
-    mut done: Local<bool>,
+    mut frames: Local<u32>,
 ) {
-    if *done { return; }
+    if *frames > 150 { return; }
+    *frames += 1;
+    if *frames != 150 { return; }
     
-    // waiting for meshes to load...
-    if q_meshes.iter().count() > 10 {
+    if q_meshes.iter().count() > 0 {
         let mut min_h = vec![1000.0f32; (512 * 512) as usize];
         let mut max_h = vec![-1000.0f32; (512 * 512) as usize];
         
@@ -136,23 +112,21 @@ pub fn bake_dynamic_mesh(
                     }
                 }
             } else {
-                return; // wait for all
+                *frames -= 1; // Try again next frame if not all meshes are loaded
+                return; 
             }
         }
-        
-        // Write to image
         if let Some(mut img) = images.get_mut(&heightmap_res.texture) {
             let mut data = Vec::with_capacity(512 * 512 * 8);
             for i in 0..(512*512) {
-                let mn = if min_h[i] == 1000.0 { -2.0 } else { min_h[i] };
-                let mx = if max_h[i] == -1000.0 { -2.0 } else { max_h[i] };
+                let mn = if min_h[i] == 1000.0 { -10.0 } else { min_h[i] };
+                let mx = if max_h[i] == -1000.0 { -10.0 } else { max_h[i] };
                 data.extend_from_slice(&mn.to_ne_bytes());
                 data.extend_from_slice(&mx.to_ne_bytes());
             }
             img.data = Some(data);
         }
         
-        *done = true;
-        println!("BAKED TOKYO GLTF INTO HEIGHTMAP!");
+        println!("BAKED SCENE GLTF INTO HEIGHTMAP! Meshes count: {}", q_meshes.iter().count());
     }
 }

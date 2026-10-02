@@ -42,7 +42,7 @@ fn setup_scene(
 ) {
     use bevy::world_serialization::WorldAssetRoot;
     commands.spawn((
-        WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/Fox.glb"))),
+        WorldAssetRoot(asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/Sponza/glTF/Sponza.gltf"))),
         Transform::from_xyz(0.0, 0.0, 0.0),
     ));
     
