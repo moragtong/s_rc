@@ -1,7 +1,7 @@
 @group(0) @binding(0) var heightmap: texture_2d<f32>;
-@group(0) @binding(1) var metadata_min: texture_2d<vec4<f32>>;
-@group(0) @binding(2) var metadata_max: texture_2d<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> hits: array<f32>;
+@group(0) @binding(1) var metadata_min: texture_2d<f32>;
+@group(0) @binding(2) var metadata_max: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read_write> hits: array<f32>;
 @group(0) @binding(4) var<storage, read_write> sh_probes: array<vec4<f32>>;
 
 struct Uniforms {

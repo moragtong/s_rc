@@ -56,12 +56,12 @@ pub struct CascadesUniforms {
 }
 
 #[derive(Resource)]
-struct CascadesRenderData {
-    hit_buffer: Buffer,
-    sh_probes_buffer: Buffer,
-    uniform_buffer: Buffer,
-    raymarch_bind_group: BindGroup,
-    gather_bind_group: BindGroup,
+pub struct CascadesRenderData {
+    pub hit_buffer: Buffer,
+    pub sh_probes_buffer: Buffer,
+    pub uniform_buffer: Buffer,
+    pub raymarch_bind_group: BindGroup,
+    pub gather_bind_group: BindGroup,
 }
 
 impl Plugin for Cascades2_5dPlugin {

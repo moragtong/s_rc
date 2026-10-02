@@ -6,8 +6,9 @@ mod heightmap;
 mod heightmap_view;
 mod scene3d;
 mod ui;
+mod shade;
 
-use bevy::core_pipeline::prepass::{DeferredPrepass, DepthPrepass};
+use bevy::core_pipeline::prepass::{DeferredPrepass, DepthPrepass, NormalPrepass};
 use bevy::pbr::DefaultOpaqueRendererMethod;
 use bevy::prelude::*;
 use bevy::render::renderer::RenderAdapterInfo;
@@ -32,6 +33,7 @@ fn main() {
             HeightmapViewPlugin,
             ui::UiPlugin,
             Cascades2_5dPlugin,
+            shade::ShadePlugin,
             bevy::render::diagnostic::RenderDiagnosticsPlugin,
         ))
         .add_systems(Startup, (setup_scene, log_adapter_info))
@@ -60,6 +62,7 @@ fn setup_scene(
         Camera3d::default(),
         Msaa::Off,
         DepthPrepass,
+        NormalPrepass,
         DeferredPrepass,
         HiZ,
         FreeCamera::default(),

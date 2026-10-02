@@ -2,7 +2,7 @@ use bevy::prelude::*;
 
 pub struct UiPlugin;
 
-#[derive(Resource)]
+#[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
 pub struct LightingState {
     pub indirect_enabled: bool,
 }
@@ -25,6 +25,7 @@ pub enum Action {
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LightingState>()
+            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<LightingState>::default())
             .add_systems(Startup, setup_ui)
             .add_systems(Update, button_system);
     }
