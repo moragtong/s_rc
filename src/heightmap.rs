@@ -1,4 +1,3 @@
-
 use bevy::{
     prelude::*,
     asset::RenderAssetUsages,
@@ -8,7 +7,6 @@ use bevy::{
         RenderApp,
     },
 };
-use crate::scene3d::Scene3d;
 
 #[derive(Resource, Clone, ExtractResource, Default)]
 pub struct Heightmap {
@@ -51,7 +49,7 @@ fn setup_heightmap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let min_bounds = Vec2::new(-20.0, -16.0);
     let max_bounds = Vec2::new(20.0, 16.0);
     
-    let texture = images.add(create_empty_image(resolution, TextureFormat::Rg32Float, 2, -100.0));
+    let texture = images.add(create_empty_image(resolution, TextureFormat::Rg32Float, 2, 0.0));
     let metadata_min = images.add(create_empty_image(resolution, TextureFormat::Rgba32Float, 4, 0.0));
     let metadata_max = images.add(create_empty_image(resolution, TextureFormat::Rgba32Float, 4, 0.0));
     
@@ -62,7 +60,7 @@ fn setup_heightmap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 }
 
 pub fn bake_dynamic_mesh(
-    mut q_meshes: Query<(&bevy::prelude::Mesh3d, &GlobalTransform, Option<&MeshMaterial3d<StandardMaterial>>)>,
+    q_meshes: Query<(&bevy::prelude::Mesh3d, &GlobalTransform, Option<&MeshMaterial3d<StandardMaterial>>)>,
     meshes: Res<Assets<Mesh>>,
     materials: Res<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -101,8 +99,9 @@ pub fn bake_dynamic_mesh(
                     for i in 0..positions.len() {
                         let pos = positions[i];
                         let norm = normals[i];
-                        let world_pos = gtrans.to_matrix() * Vec4::new(pos[0], pos[1], pos[2], 1.0);
-                        let inv_trans = gtrans.compute_transform().to_matrix().inverse().transpose(); let world_norm = (inv_trans * Vec4::new(norm[0], norm[1], norm[2], 0.0)).truncate();
+                        let world_pos = gtrans.compute_transform().to_matrix() * Vec4::new(pos[0], pos[1], pos[2], 1.0);
+                        let inv_trans = gtrans.compute_transform().to_matrix().inverse().transpose(); 
+                        let world_norm = (inv_trans * Vec4::new(norm[0], norm[1], norm[2], 0.0)).truncate();
                         let world_norm = world_norm.normalize_or_zero();
                         
                         let u = (world_pos.x - bounds_min.x) / (bounds_max.x - bounds_min.x);
@@ -130,8 +129,8 @@ pub fn bake_dynamic_mesh(
         if let Some(mut img) = images.get_mut(&heightmap_res.texture) {
             let mut data = Vec::with_capacity(512 * 512 * 8);
             for i in 0..(512*512) {
-                let mn = if min_h[i] == 1000.0 { -10.0 } else { min_h[i] };
-                let mx = if max_h[i] == -1000.0 { -10.0 } else { max_h[i] };
+                let mn = if min_h[i] == 1000.0 { 0.0 } else { min_h[i] };
+                let mx = if max_h[i] == -1000.0 { 0.0 } else { max_h[i] };
                 data.extend_from_slice(&mn.to_ne_bytes());
                 data.extend_from_slice(&mx.to_ne_bytes());
             }
@@ -141,7 +140,9 @@ pub fn bake_dynamic_mesh(
         if let Some(mut img) = images.get_mut(&heightmap_res.metadata_min) {
             let mut data = Vec::with_capacity(512 * 512 * 16);
             for i in 0..(512*512) {
-                let a = meta_min[i].to_array(); let mut bytes = [0u8; 16]; for j in 0..4 { bytes[j*4..j*4+4].copy_from_slice(&a[j].to_ne_bytes()); }
+                let a = meta_min[i].to_array(); 
+                let mut bytes = [0u8; 16]; 
+                for j in 0..4 { bytes[j*4..j*4+4].copy_from_slice(&a[j].to_ne_bytes()); }
                 data.extend_from_slice(&bytes);
             }
             img.data = Some(data);
@@ -150,7 +151,9 @@ pub fn bake_dynamic_mesh(
         if let Some(mut img) = images.get_mut(&heightmap_res.metadata_max) {
             let mut data = Vec::with_capacity(512 * 512 * 16);
             for i in 0..(512*512) {
-                let a = meta_max[i].to_array(); let mut bytes = [0u8; 16]; for j in 0..4 { bytes[j*4..j*4+4].copy_from_slice(&a[j].to_ne_bytes()); }
+                let a = meta_max[i].to_array(); 
+                let mut bytes = [0u8; 16]; 
+                for j in 0..4 { bytes[j*4..j*4+4].copy_from_slice(&a[j].to_ne_bytes()); }
                 data.extend_from_slice(&bytes);
             }
             img.data = Some(data);
