@@ -1,3 +1,6 @@
+#[derive(Component)]
+pub struct HeightmapViewMesh;
+
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::*;
@@ -48,5 +51,6 @@ fn setup_view(
             heightmap: heightmap_res.texture.clone(),
         })),
         Transform::from_xyz(0.0, 0.0, 0.0),
+        HeightmapViewMesh,
     ));
 }

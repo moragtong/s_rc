@@ -5,6 +5,7 @@ mod cascades2_5d;
 mod heightmap;
 mod heightmap_view;
 mod scene3d;
+mod ui;
 
 use bevy::core_pipeline::prepass::{DeferredPrepass, DepthPrepass};
 use bevy::pbr::DefaultOpaqueRendererMethod;
@@ -29,6 +30,7 @@ fn main() {
             FreeCameraPlugin,
             HeightmapPlugin,
             HeightmapViewPlugin,
+            ui::UiPlugin,
             Cascades2_5dPlugin,
             bevy::render::diagnostic::RenderDiagnosticsPlugin,
         ))
