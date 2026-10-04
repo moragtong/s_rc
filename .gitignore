@@ -1,3 +1,43 @@
 /target
 tools/.venv/
 __pycache__/
+
+# Build and run logs, written next to Cargo.toml.
+/*.log
+
+# Scratch from wiring this up: one-shot patch/fix/rewrite scripts, compile
+# probes and screenshots. Nothing here is part of the app. Kept on disk, out
+# of the history.
+/backups/
+/fix*.py
+/fix*.sh
+/patch*.py
+/patch*.sh
+/patch*.rs
+/patch*.wgsl
+/patch_mod
+/patch_hmap_bake
+/rewrite_*.py
+/revert.py
+/implement_merge.py
+/trace*.py
+/tweak_bounds.py
+/get_ops.py
+/get_sh.py
+/test*.py
+/test*.rs
+/tmp_*.wgsl
+/cascades3d_mod.rs
+/new_bake.rs
+/convert_mod.py
+/update_*.py
+/run_gizmos.py
+/user_view.py
+/dda*.py
+/dda*.wgsl
+/run_result*.txt
+
+# Compile probes: an empty shader or a stub main() kept only to make the
+# typechecker complain about a Bevy API.
+/assets/shaders/test_*.wgsl
+/src/bin/test_prepass.rs
