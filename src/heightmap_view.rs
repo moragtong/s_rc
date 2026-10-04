@@ -21,6 +21,8 @@ struct HeightmapMaterial {
     #[texture(0)]
     #[sampler(1)]
     heightmap: Handle<Image>,
+    #[uniform(2)]
+    channel: f32,
 }
 
 impl Material for HeightmapMaterial {
@@ -44,11 +46,21 @@ fn setup_view(
     heightmap_res: Res<Heightmap>,
 ) {
     // Spawning a highly subdivided plane so we can do vertex displacement!
-    let mut mesh = Plane3d::default().mesh().size(40.0, 32.0).subdivisions(256).build();
+    let mesh = Plane3d::default().mesh().size(40.0, 32.0).subdivisions(256).build();
     commands.spawn((
-        Mesh3d(meshes.add(mesh)),
+        Mesh3d(meshes.add(mesh.clone())),
         MeshMaterial3d(materials.add(HeightmapMaterial {
             heightmap: heightmap_res.texture.clone(),
+            channel: 1.0,
+        })),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        HeightmapViewMesh,
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(mesh.clone())),
+        MeshMaterial3d(materials.add(HeightmapMaterial {
+            heightmap: heightmap_res.texture.clone(),
+            channel: 0.0,
         })),
         Transform::from_xyz(0.0, 0.0, 0.0),
         HeightmapViewMesh,

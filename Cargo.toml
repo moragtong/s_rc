@@ -13,7 +13,7 @@ parry3d = "0.31"
 # Enable a small amount of optimization in the dev profile. Line tables
 # only: full debug info made each binary ~1.8 GB and filled the disk.
 [profile.dev]
-opt-level = 1
+opt-level = 0
 debug = "line-tables-only"
 
 # Enable a large amount of optimization in the dev profile for dependencies.

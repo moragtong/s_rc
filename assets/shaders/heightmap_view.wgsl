@@ -5,6 +5,7 @@
 
 @group(3) @binding(0) var heightmap_tex: texture_2d<f32>;
 @group(3) @binding(1) var heightmap_samp: sampler;
+@group(3) @binding(2) var<uniform> channel: f32;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -20,11 +21,14 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     
     // fetch height
     let ht = textureSampleLevel(heightmap_tex, heightmap_samp, uv, 0.0);
-    let max_h = ht.y;
     
     var local_pos = vertex.position;
-    // displace up by max_h
-    local_pos.y += ht.x;
+    if channel > 0.5 {
+        local_pos.y += ht.y;
+    } else {
+        // Open-sky columns have their ceiling far up; draw it at 15 m.
+        local_pos.y += min(ht.x, 15.0);
+    }
     
     out.uv = uv;
     out.position = mesh_position_local_to_clip(get_world_from_local(vertex.instance_index), vec4<f32>(local_pos, 1.0));
@@ -35,7 +39,11 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let uv = mesh.uv;
     let ht = textureSample(heightmap_tex, heightmap_samp, uv);
-    let r = max(0.0, ht.x / 4.0);
-    let g = max(0.0, ht.y / 4.0);
-    return vec4<f32>(r, g, 0.0, 0.5); // semi transparent
+    if channel > 0.5 {
+        let g = max(0.0, ht.y / 4.0);
+        return vec4<f32>(0.0, g + 0.2, 0.0, 0.5); // green for ground
+    } else {
+        let r = max(0.0, ht.x / 4.0);
+        return vec4<f32>(r + 0.2, 0.0, 0.0, 0.5); // red for roof
+    }
 }

@@ -1,9 +1,12 @@
+//! Adds indirect diffuse from the cascades' SH probes onto the lit HDR
+//! image, before tonemapping. See shade_cascades.wgsl.
+
 use bevy::{
-    core_pipeline::{prepass::ViewPrepassTextures, Core3d, Core3dSystems, FullscreenShader},
+    core_pipeline::{prepass::ViewPrepassTextures, tonemapping::tonemapping, Core3d, Core3dSystems, FullscreenShader},
     prelude::*,
     render::{
         render_resource::{
-            binding_types::{storage_buffer, texture_2d, uniform_buffer},
+            binding_types::{storage_buffer_read_only, texture_2d, texture_depth_2d, uniform_buffer},
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
@@ -12,18 +15,19 @@ use bevy::{
     },
 };
 
-use crate::cascades2_5d::{CascadesLayout, CascadesRenderData, CascadesUniforms};
+use crate::cascades2_5d::{common_layout, CascadesRenderData};
 use crate::ui::LightingState;
 
 const SHADER_PATH: &str = "shaders/shade_cascades.wgsl";
 
 pub struct ShadePlugin;
 
-#[derive(Resource)]
 #[derive(ShaderType, Clone)]
 struct ShadeUniforms {
-    clip_from_view: Mat4,
+    view_from_clip: Mat4,
     world_from_view: Mat4,
+    probes_enabled: u32,
+    indirect_enabled: u32,
 }
 
 #[derive(Resource)]
@@ -39,13 +43,25 @@ impl SpecializedRenderPipeline for ShadePipeline {
     fn specialize(&self, format: TextureFormat) -> RenderPipelineDescriptor {
         RenderPipelineDescriptor {
             label: Some("shade_cascades".into()),
-            layout: vec![self.layout.clone()],
+            layout: vec![common_layout(), self.layout.clone()],
             vertex: self.fullscreen_shader.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
                 targets: vec![Some(ColorTargetState {
                     format,
-                    blend: Some(BlendState { color: BlendComponent { src_factor: BlendFactor::One, dst_factor: BlendFactor::One, operation: BlendOperation::Add }, alpha: BlendComponent::REPLACE }), // Additive blending for indirect light
+                    // Add the indirect light; leave alpha alone.
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent {
+                            src_factor: BlendFactor::Zero,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                    }),
                     write_mask: ColorWrites::ALL,
                 })],
                 ..default()
@@ -66,7 +82,7 @@ impl Plugin for ShadePlugin {
             .add_systems(RenderStartup, init_shade_pipeline)
             .add_systems(
                 Core3d,
-                draw_shade.in_set(Core3dSystems::PostProcess), // additive over tonemapped maybe, or just before tonemapping? Let's add it before tonemapping if possible. But for mockup, after might be fine. We'll set add blend.
+                draw_shade.in_set(Core3dSystems::PostProcess).before(tonemapping),
             );
     }
 }
@@ -82,10 +98,9 @@ fn init_shade_pipeline(
             &BindGroupLayoutEntries::sequential(
                 ShaderStages::FRAGMENT,
                 (
-                    texture_2d(TextureSampleType::Depth), // Depth
-                    texture_2d(TextureSampleType::Float { filterable: false }), // Normal
-                    storage_buffer::<Vec4>(false),        // sh_probes
-                    uniform_buffer::<CascadesUniforms>(false),
+                    texture_depth_2d(),
+                    texture_2d(TextureSampleType::Uint), // deferred G-buffer
+                    storage_buffer_read_only::<Vec4>(false), // sh_probes
                     uniform_buffer::<ShadeUniforms>(false),
                 ),
             ),
@@ -97,7 +112,7 @@ fn init_shade_pipeline(
 
 fn draw_shade(
     view: ViewQuery<(&ViewTarget, &ExtractedView, Option<&ViewPrepassTextures>)>,
-    lighting_state: Res<crate::ui::LightingState>,
+    lighting_state: Res<LightingState>,
     pipeline: Res<ShadePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<ShadePipeline>>,
     pipeline_cache: Res<PipelineCache>,
@@ -106,10 +121,9 @@ fn draw_shade(
     render_data: Option<Res<CascadesRenderData>>,
     mut ctx: RenderContext,
 ) {
-    if !lighting_state.indirect_enabled {
+    if !lighting_state.indirect_enabled && !lighting_state.probes_enabled {
         return;
     }
-
     let Some(render_data) = render_data else {
         return;
     };
@@ -117,25 +131,19 @@ fn draw_shade(
     let Some(prepass) = prepass else {
         return;
     };
+    let (Some(depth), Some(gbuffer)) = (&prepass.depth, &prepass.deferred) else {
+        return;
+    };
 
-    let Some(depth_tex) = &prepass.depth else {
-        return;
-    };
-    let Some(normal_tex) = &prepass.normal else {
-        return;
-    };
-    let mut uni = UniformBuffer::from(ShadeUniforms {
-        clip_from_view: extracted_view.clip_from_view,
-        world_from_view: extracted_view.world_from_view.compute_transform().to_matrix(),
+    let mut uniforms = UniformBuffer::from(ShadeUniforms {
+        view_from_clip: extracted_view.clip_from_view.inverse(),
+        world_from_view: extracted_view.world_from_view.to_matrix(),
+        probes_enabled: lighting_state.probes_enabled as u32,
+        indirect_enabled: lighting_state.indirect_enabled as u32,
     });
-    uni.write_buffer(&render_device, &render_queue);
+    uniforms.write_buffer(&render_device, &render_queue);
 
-
-    let pipeline_id = pipelines.specialize(
-        &pipeline_cache,
-        &pipeline,
-        view_target.main_texture_format(),
-    );
+    let pipeline_id = pipelines.specialize(&pipeline_cache, &pipeline, view_target.main_texture_format());
     let Some(render_pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
         return;
     };
@@ -144,25 +152,23 @@ fn draw_shade(
         "shade_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipeline.layout),
         &BindGroupEntries::sequential((
-            &depth_tex.texture.default_view,
-            &normal_tex.texture.default_view,
+            &depth.texture.default_view,
+            &gbuffer.texture.default_view,
             render_data.sh_probes_buffer.as_entire_binding(),
-            render_data.uniform_buffer.as_entire_binding(),
-            uni.binding().unwrap(),
+            uniforms.binding().unwrap(),
         )),
     );
 
-    let mut pass = ctx
-        .command_encoder()
-        .begin_render_pass(&RenderPassDescriptor {
-            label: Some("shade_pass"),
-            color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+    let mut pass = ctx.command_encoder().begin_render_pass(&RenderPassDescriptor {
+        label: Some("shade_pass"),
+        color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
     pass.set_pipeline(render_pipeline);
-    pass.set_bind_group(0, &bind_group, &[]);
+    pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+    pass.set_bind_group(1, &bind_group, &[]);
     pass.draw(0..3, 0..1);
 }

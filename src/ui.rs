@@ -5,11 +5,12 @@ pub struct UiPlugin;
 #[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
 pub struct LightingState {
     pub indirect_enabled: bool,
+    pub probes_enabled: bool,
 }
 
 impl Default for LightingState {
     fn default() -> Self {
-        Self { indirect_enabled: true }
+        Self { indirect_enabled: true, probes_enabled: false }
     }
 }
 
@@ -20,6 +21,7 @@ pub struct ActionButton(pub Action);
 pub enum Action {
     ToggleHeightmap,
     ToggleIndirect,
+    ToggleProbes,
 }
 
 impl Plugin for UiPlugin {
@@ -77,6 +79,22 @@ fn setup_ui(mut commands: Commands) {
                     Text::new("Toggle Indirect Lighting (I)"),
                     TextColor(Color::WHITE),
                 ));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                    ActionButton(Action::ToggleProbes),
+                ))
+                .with_child((
+                    Text::new("Toggle Probes (P)"),
+                    TextColor(Color::WHITE),
+                ));
         });
 }
 
@@ -91,6 +109,7 @@ fn button_system(
 ) {
     let mut toggle_h = keys.just_pressed(KeyCode::KeyM);
     let mut toggle_i = keys.just_pressed(KeyCode::KeyI);
+    let mut toggle_p = keys.just_pressed(KeyCode::KeyP);
 
     for (interaction, mut color, action) in &mut interaction_query {
         match *interaction {
@@ -99,6 +118,7 @@ fn button_system(
                 match action.0 {
                     Action::ToggleHeightmap => toggle_h = true,
                     Action::ToggleIndirect => toggle_i = true,
+                    Action::ToggleProbes => toggle_p = true,
                 }
             }
             Interaction::Hovered => {
@@ -122,5 +142,9 @@ fn button_system(
     if toggle_i {
         lighting_state.indirect_enabled = !lighting_state.indirect_enabled;
         bevy::log::info!("Indirect Lighting: {}", lighting_state.indirect_enabled);
+    }
+
+    if toggle_p {
+        lighting_state.probes_enabled = !lighting_state.probes_enabled;
     }
 }

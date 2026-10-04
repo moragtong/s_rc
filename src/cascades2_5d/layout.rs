@@ -1,5 +1,6 @@
-//! CPU side of the 3D cascades: per-cascade probe windows, buffer offsets,
-//! and octahedral direction tables. Must mirror cascades3d.wgsl.
+//! CPU side of the 2.5D cascades: per-cascade probe grids over the
+//! heightmap, buffer offsets, and octahedral direction tables. Must mirror
+//! heightmap_trace.wgsl.
 
 use bevy::math::{Vec2, Vec3, Vec4};
 
@@ -9,13 +10,13 @@ pub const CASCADES: u32 = 4;
 /// RMSE was 49.5% at 0.5 m and 4x4 directions, 52% with only the spacing
 /// halved, 54% with only 4x the directions, and 35% with both (median
 /// pixel error 68% -> 34%).
-pub const SPACING0: f32 = 0.25;
+pub const SPACING0: f32 = 1.0;
 /// Cascade-0 directions: an OCTA_SIDE0^2 octahedral map. The side doubles
 /// per cascade (4x directions).
-pub const OCTA_SIDE0: u32 = 8;
+pub const OCTA_SIDE0: u32 = 4;
 /// End of cascade 0's interval, m; cascade n covers
 /// [INTERVAL0 * 2^(n-1), INTERVAL0 * 2^n] (cascade 0 from 0).
-pub const INTERVAL0: f32 = 1.5;
+pub const INTERVAL0: f32 = 2.0;
 /// Cascade-0 probes exist within this distance of the camera: 10.5 m holds
 /// the room from inside it, and is what fits in memory at this density
 /// (1.9 GB of cached hits, 1.2 GB of radiance).
@@ -37,7 +38,14 @@ pub struct CascadeWindow {
     /// Probes within this distance of the camera are live.
     pub radius: f32,
     pub tag_base: u32,
+    /// First ray of this cascade in the ray radiance buffer.
     pub hit_base: u32,
+    /// First probe of this cascade in the SH probe buffer.
+    pub sh_base: u32,
+    /// Sub-samples per axis of each direction cell when projecting to SH.
+    pub sub: u32,
+    /// First entry of this cascade in `Layout::subsamples`.
+    pub sub_base: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -45,6 +53,8 @@ pub struct Layout {
     pub cascades: Vec<CascadeWindow>,
     pub tag_words: u64,
     pub hit_words: u64,
+    /// Every cascade's SH projection sub-samples (see `subsamples`).
+    pub subsamples: Vec<Vec4>,
 }
 
 pub fn spacing(n: u32) -> f32 {
@@ -87,11 +97,12 @@ impl Layout {
         // probe holds every probe within `radius`.
         let window = |radius: f32, s: f32| 2 * ((radius / s).ceil() as u32 + 2);
         let (mut tag_base, mut hit_base) = (0u64, 0u64);
-        let mut allocate = |w: &mut CascadeWindow| {
+                let mut allocate = |w: &mut CascadeWindow| {
             w.tag_base = tag_base as u32;
+            w.sh_base = tag_base as u32;
             w.hit_base = hit_base as u32;
-            tag_base += (w.size.x as u64 * w.size.y as u64);
-            hit_base += w.rays() * w.hit_words() as u64;
+            tag_base += w.size.x as u64 * w.size.y as u64;
+            hit_base += (w.rays_per_probe() as u64) * w.size.x as u64 * w.size.y as u64;
         };
 
         let mut cascades = Vec::new();
@@ -103,24 +114,38 @@ impl Layout {
                 // sqrt(3) child spacings of it.
                 radius += 1.75 * s;
             }
+            let sizes_x = (40.0 / s).ceil() as u32 + 1;
+            let sizes_y = (32.0 / s).ceil() as u32 + 1;
             let mut w = CascadeWindow {
                 spacing: s,
                 octa_side: octa_side(n),
                 interval: interval(n),
                 child: (n + 1 < CASCADES).then_some(n + 1),
-                size: bevy::math::UVec2::splat(window(radius, s)),
+                size: bevy::math::UVec2::new(sizes_x, sizes_y),
                 radius,
                 tag_base: 0,
                 hit_base: 0,
+                sh_base: 0,
+                // Cascade 0's 16 cells are too coarse to project at their
+                // centers; finer cascades are fine at one sample per cell.
+                sub: if n == 0 { SHADE_SUBSAMPLES } else { 1 },
+                sub_base: 0,
             };
             allocate(&mut w);
             cascades.push(w);
+        }
+
+        let mut subsamples = Vec::new();
+        for w in &mut cascades {
+            w.sub_base = subsamples.len() as u32;
+            subsamples.extend(self::subsamples(w.octa_side, w.sub));
         }
 
         Self {
             cascades,
             tag_words: tag_base,
             hit_words: hit_base,
+            subsamples,
         }
     }
 }
@@ -169,26 +194,32 @@ pub fn octa_solid_angles(side: u32) -> Vec<f32> {
     out
 }
 
-/// For shading from cascade 0: per direction cell, SHADE_SUBSAMPLES^2 sub-
-/// directions with their solid angles (xyz = direction, w = solid angle),
-/// cell-major, so irradiance can weight each cell by the cosine across it
+/// Per direction cell of a side x side octahedral map, sub^2 sub-directions
+/// with their solid angles (xyz = direction, w = solid angle), cell-major,
+/// so a cell's radiance projects onto SH over the cell's whole extent
 /// rather than at its center.
-pub fn shading_subsamples() -> Vec<Vec4> {
-    let side = OCTA_SIDE0 * SHADE_SUBSAMPLES;
-    let angles = octa_solid_angles(side);
+pub fn subsamples(side: u32, sub: u32) -> Vec<Vec4> {
+    let fine = side * sub;
+    let angles = octa_solid_angles(fine);
     let mut out = Vec::new();
-    for y in 0..OCTA_SIDE0 {
-        for x in 0..OCTA_SIDE0 {
-            for sy in 0..SHADE_SUBSAMPLES {
-                for sx in 0..SHADE_SUBSAMPLES {
-                    let (fx, fy) = (x * SHADE_SUBSAMPLES + sx, y * SHADE_SUBSAMPLES + sy);
-                    let uv = (Vec2::new(fx as f32, fy as f32) + 0.5) / side as f32;
-                    out.push(oct_decode(uv).extend(angles[(fy * side + fx) as usize]));
+    for y in 0..side {
+        for x in 0..side {
+            for sy in 0..sub {
+                for sx in 0..sub {
+                    let (fx, fy) = (x * sub + sx, y * sub + sy);
+                    let uv = (Vec2::new(fx as f32, fy as f32) + 0.5) / fine as f32;
+                    out.push(oct_decode(uv).extend(angles[(fy * fine + fx) as usize]));
                 }
             }
         }
     }
     out
+}
+
+/// Cascade 0's sub-samples.
+#[cfg(test)]
+pub fn shading_subsamples() -> Vec<Vec4> {
+    subsamples(OCTA_SIDE0, SHADE_SUBSAMPLES)
 }
 
 #[cfg(test)]
