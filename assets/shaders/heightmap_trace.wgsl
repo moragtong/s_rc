@@ -44,6 +44,12 @@ struct Uniforms {
 // and h.y (floor) with the floor normal, same as src/heightmap_bake.rs.
 @group(0) @binding(2) var ceiling_normal: texture_2d<f32>;
 @group(0) @binding(3) var floor_normal: texture_2d<f32>;
+// 1 where the column is inside solid material. The heightmap's floor and
+// ceiling cannot express that, so a hollow column is indistinguishable from a
+// tall room and probes form inside walls. This is the only channel that can say
+// so. Written by the bake's reduce pass; inert (all zero) until a stencil pass
+// fills it, which is why the rejection below is safe to land first.
+@group(0) @binding(4) var solid: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 // Stored instead of a distance for rays that hit nothing.
@@ -174,6 +180,31 @@ fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
 // footprint are renormalised against each other, that residual share was
 // enough to leak. The soft shoulder only exists to keep the transition from
 // aliasing as the pixel moves; it spans a small fraction of the tolerance.
+// Whether a texel is inside solid material.
+fn is_solid(texel: vec2<i32>) -> bool {
+    let dims = textureDimensions(solid);
+    if (texel.x < 0 || texel.y < 0 || texel.x >= i32(dims.x) || texel.y >= i32(dims.y)) {
+        return false;
+    }
+    return textureLoad(solid, texel, 0).x > 0.5;
+}
+
+// Whether any texel of the footprint `texel` belongs to is solid.
+//
+// All four, not just the one the probe is lifted from. A probe lifted from an
+// open texel next to a wall still bilinearly blends the wall's texels in, and
+// that blend is exactly what puts a probe inside masonry; rejecting only the
+// source texel would leave the fringe this is meant to remove. The cost is
+// thinner probes along every wall, which is the intended direction - a missing
+// probe along a wall reads as a slightly dark seam, a probe inside one reads as
+// a leak.
+fn stencil_touches_solid(texel: vec2<i32>) -> bool {
+    return is_solid(texel)
+        || is_solid(texel + vec2<i32>(1, 0))
+        || is_solid(texel + vec2<i32>(0, 1))
+        || is_solid(texel + vec2<i32>(1, 1));
+}
+
 fn height_agreement(dy: f32, spacing: f32) -> f32 {
     let s = max(spacing * HEIGHT_TOLERANCE_SPACING, 1e-4);
     let t = abs(dy) / s;

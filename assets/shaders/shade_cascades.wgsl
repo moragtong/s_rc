@@ -5,7 +5,7 @@
 // where the shading point's ray would meet that sphere.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, trace, MISS, PI, SH_STRIDE, height_agreement}
+#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, trace, MISS, PI, SH_STRIDE, height_agreement, stencil_touches_solid}
 
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var gbuffer: texture_2d<u32>;
@@ -217,7 +217,15 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // Height agreement folds the probe's own height into the bilinear
         // weight; w_sum below renormalises, so down-weighting a probe
         // redistributes its share instead of removing light.
-        let w = w_loc * height_agreement(slot.y - p.y, info.spacing);
+        var w = w_loc * height_agreement(slot.y - p.y, info.spacing);
+        // Drop the probe outright if its cell is inside solid material. The
+        // renormalisation below then hands its share to the probes that
+        // survive, so a wall column loses its contribution rather than
+        // subtracting energy - which is what put probes inside walls and let
+        // them collect a share from both storeys.
+        if stencil_touches_solid(cell + vec2<i32>(corner)) {
+            w = 0.0;
+        }
         if probe_visible(p, n, slot.xyz) {
             e += w * probe_irradiance(probe, p, n);
             w_sum += w;

@@ -128,6 +128,11 @@ pub fn common_layout() -> BindGroupLayoutDescriptor {
                 // alongside the heights they came from.
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 texture_2d(TextureSampleType::Float { filterable: false }),
+                // Which columns are inside solid material. Appended last so the
+                // four bindings above keep their numbers - this layout is shared
+                // with the shading pass, and reordering it would silently swap
+                // the normals.
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     )
@@ -299,6 +304,7 @@ fn prepare_buffers(
         Some(albedo_max),
         Some(radiance_min),
         Some(radiance_max),
+        Some(solid),
     ) = (
         image(&heightmap.texture),
         image(&heightmap.metadata_min),
@@ -307,6 +313,7 @@ fn prepare_buffers(
         image(&heightmap.albedo_max),
         image(&heightmap.radiance_min),
         image(&heightmap.radiance_max),
+        image(&heightmap.solid),
     )
     else {
         return;
@@ -399,6 +406,7 @@ fn prepare_buffers(
             uniform_buffer.as_entire_binding(),
             normal_min,
             normal_max,
+            solid,
         )),
     );
     let light_bind_group = bind_group(

@@ -27,6 +27,16 @@ pub struct Heightmap {
     /// on the GPU by the cascades' surface light pass.
     pub radiance_min: Handle<Image>,
     pub radiance_max: Handle<Image>,
+    /// 1 where the column is inside solid material at the split.
+    ///
+    /// The heightmap stores only a floor and a ceiling, so it cannot express
+    /// "this column is inside a wall". A column through a hollow wall reads
+    /// like an ordinary tall interval - the same floor, ceiling and normals as
+    /// a column under an atrium, because a vertical ray cannot tell them apart -
+    /// so probes get placed inside walls and nothing downstream rejects them.
+    /// This is the one channel that can, and the trace pass uses it to drop
+    /// probes whose bilinear stencil touches it.
+    pub solid: Handle<Image>,
     /// Highest ceiling or floor in the map; above it rays can't hit.
     pub top: f32,
 }
@@ -116,6 +126,10 @@ fn setup_heightmap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         max_bounds: MAX_BOUNDS,
         resolution: RESOLUTION,
         texture: images.add(create_empty_image(RESOLUTION, TextureFormat::Rg32Float, 2)),
+        // Cleared to 0 and written by the bake's reduce pass. Until a stencil
+        // pass fills it, every texel reads as air, so probe rejection keyed off
+        // it is inert and nothing else changes.
+        solid: images.add(create_empty_image(RESOLUTION, TextureFormat::R32Float, 1)),
         metadata_min,
         metadata_max,
         albedo_min,
