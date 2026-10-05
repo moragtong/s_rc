@@ -120,8 +120,14 @@ pub fn common_layout() -> BindGroupLayoutDescriptor {
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE | ShaderStages::FRAGMENT,
             (
-                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }), // heightmap
                 uniform_buffer::<CascadesUniforms>(false),
+                // Ceiling and floor surface normals. Probe relocation pushes a
+                // probe out of the surface it is buried behind, along that
+                // surface's normal, so the trace and gather passes need them
+                // alongside the heights they came from.
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     )
@@ -388,7 +394,12 @@ fn prepare_buffers(
     let common_bind_group = bind_group(
         "cascades_common",
         &common_layout(),
-        &BindGroupEntries::sequential((heights, uniform_buffer.as_entire_binding())),
+        &BindGroupEntries::sequential((
+            heights,
+            uniform_buffer.as_entire_binding(),
+            normal_min,
+            normal_max,
+        )),
     );
     let light_bind_group = bind_group(
         "cascades_light",

@@ -4,9 +4,7 @@
 //! See `assets/shaders/hi_z_debug.wgsl` for what the colors mean.
 
 use bevy::{
-    core_pipeline::{
-        Core3d, Core3dSystems, FullscreenShader, tonemapping::tonemapping,
-    },
+    core_pipeline::{Core3d, Core3dSystems, FullscreenShader, tonemapping::tonemapping},
     prelude::*,
     render::{
         RenderApp, RenderStartup,
@@ -165,8 +163,11 @@ fn draw_hi_z_debug(
     }
     let (view_target, hi_z, extracted_view) = view.into_inner();
 
-    let pipeline_id =
-        pipelines.specialize(&pipeline_cache, &pipeline, view_target.main_texture_format());
+    let pipeline_id = pipelines.specialize(
+        &pipeline_cache,
+        &pipeline,
+        view_target.main_texture_format(),
+    );
     let Some(render_pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
         return;
     };
@@ -185,14 +186,16 @@ fn draw_hi_z_debug(
         &BindGroupEntries::sequential((&hi_z.texture.default_view, uniform.binding().unwrap())),
     );
 
-    let mut pass = ctx.command_encoder().begin_render_pass(&RenderPassDescriptor {
-        label: Some("hi_z_debug"),
-        color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
+    let mut pass = ctx
+        .command_encoder()
+        .begin_render_pass(&RenderPassDescriptor {
+            label: Some("hi_z_debug"),
+            color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
     pass.set_pipeline(render_pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     pass.draw(0..3, 0..1);

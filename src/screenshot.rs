@@ -4,7 +4,7 @@
 //! `S_RC_PROBES=1` shows the probes.
 
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 
 /// Frames to wait for loading and the heightmap bake.
 const SHOT_FRAME: u32 = 200;
@@ -31,13 +31,19 @@ fn take_screenshot(
     if *frames == 2 {
         lighting.indirect_enabled = std::env::var("S_RC_INDIRECT").as_deref() != Ok("0");
         lighting.probes_enabled = std::env::var("S_RC_PROBES").as_deref() == Ok("1");
-        for mut visibility in &mut overlay {
-            *visibility = Visibility::Hidden;
+        // S_RC_OVERLAY=1 keeps the heightmap debug planes visible, which is
+        // how you check what the GPU bake actually produced.
+        if std::env::var("S_RC_OVERLAY").as_deref() != Ok("1") {
+            for mut visibility in &mut overlay {
+                *visibility = Visibility::Hidden;
+            }
         }
     }
     if *frames == SHOT_FRAME {
         let path = std::env::var("S_RC_SCREENSHOT").unwrap();
-        commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
     }
     if *frames == EXIT_FRAME {
         exit.write(AppExit::Success);

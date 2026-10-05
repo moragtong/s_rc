@@ -2,20 +2,25 @@
 //! image, before tonemapping. See shade_cascades.wgsl.
 
 use bevy::{
-    core_pipeline::{prepass::ViewPrepassTextures, tonemapping::tonemapping, Core3d, Core3dSystems, FullscreenShader},
+    core_pipeline::{
+        Core3d, Core3dSystems, FullscreenShader, prepass::ViewPrepassTextures,
+        tonemapping::tonemapping,
+    },
     prelude::*,
     render::{
+        RenderApp, RenderStartup,
         render_resource::{
-            binding_types::{storage_buffer_read_only, texture_2d, texture_depth_2d, uniform_buffer},
+            binding_types::{
+                storage_buffer_read_only, texture_2d, texture_depth_2d, uniform_buffer,
+            },
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
         view::{ExtractedView, ViewTarget},
-        RenderApp, RenderStartup,
     },
 };
 
-use crate::cascades2_5d::{common_layout, CascadesRenderData};
+use crate::cascades2_5d::{CascadesRenderData, common_layout};
 use crate::ui::LightingState;
 
 const SHADER_PATH: &str = "shaders/shade_cascades.wgsl";
@@ -82,7 +87,9 @@ impl Plugin for ShadePlugin {
             .add_systems(RenderStartup, init_shade_pipeline)
             .add_systems(
                 Core3d,
-                draw_shade.in_set(Core3dSystems::PostProcess).before(tonemapping),
+                draw_shade
+                    .in_set(Core3dSystems::PostProcess)
+                    .before(tonemapping),
             );
     }
 }
@@ -143,7 +150,11 @@ fn draw_shade(
     });
     uniforms.write_buffer(&render_device, &render_queue);
 
-    let pipeline_id = pipelines.specialize(&pipeline_cache, &pipeline, view_target.main_texture_format());
+    let pipeline_id = pipelines.specialize(
+        &pipeline_cache,
+        &pipeline,
+        view_target.main_texture_format(),
+    );
     let Some(render_pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
         return;
     };
@@ -159,14 +170,16 @@ fn draw_shade(
         )),
     );
 
-    let mut pass = ctx.command_encoder().begin_render_pass(&RenderPassDescriptor {
-        label: Some("shade_pass"),
-        color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
+    let mut pass = ctx
+        .command_encoder()
+        .begin_render_pass(&RenderPassDescriptor {
+            label: Some("shade_pass"),
+            color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
     pass.set_pipeline(render_pipeline);
     pass.set_bind_group(0, &render_data.common_bind_group, &[]);
     pass.set_bind_group(1, &bind_group, &[]);

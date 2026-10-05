@@ -1,11 +1,12 @@
 #[derive(Component)]
 pub struct HeightmapViewMesh;
 
+use crate::heightmap::{DEBUG_LAYER, Heightmap};
+use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::*;
 use bevy::shader::ShaderRef;
-use crate::heightmap::Heightmap;
 
 pub struct HeightmapViewPlugin;
 
@@ -33,7 +34,7 @@ impl Material for HeightmapMaterial {
     fn fragment_shader() -> ShaderRef {
         "shaders/heightmap_view.wgsl".into()
     }
-    
+
     fn alpha_mode(&self) -> AlphaMode {
         AlphaMode::Blend
     }
@@ -46,7 +47,11 @@ fn setup_view(
     heightmap_res: Res<Heightmap>,
 ) {
     // Spawning a highly subdivided plane so we can do vertex displacement!
-    let mesh = Plane3d::default().mesh().size(40.0, 32.0).subdivisions(256).build();
+    let mesh = Plane3d::default()
+        .mesh()
+        .size(40.0, 32.0)
+        .subdivisions(256)
+        .build();
     commands.spawn((
         Mesh3d(meshes.add(mesh.clone())),
         MeshMaterial3d(materials.add(HeightmapMaterial {
@@ -54,6 +59,7 @@ fn setup_view(
             channel: 1.0,
         })),
         Transform::from_xyz(0.0, 0.0, 0.0),
+        RenderLayers::layer(DEBUG_LAYER),
         HeightmapViewMesh,
     ));
     commands.spawn((
@@ -63,6 +69,7 @@ fn setup_view(
             channel: 0.0,
         })),
         Transform::from_xyz(0.0, 0.0, 0.0),
+        RenderLayers::layer(DEBUG_LAYER),
         HeightmapViewMesh,
     ));
 }

@@ -7,8 +7,7 @@
 
 use bevy::{
     core_pipeline::{
-        Core3d, Core3dSystems, deferred::node::late_deferred_prepass,
-        prepass::ViewPrepassTextures,
+        Core3d, Core3dSystems, deferred::node::late_deferred_prepass, prepass::ViewPrepassTextures,
     },
     prelude::*,
     render::{
@@ -73,7 +72,10 @@ impl Plugin for HiZPlugin {
 
         render_app
             .add_systems(RenderStartup, init_hi_z_pipelines)
-            .add_systems(Render, prepare_hi_z.in_set(RenderSystems::PrepareBindGroups))
+            .add_systems(
+                Render,
+                prepare_hi_z.in_set(RenderSystems::PrepareBindGroups),
+            )
             // After the last pass that writes depth, before any lighting
             // that will want to march it.
             .add_systems(
@@ -99,7 +101,10 @@ fn init_hi_z_pipelines(
         "hi_z_downsample_layout",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
-            (texture_2d(TextureSampleType::Float { filterable: false }), dst),
+            (
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                dst,
+            ),
         ),
     );
 

@@ -39,6 +39,11 @@ struct Uniforms {
 // x: ceiling (lowest surface above the split), y: floor (highest below).
 @group(0) @binding(0) var heightmap: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> uniforms: Uniforms;
+// Surface normals of the two channels. "min"/"max" name the height texture's
+// two channels, not low and high: h.x (ceiling) pairs with the ceiling normal
+// and h.y (floor) with the floor normal, same as src/heightmap_bake.rs.
+@group(0) @binding(2) var ceiling_normal: texture_2d<f32>;
+@group(0) @binding(3) var floor_normal: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 // Stored instead of a distance for rays that hit nothing.
@@ -49,6 +54,26 @@ const SH_STRIDE: u32 = 10u;
 // the floor and at most PROBE_MAX_LIFT (open-sky columns have no ceiling).
 const PROBE_MIN_LIFT: f32 = 0.1;
 const PROBE_MAX_LIFT: f32 = 2.0;
+// How far clear of a surface a relocated probe is left. Small enough to stay
+// inside the open column, large enough that the surface it just left does not
+// immediately re-embed it.
+const PROBE_SURFACE_EPS: f32 = 0.02;
+// Floor on |n.y| when turning a vertical push into a distance along the
+// surface normal. A vertical wall has n.y near zero, and dividing by it would
+// turn a few centimetres of overshoot into a huge sideways leap.
+const PROBE_NORMAL_MIN_Y: f32 = 0.2;
+
+/// Vertical tolerance of a probe footprint, in units of cascade spacing.
+// Height tolerance between a probe's own height and the shaded pixel's, as a
+// multiple of the cascade's spacing. Cascade-0 spacing is ~0.078 m, so 0.5 puts
+// the cutoff at ~0.04 m. A probe is either at the pixel's height or it is
+// somewhere else entirely: on another storey, or inside a wall whose column
+// floor is the ground floor. There is no useful middle ground between the two,
+// which is why this is a cutoff rather than a falloff.
+const HEIGHT_TOLERANCE_SPACING: f32 = 2.0;
+
+// Fraction of the tolerance over which the cutoff fades, to avoid aliasing.
+const HEIGHT_CUTOFF_SHOULDER: f32 = 0.85;
 
 fn oct_decode(uv: vec2<f32>) -> vec3<f32> {
     let f = uv * 2.0 - 1.0;
@@ -91,10 +116,70 @@ fn texel_at(xz: vec2<f32>) -> vec2<i32> {
 fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
     let s = uniforms.cascades[c].spacing;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
-    let h = textureLoad(heightmap, texel_at(xz), 0).xy;
+    let t = texel_at(xz);
+    let h = textureLoad(heightmap, t, 0).xy;
     let lift = clamp(0.5 * (h.x - h.y), PROBE_MIN_LIFT, PROBE_MAX_LIFT);
-    return vec3<f32>(xz.x, h.y + lift, xz.y);
+    let nominal = h.y + lift;
+    let p = vec3<f32>(xz.x, nominal, xz.y);
+
+    let n_ceiling = textureLoad(ceiling_normal, t, 0).xyz;
+    let n_floor = textureLoad(floor_normal, t, 0).xyz;
+    // A zero normal is how the bake marks a texel it found no surface in, and
+    // those columns keep their sentinel height. There is no surface there to
+    // push out of, so relocation has to leave them alone: with an empty floor
+    // at EMPTY_FLOOR the lift clamp would otherwise fire on every one of them.
+    let has_ceiling = dot(n_ceiling, n_ceiling) > 0.5;
+    let has_floor = dot(n_floor, n_floor) > 0.5;
+    if !has_floor || !has_ceiling {
+        return p;
+    }
+
+    // Solid is everything outside (h.y, h.x); the interval itself is the open
+    // column. PROBE_MIN_LIFT can push the nominal position straight through a
+    // thin ceiling - a column 5 cm tall still gets lifted 10 cm - which parks
+    // the probe inside the surface meant to bound it, and a probe inside
+    // solid gathers the light of whatever it is buried in.
+    let d_floor = nominal - h.y;
+    let d_ceiling = h.x - nominal;
+    if d_floor >= 0.0 && d_ceiling >= 0.0 {
+        return p;
+    }
+
+    // Buried: leave along the normal of the nearer of the two surfaces, which
+    // is the one whose solid the probe is inside. Both stored normals already
+    // point out of their surface into the open column - the ceiling's is
+    // negated at bake time so that it points down - so the same expression
+    // works for either branch.
+    let n = select(n_floor, n_ceiling, d_ceiling < d_floor);
+    let overshoot = max(-d_ceiling, -d_floor) + PROBE_SURFACE_EPS;
+    // |n.y| is the fraction of that distance that goes into Y, so the push
+    // lands exactly PROBE_SURFACE_EPS clear of the surface whatever its tilt.
+    return p + n * (overshoot / max(abs(n.y), PROBE_NORMAL_MIN_Y));
 }
+
+// The grid is top-down but each probe is lifted off its own column's floor, so
+// the four probes of a footprint sit at four unrelated heights - and 14% of
+// cascade-0 footprints straddle a storey by more than 2 m. An XZ bilinear
+// footprint cannot express that: a vertical offset leaves XZ untouched, so
+// reprojecting a probe "to the pixel's height" returns the same four cells with
+// the same weights. The height difference has to enter as a weight, or a probe
+// on another storey - or inside a hollow in a wall, whose column floor is the
+// ground floor - collects a full bilinear share and leaks.
+//
+// `spacing` scales the tolerance so it tracks cascade coarseness.
+//
+// Hard cutoff, not a falloff: past the tolerance the probe contributes nothing
+// at all. A Gaussian never reaches zero, so a probe on another storey kept
+// collecting a small but nonzero share, and since the four probes of a
+// footprint are renormalised against each other, that residual share was
+// enough to leak. The soft shoulder only exists to keep the transition from
+// aliasing as the pixel moves; it spans a small fraction of the tolerance.
+fn height_agreement(dy: f32, spacing: f32) -> f32 {
+    let s = max(spacing * HEIGHT_TOLERANCE_SPACING, 1e-4);
+    let t = abs(dy) / s;
+    return 1.0 - smoothstep(HEIGHT_CUTOFF_SHOULDER, 1.0, t);
+}
+
 
 struct Hit {
     // Distance along the ray, MISS if none.

@@ -5,7 +5,7 @@
 // where the shading point's ray would meet that sphere.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, PI, SH_STRIDE}
+#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, trace, MISS, PI, SH_STRIDE, height_agreement}
 
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var gbuffer: texture_2d<u32>;
@@ -22,6 +22,28 @@ struct ShadeUniforms {
 // Cosine-distributed directions per probe for the irradiance integral.
 const HEMISPHERE_SAMPLES: u32 = 32u;
 const GOLDEN_ANGLE: f32 = 2.39996323;
+// Push the shadow ray's origin off the shading point's own surface. A point
+// lying on its column's floor or ceiling is inside that column's solid half
+// space, so tracing from it unmodified reports a hit at t=0 and occludes every
+// probe at once, including the ones actually in view.
+const PROBE_BIAS: f32 = 0.02;
+
+// Whether a probe is reachable from `p`. The heightmap records one floor and
+// one ceiling per column, so it cannot represent a wall: without this test a
+// probe on the far side of a wall, or a ground-floor probe under a second
+// floor, bleeds straight through. `trace` returns MISS for a segment that
+// stays in open space over its whole length.
+fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
+    let to_probe = center - p;
+    let dist = length(to_probe);
+    if dist <= 1e-4 {
+        return true;
+    }
+    let o = p + n * PROBE_BIAS;
+    let t_end = max(dist - PROBE_BIAS, PROBE_BIAS);
+    let hit = trace(o, to_probe / dist, PROBE_BIAS, t_end);
+    return hit.t == MISS;
+}
 
 fn sh_radiance(base: u32, d: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(d);
@@ -176,14 +198,35 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let info = uniforms.cascades[0];
     let u = (p.xz - uniforms.hmap_min) / info.spacing - 0.5;
     let cell = vec2<i32>(floor(u));
-    let f = u - floor(u);
     var e = vec3<f32>(0.0);
+    var w_sum = 0.0;
     for (var k = 0u; k < 4u; k++) {
         let corner = vec2<u32>(k & 1u, k >> 1u);
-        let wxy = select(1.0 - f, f, corner == vec2<u32>(1u));
         let q = vec2<u32>(clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(info.size) - 1));
         let probe = info.probe_base + q.y * info.size.x + q.x;
-        e += (wxy.x * wxy.y) * probe_irradiance(probe, p, n);
+        let slot = sh_probes[probe * SH_STRIDE + 9u];
+        // The footprint is a tent centred on where the probe actually is, not
+        // on the cell it was sampled from. Relocation moves probes off their
+        // cell - out of the surface they were buried behind - and a probe that
+        // ended up more than a cell away is simply out of this footprint, so
+        // it falls to zero here instead of contributing at a cell it no longer
+        // occupies. On an undisplaced grid this reduces to the usual bilinear
+        // weights, and stays a partition of unity, so w_sum still renormalises.
+        let rel = (p.xz - slot.xz) / info.spacing;
+        let w_loc = max(1.0 - abs(rel.x), 0.0) * max(1.0 - abs(rel.y), 0.0);
+        // Height agreement folds the probe's own height into the bilinear
+        // weight; w_sum below renormalises, so down-weighting a probe
+        // redistributes its share instead of removing light.
+        let w = w_loc * height_agreement(slot.y - p.y, info.spacing);
+        if probe_visible(p, n, slot.xyz) {
+            e += w * probe_irradiance(probe, p, n);
+            w_sum += w;
+        }
     }
+    // Renormalise over the probes that survived, so an occluded probe hands
+    // its share to the visible ones instead of subtracting light. Without this
+    // the footprint sums to less than 1 and every occlusion reads as a
+    // straight loss of energy rather than a redistribution.
+    e = select(e, e / w_sum, w_sum > 1e-5);
     return vec4<f32>(base_color * (1.0 - metallic) / PI * e, 0.0);
 }

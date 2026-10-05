@@ -97,7 +97,7 @@ impl Layout {
         // probe holds every probe within `radius`.
         let window = |radius: f32, s: f32| 2 * ((radius / s).ceil() as u32 + 2);
         let (mut tag_base, mut hit_base) = (0u64, 0u64);
-                let mut allocate = |w: &mut CascadeWindow| {
+        let mut allocate = |w: &mut CascadeWindow| {
             w.tag_base = tag_base as u32;
             w.sh_base = tag_base as u32;
             w.hit_base = hit_base as u32;

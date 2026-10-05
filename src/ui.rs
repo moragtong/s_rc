@@ -10,7 +10,10 @@ pub struct LightingState {
 
 impl Default for LightingState {
     fn default() -> Self {
-        Self { indirect_enabled: true, probes_enabled: false }
+        Self {
+            indirect_enabled: true,
+            probes_enabled: false,
+        }
     }
 }
 
@@ -27,7 +30,9 @@ pub enum Action {
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LightingState>()
-            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<LightingState>::default())
+            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
+                LightingState,
+            >::default())
             .add_systems(Startup, setup_ui)
             .add_systems(Update, button_system);
     }
@@ -35,16 +40,14 @@ impl Plugin for UiPlugin {
 
 fn setup_ui(mut commands: Commands) {
     commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(10.0),
-                left: Val::Px(10.0),
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(10.0),
-                ..default()
-            },
-        ))
+        .spawn((Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            left: Val::Px(10.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(10.0),
+            ..default()
+        },))
         .with_children(|parent| {
             parent
                 .spawn((
@@ -58,11 +61,8 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleHeightmap),
                 ))
-                .with_child((
-                    Text::new("Toggle Heightmap (M)"),
-                    TextColor(Color::WHITE),
-                ));
-            
+                .with_child((Text::new("Toggle Heightmap (M)"), TextColor(Color::WHITE)));
+
             parent
                 .spawn((
                     Button,
@@ -91,10 +91,7 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleProbes),
                 ))
-                .with_child((
-                    Text::new("Toggle Probes (P)"),
-                    TextColor(Color::WHITE),
-                ));
+                .with_child((Text::new("Toggle Probes (P)"), TextColor(Color::WHITE)));
         });
 }
 

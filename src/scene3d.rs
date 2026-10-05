@@ -38,8 +38,7 @@ impl SceneBox {
 }
 
 /// A sun: a distant disk light.
-#[derive(Clone, Copy, Debug)]
-#[derive(Resource)]
+#[derive(Clone, Copy, Debug, Resource)]
 pub struct Sun {
     /// Unit vector from the scene toward the sun.
     pub toward: Vec3,
@@ -64,13 +63,33 @@ impl Scene3d {
         let half_len = ROOM_HALF + t / 2.0;
         let mut boxes = vec![
             // Ground slab, extending well past the room.
-            SceneBox { center: Vec3::new(0.0, -0.1, 0.0), half_size: Vec3::new(12.0, 0.1, 12.0), albedo: ground },
+            SceneBox {
+                center: Vec3::new(0.0, -0.1, 0.0),
+                half_size: Vec3::new(12.0, 0.1, 12.0),
+                albedo: ground,
+            },
             // Ceiling.
-            SceneBox { center: Vec3::new(0.0, h + t / 2.0, 0.0), half_size: Vec3::new(half_len, t / 2.0, half_len), albedo: wall },
+            SceneBox {
+                center: Vec3::new(0.0, h + t / 2.0, 0.0),
+                half_size: Vec3::new(half_len, t / 2.0, half_len),
+                albedo: wall,
+            },
             // +X, -Z, +Z walls.
-            SceneBox { center: Vec3::new(ROOM_HALF, y_mid, 0.0), half_size: Vec3::new(t / 2.0, h / 2.0, half_len), albedo: wall },
-            SceneBox { center: Vec3::new(0.0, y_mid, -ROOM_HALF), half_size: Vec3::new(half_len, h / 2.0, t / 2.0), albedo: wall },
-            SceneBox { center: Vec3::new(0.0, y_mid, ROOM_HALF), half_size: Vec3::new(half_len, h / 2.0, t / 2.0), albedo: wall },
+            SceneBox {
+                center: Vec3::new(ROOM_HALF, y_mid, 0.0),
+                half_size: Vec3::new(t / 2.0, h / 2.0, half_len),
+                albedo: wall,
+            },
+            SceneBox {
+                center: Vec3::new(0.0, y_mid, -ROOM_HALF),
+                half_size: Vec3::new(half_len, h / 2.0, t / 2.0),
+                albedo: wall,
+            },
+            SceneBox {
+                center: Vec3::new(0.0, y_mid, ROOM_HALF),
+                half_size: Vec3::new(half_len, h / 2.0, t / 2.0),
+                albedo: wall,
+            },
         ];
         // -X wall, split around the doorway: two side pieces and a lintel.
         let side_half = (half_len - DOOR_HALF_WIDTH) / 2.0;
@@ -120,7 +139,14 @@ impl Scene3d {
         let boxes: Vec<String> = self
             .boxes
             .iter()
-            .map(|b| format!("{{\"center\": {}, \"half_size\": {}, \"albedo\": {}}}", v(b.center), v(b.half_size), v(b.albedo)))
+            .map(|b| {
+                format!(
+                    "{{\"center\": {}, \"half_size\": {}, \"albedo\": {}}}",
+                    v(b.center),
+                    v(b.half_size),
+                    v(b.albedo)
+                )
+            })
             .collect();
         let sun = format!(
             "{{\"toward\": {}, \"irradiance\": {}, \"angular_radius_degrees\": {}}}",
@@ -129,7 +155,10 @@ impl Scene3d {
             self.sun.angular_radius.to_degrees()
         );
         let (o, voxel, res) = camera.grid;
-        let grid = format!("{{\"origin\": [{}, {}, {}], \"voxel\": {voxel}, \"resolution\": {res}}}", o.x, o.y, o.z);
+        let grid = format!(
+            "{{\"origin\": [{}, {}, {}], \"voxel\": {voxel}, \"resolution\": {res}}}",
+            o.x, o.y, o.z
+        );
         format!(
             "{{\n  \"camera\": {{\"position\": {}, \"forward\": {}, \"up\": {}, \"fov_y_degrees\": {}, \"width\": {}, \"height\": {}}},\n  \"clipmap\": [{}],\n  \"boxes\": [\n    {}\n  ],\n  \"sun\": {sun}\n}}\n",
             v(camera.position),

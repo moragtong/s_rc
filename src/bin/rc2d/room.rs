@@ -51,17 +51,32 @@ impl RegionSums {
 }
 
 impl RoomStats {
-    pub fn add_interior(&mut self, pos: Vec2, squared_error: f32, squared_reference: f32, reference: f32, cascades: f32) {
+    pub fn add_interior(
+        &mut self,
+        pos: Vec2,
+        squared_error: f32,
+        squared_reference: f32,
+        reference: f32,
+        cascades: f32,
+    ) {
         if INTERIOR.contains(pos) {
-            self.interior.add(squared_error, squared_reference, reference, cascades);
+            self.interior
+                .add(squared_error, squared_reference, reference, cascades);
         }
     }
 
     /// Wall pixels show their nearest face's lit color, compared like empty
     /// space. This is the direct check on the bounce lookup: a face that
     /// borrowed the other side's light shows up here first.
-    pub fn add_wall(&mut self, squared_error: f32, squared_reference: f32, reference: f32, cascades: f32) {
-        self.walls.add(squared_error, squared_reference, reference, cascades);
+    pub fn add_wall(
+        &mut self,
+        squared_error: f32,
+        squared_reference: f32,
+        reference: f32,
+        cascades: f32,
+    ) {
+        self.walls
+            .add(squared_error, squared_reference, reference, cascades);
     }
 
     pub fn summary(&self) -> String {
