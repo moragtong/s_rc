@@ -107,7 +107,8 @@ fn init_shade_pipeline(
                 (
                     texture_depth_2d(),
                     texture_2d(TextureSampleType::Uint), // deferred G-buffer
-                    storage_buffer_read_only::<Vec4>(false), // sh_probes
+                    // The blended probe set; `blend_sh` writes it every frame.
+                    storage_buffer_read_only::<Vec4>(false),
                     uniform_buffer::<ShadeUniforms>(false),
                 ),
             ),
@@ -165,7 +166,7 @@ fn draw_shade(
         &BindGroupEntries::sequential((
             &depth.texture.default_view,
             &gbuffer.texture.default_view,
-            render_data.sh_probes_buffer.as_entire_binding(),
+            render_data.sh_probes_blend_buffer.as_entire_binding(),
             uniforms.binding().unwrap(),
         )),
     );

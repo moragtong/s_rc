@@ -1,36 +1,17 @@
 //! Reads the heightmap back from the GPU and decides whether the bake is
 //! trustworthy.
 //!
-//! This is the authority on bake completion, not the frame count. The reduction
-//! is idempotent and can land on a frame whose prepasses predate the near-plane
-//! caps, and that bake is *not* detectably broken by looking at its size: a
-//! capped bake fills 111200 ceiling texels and a stale uncapped one fills
-//! 102226, both comfortably over the old threshold. So the check here is not
-//! "did it fill enough" but "does it contain the thing we were baking", which
-//! the cap texels answer directly.
+//! This is the authority on bake completion, not the frame count: the readback
+//! is requested only once the reduction is done and the cameras are off, and it
+//! is this that releases the rest of the app to treat the map as final.
 
 use bevy::{
     prelude::*,
     render::gpu_readback::{Readback, ReadbackComplete},
 };
 
-use crate::heightmap::{BAKE_NEAR, CAP_INSET, Heightmap, NO_CEILING, SPLIT};
+use crate::heightmap::{Heightmap, NO_CEILING};
 use crate::heightmap_bake::BakeState;
-
-/// Where caps are written, and how near a ceiling texel must sit to count as
-/// one. The 1 cm band is far tighter than the gap between the cap plane and
-/// anything else in Sponza, so this cannot fire on scene geometry.
-fn cap_plane() -> f32 {
-    SPLIT + BAKE_NEAR + CAP_INSET
-}
-
-const CAP_TOLERANCE: f32 = 0.01;
-
-/// Cap texels a bake must contain. A capped bake writes about 101000; a stale
-/// uncapped one writes 4. Any threshold in that four-order-of-magnitude gap
-/// works, and this sits near the bottom so a scene with only a little wall area
-/// crossing the split still passes.
-const MIN_CAP_HITS: usize = 512;
 
 /// What the readback found, consumed by `verdict`.
 #[derive(Resource, Default)]
@@ -40,7 +21,6 @@ struct Verdict {
 
 struct Found {
     hits: usize,
-    cap_hits: usize,
 }
 
 /// Set once retries run out, so the warning is a conclusion rather than a
@@ -102,7 +82,7 @@ fn request(
         "meta_min",
         0,
         16,
-        false,
+        true,
         heightmap.metadata_min.clone(),
     );
     spawn(
@@ -118,7 +98,7 @@ fn request(
         "meta_max",
         0,
         16,
-        false,
+        true,
         heightmap.metadata_max.clone(),
     );
     spawn(
@@ -161,6 +141,18 @@ fn request(
         false,
         heightmap.radiance_max.clone(),
     );
+    // The winding map is the one channel written by the CPU rather than by a
+    // compute pass, so it is the only one whose readback is checking that a
+    // Rust routine ran at all rather than that a shader compiled. Whole-image
+    // dump is `S_RC_DUMP_WINDING`.
+    spawn(
+        &mut commands,
+        "winding",
+        0,
+        4,
+        true,
+        heightmap.winding.clone(),
+    );
 }
 
 fn report_event(trigger: On<ReadbackComplete>, mut commands: Commands, probes: Query<&Probe>) {
@@ -170,13 +162,17 @@ fn report_event(trigger: On<ReadbackComplete>, mut commands: Commands, probes: Q
     if !probe.report {
         return;
     }
-    if probe.tag == "height"
-        && probe.chan == 0
-        && let Ok(path) = std::env::var("S_RC_DUMP_HEIGHT")
+    // Dump the whole image for whichever tag the caller named, so a channel can
+    // be examined off the GPU without a bespoke probe: `S_RC_DUMP_HEIGHT`,
+    // `S_RC_DUMP_META_MIN`, `S_RC_DUMP_META_MAX`, `S_RC_DUMP_ALBEDO_MIN`...
+    // One write per tag: every tag is read back once per channel, and the
+    // channel only selects which float the stats below read.
+    if probe.chan == 0
+        && let Ok(path) = std::env::var(format!("S_RC_DUMP_{}", probe.tag.to_uppercase()))
     {
         match std::fs::write(&path, &trigger.data) {
-            Ok(()) => info!("wrote heightmap dump ({path})"),
-            Err(e) => warn!("heightmap dump failed: {e}"),
+            Ok(()) => info!("wrote {} dump ({path})", probe.tag),
+            Err(e) => warn!("{} dump failed: {e}", probe.tag),
         }
     }
 
@@ -209,10 +205,8 @@ fn report_event(trigger: On<ReadbackComplete>, mut commands: Commands, probes: Q
     );
     if probe.tag == "height" {
         let mut open = 0usize;
-        let mut cap_hits = 0usize;
         let mut cmin = f32::MAX;
         let mut cmax = f32::MIN;
-        let cap = cap_plane();
         for i in 0..res {
             let base = i * 8;
             let c = f32::from_le_bytes([
@@ -226,20 +220,11 @@ fn report_event(trigger: On<ReadbackComplete>, mut commands: Commands, probes: Q
             } else {
                 cmin = cmin.min(c);
                 cmax = cmax.max(c);
-                if (c - cap).abs() <= CAP_TOLERANCE {
-                    cap_hits += 1;
-                }
             }
         }
-        info!(
-            "BAKESTATS ceiling open_sky={open} hits_range=[{cmin:.3}, {cmax:.3}] \
-             cap_hits={cap_hits}"
-        );
+        info!("BAKESTATS ceiling open_sky={open} hits_range=[{cmin:.3}, {cmax:.3}]");
         commands.insert_resource(Verdict {
-            found: Some(Found {
-                hits: res - open,
-                cap_hits,
-            }),
+            found: Some(Found { hits: res - open }),
         });
     }
 }
@@ -258,32 +243,15 @@ fn verdict(
         return;
     }
     let big_enough = found.hits as u32 >= BakeState::min_ceiling_hits();
-    // The postcondition that actually matters. A bake that ran against prepasses
-    // from before the caps arrived is full-sized and passes every size check, so
-    // demand the caps themselves: if this scene built cap geometry, the map must
-    // show cap texels. Anything less and the reduction read the wrong frame, and
-    // a map without caps is worse than no map because it looks finished.
-    let caps_present = !bake.caps_expected() || found.cap_hits >= MIN_CAP_HITS;
-    if big_enough && caps_present {
+    if big_enough {
         bake.mark_verified();
-        info!(
-            "heightmap bake verified: {} ceiling hits, {} cap texels",
-            found.hits, found.cap_hits
-        );
+        info!("heightmap bake verified: {} ceiling hits", found.hits);
         for entity in &probes {
             commands.entity(entity).despawn();
         }
         return;
     }
-    let why = match (big_enough, caps_present) {
-        (false, _) => format!("only {} ceiling hits", found.hits),
-        (true, false) => format!(
-            "{} ceiling hits but only {} cap texels (need {}): the reduction read \
-             prepasses from before the caps spawned",
-            found.hits, found.cap_hits, MIN_CAP_HITS
-        ),
-        _ => unreachable!(),
-    };
+    let why = format!("only {} ceiling hits", found.hits);
     if !bake.request_retry() {
         warn!(
             "heightmap bake unsound ({why}) after {} attempts; leaving the map \

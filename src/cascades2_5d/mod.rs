@@ -1,8 +1,14 @@
-//! 2.5D radiance cascades over the dual heightmap. Per frame: light the
-//! heightmap's floor and ceiling surfaces (sun, shadowed through the
-//! heightmap), trace and merge the cascades top-down with the bilinear fix,
-//! then project every probe onto L2 SH with its parallax radius for
-//! `shade`.
+//! 2.5D radiance cascades over the dual heightmap.
+//!
+//! The two halves of the work have very different clocks. Where each probe ray
+//! lands depends only on the scene, so it is marched **once** into
+//! `hits_buffer` by `shaders/march_hits.wgsl`, after the bake and the winding
+//! map are final. What arrives *at* those hits depends on the sun, so the
+//! light, trace and gather passes relight every [`RELIGHT_INTERVAL`] frames.
+//! Every frame, `shaders/blend_sh.wgsl` mixes the previous relight into the
+//! current one over the whole probe set, and `shade` reads that single buffer —
+//! the cross-fade it would otherwise do per SH coefficient costs the shade pass
+//! a second storage read 1.4 million times over.
 
 pub mod layout;
 
@@ -20,31 +26,71 @@ use bevy::{
             },
             *,
         },
-        renderer::{RenderContext, RenderDevice},
+        renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
     },
 };
 
 use crate::heightmap::Heightmap;
+use crate::heightmap_bake::BakeState;
 
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
 const LIGHT_SHADER_PATH: &str = "shaders/surface_light.wgsl";
 const TRACE_SHADER_PATH: &str = "shaders/cascades2_5d.wgsl";
 const GATHER_SHADER_PATH: &str = "shaders/gather_cascades.wgsl";
+const MARCH_SHADER_PATH: &str = "shaders/march_hits.wgsl";
+const BLEND_SHADER_PATH: &str = "shaders/blend_sh.wgsl";
 /// Workgroup sizes: 8x8 texels for the light pass, 64 rays or probes for
 /// the others.
 const LIGHT_WORKGROUP: u32 = 8;
 const WORKGROUP: u32 = 64;
 /// SH probe stride in vec4s: 9 coefficients, then (position, radius).
 pub const SH_STRIDE: u64 = 10;
+/// Slots per ray in the one-shot hit cache: the top cascade's own trace, or
+/// the four segment traces the cascades below it use instead.
+const HITS_PER_RAY: u64 = 4;
+/// Frames between two relights. The sun moves every frame, so this is the
+/// period the indirect light lags behind the direct light by.
+const RELIGHT_INTERVAL: u32 = 4;
 
 pub struct Cascades2_5dPlugin;
+
+/// Where the frame counter sits in [`RELIGHT_INTERVAL`], and how far through
+/// the cross-fade the probes are: 0.0 on the frame they were rewritten,
+/// climbing to just under 1.0 before the next relight. `alpha` is written into
+/// `blend_sh`'s uniform, which is what makes the cross-fade a pre-pass over the
+/// probe set rather than a per-coefficient read in the fragment shader.
+#[derive(Resource, Clone, Copy)]
+pub struct Relight {
+    pub interval: u32,
+    pub alpha: f32,
+}
+
+impl Default for Relight {
+    fn default() -> Self {
+        Self {
+            interval: RELIGHT_INTERVAL,
+            alpha: 0.0,
+        }
+    }
+}
+
+/// What `blend_sh` mixes with. Sized to a whole 16 bytes on purpose: a
+/// two-scalar struct is 8 bytes naturally, but uniform address space rounds a
+/// struct up to 16, and the two sides have to agree on the binding's minimum
+/// size or the bind group fails validation.
+#[derive(ShaderType, Clone, Copy, Default)]
+struct BlendUniforms {
+    pub alpha: f32,
+    pub probe_words: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
 
 #[derive(Resource, Clone, ExtractResource)]
 pub struct CascadesLayout {
     pub layout: layout::Layout,
 }
-
 impl Default for CascadesLayout {
     fn default() -> Self {
         Self {
@@ -96,21 +142,40 @@ struct CascadesPipeline {
     light_layout: BindGroupLayoutDescriptor,
     trace_layout: BindGroupLayoutDescriptor,
     gather_layout: BindGroupLayoutDescriptor,
+    march_layout: BindGroupLayoutDescriptor,
+    blend_layout: BindGroupLayoutDescriptor,
     light_pipeline: CachedComputePipelineId,
     trace_pipelines: Vec<CachedComputePipelineId>,
     gather_pipelines: Vec<CachedComputePipelineId>,
+    march_pipelines: Vec<CachedComputePipelineId>,
+    blend_pipeline: CachedComputePipelineId,
 }
 
 #[derive(Resource)]
 pub struct CascadesRenderData {
     pub rays_buffer: Buffer,
     pub sh_probes_buffer: Buffer,
+    /// The previous relight's SH probes, mixed into `sh_probes_blend_buffer`
+    /// by `blend_sh` every frame.
+    pub sh_probes_prev_buffer: Buffer,
+    /// What `shade` reads: the cross-fade between the two relights, written
+    /// once per frame over the whole probe set.
+    pub sh_probes_blend_buffer: Buffer,
+    /// Where each ray landed, written once by `march_hits.wgsl`.
+    pub hits_buffer: Buffer,
+    /// Persistent so a moving sun rewrites its contents instead of allocating
+    /// a new buffer every frame.
+    pub uniform_buffer: Buffer,
+    /// `BlendUniforms`, rewritten every frame.
+    blend_uniform_buffer: Buffer,
     subsamples_buffer: Buffer,
     /// Group 0 of every pass: the heightmap and the uniforms.
     pub common_bind_group: BindGroup,
     light_bind_group: BindGroup,
     trace_bind_group: BindGroup,
     gather_bind_group: BindGroup,
+    march_bind_group: BindGroup,
+    blend_bind_group: BindGroup,
 }
 
 /// Group 0, shared with the shading pass.
@@ -128,10 +193,10 @@ pub fn common_layout() -> BindGroupLayoutDescriptor {
                 // alongside the heights they came from.
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 texture_2d(TextureSampleType::Float { filterable: false }),
-                // Which columns are inside solid material. Appended last so the
-                // four bindings above keep their numbers - this layout is shared
-                // with the shading pass, and reordering it would silently swap
-                // the normals.
+                // 2D winding number of the split cut: the horizontal
+                // containment signal, since the floor/ceiling map cannot
+                // record a vertical wall and `is_solid` therefore cannot see
+                // one. Written on the CPU by `winding`.
                 texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
@@ -153,6 +218,7 @@ impl Plugin for Cascades2_5dPlugin {
         };
 
         render_app
+            .init_resource::<Relight>()
             .add_systems(bevy::render::RenderStartup, setup_pipelines)
             .add_systems(
                 Render,
@@ -214,6 +280,7 @@ fn setup_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: false }), // radiance_min
                 texture_2d(TextureSampleType::Float { filterable: false }), // radiance_max
                 storage_buffer::<Vec4>(false),                              // rays
+                storage_buffer_read_only::<Vec4>(false),                    // hits
             ),
         ),
     );
@@ -225,6 +292,26 @@ fn setup_pipelines(
                 storage_buffer_read_only::<Vec4>(false), // rays
                 storage_buffer::<Vec4>(false),           // sh_probes
                 storage_buffer_read_only::<Vec4>(false), // subsamples
+            ),
+        ),
+    );
+    let march_layout = BindGroupLayoutDescriptor::new(
+        "cascades_march_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            // Written once, read by every relight after that.
+            (storage_buffer::<Vec4>(false),), // hits
+        ),
+    );
+    let blend_layout = BindGroupLayoutDescriptor::new(
+        "cascades_blend_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                storage_buffer_read_only::<Vec4>(false), // sh_probes_prev
+                storage_buffer_read_only::<Vec4>(false), // sh_probes
+                storage_buffer::<Vec4>(false),           // sh_probes_blend
+                uniform_buffer::<BlendUniforms>(false),  // alpha
             ),
         ),
     );
@@ -244,6 +331,8 @@ fn setup_pipelines(
     let light_shader = asset_server.load(LIGHT_SHADER_PATH);
     let trace_shader = asset_server.load(TRACE_SHADER_PATH);
     let gather_shader = asset_server.load(GATHER_SHADER_PATH);
+    let march_shader = asset_server.load(MARCH_SHADER_PATH);
+    let blend_shader = asset_server.load(BLEND_SHADER_PATH);
     let cascades = 0..layout::CASCADES;
 
     commands.insert_resource(CascadesPipeline {
@@ -266,6 +355,7 @@ fn setup_pipelines(
             })
             .collect(),
         gather_pipelines: cascades
+            .clone()
             .map(|c| {
                 pipeline(
                     format!("cascades_gather{c}"),
@@ -275,20 +365,40 @@ fn setup_pipelines(
                 )
             })
             .collect(),
+        march_pipelines: cascades
+            .map(|c| {
+                pipeline(
+                    format!("cascades_march{c}"),
+                    &march_layout,
+                    &march_shader,
+                    format!("march_{c}"),
+                )
+            })
+            .collect(),
+        blend_pipeline: pipeline(
+            "cascades_blend_sh".into(),
+            &blend_layout,
+            &blend_shader,
+            "blend_sh".into(),
+        ),
         light_layout,
         trace_layout,
         gather_layout,
+        march_layout,
+        blend_layout,
     });
 }
 
 fn prepare_buffers(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
     pipeline: Res<CascadesPipeline>,
     layout: Res<CascadesLayout>,
     sun: Res<SunParams>,
     heightmap: Option<Res<Heightmap>>,
+    bake: Option<Res<BakeState>>,
     existing: Option<Res<CascadesRenderData>>,
     gpu_images: Res<RenderAssets<GpuImage>>,
 ) {
@@ -304,7 +414,7 @@ fn prepare_buffers(
         Some(albedo_max),
         Some(radiance_min),
         Some(radiance_max),
-        Some(solid),
+        Some(winding),
     ) = (
         image(&heightmap.texture),
         image(&heightmap.metadata_min),
@@ -313,50 +423,12 @@ fn prepare_buffers(
         image(&heightmap.albedo_max),
         image(&heightmap.radiance_min),
         image(&heightmap.radiance_max),
-        image(&heightmap.solid),
+        image(&heightmap.winding),
     )
     else {
         return;
     };
     let layout = &layout.layout;
-
-    let (rays_buffer, sh_probes_buffer, subsamples_buffer) = match &existing {
-        Some(e) => (
-            e.rays_buffer.clone(),
-            e.sh_probes_buffer.clone(),
-            e.subsamples_buffer.clone(),
-        ),
-        None => {
-            let probes: u64 = layout
-                .cascades
-                .iter()
-                .map(|c| (c.size.x * c.size.y) as u64)
-                .sum();
-            let storage = |label: &'static str, vec4s: u64| {
-                render_device.create_buffer(&BufferDescriptor {
-                    label: Some(label),
-                    size: vec4s * 16,
-                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            };
-            let subsamples: Vec<u8> = layout
-                .subsamples
-                .iter()
-                .flat_map(|v| v.to_array())
-                .flat_map(f32::to_ne_bytes)
-                .collect();
-            (
-                storage("cascades_rays", layout.hit_words),
-                storage("cascades_sh_probes", probes * SH_STRIDE),
-                render_device.create_buffer_with_data(&BufferInitDescriptor {
-                    label: Some("cascades_subsamples"),
-                    contents: &subsamples,
-                    usage: BufferUsages::STORAGE,
-                }),
-            )
-        }
-    };
 
     let mut cascades = [CascadeInfoUniform::default(); layout::CASCADES as usize];
     for (info, c) in cascades.iter_mut().zip(&layout.cascades) {
@@ -384,11 +456,96 @@ fn prepare_buffers(
     };
     let mut bytes = encase::UniformBuffer::new(Vec::new());
     bytes.write(&uniforms).unwrap();
-    let uniform_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("cascades_uniforms"),
-        contents: bytes.as_ref(),
-        usage: BufferUsages::UNIFORM,
-    });
+
+    let probes: u64 = layout
+        .cascades
+        .iter()
+        .map(|c| (c.size.x * c.size.y) as u64)
+        .sum();
+    let (
+        rays_buffer,
+        sh_probes_buffer,
+        sh_probes_prev_buffer,
+        sh_probes_blend_buffer,
+        subsamples_buffer,
+        hits_buffer,
+        uniform_buffer,
+        blend_uniform_buffer,
+    ) = match &existing {
+            Some(e) => (
+                e.rays_buffer.clone(),
+                e.sh_probes_buffer.clone(),
+                e.sh_probes_prev_buffer.clone(),
+                e.sh_probes_blend_buffer.clone(),
+                e.subsamples_buffer.clone(),
+                e.hits_buffer.clone(),
+                e.uniform_buffer.clone(),
+                e.blend_uniform_buffer.clone(),
+            ),
+            None => {
+                let storage = |label: &'static str, vec4s: u64, usage: BufferUsages| {
+                    render_device.create_buffer(&BufferDescriptor {
+                        label: Some(label),
+                        size: vec4s * 16,
+                        usage,
+                        mapped_at_creation: false,
+                    })
+                };
+                let readback = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+                let subsamples: Vec<u8> = layout
+                    .subsamples
+                    .iter()
+                    .flat_map(|v| v.to_array())
+                    .flat_map(f32::to_ne_bytes)
+                    .collect();
+                (
+                    storage("cascades_rays", layout.hit_words, readback),
+                    storage(
+                        "cascades_sh_probes",
+                        probes * SH_STRIDE,
+                        readback | BufferUsages::COPY_SRC,
+                    ),
+                    storage("cascades_sh_probes_prev", probes * SH_STRIDE, readback),
+                    // Written by `blend_sh`, read by `shade`: no copy usage,
+                    // it is never uploaded or read back.
+                    storage("cascades_sh_probes_blend", probes * SH_STRIDE, BufferUsages::STORAGE),
+                    render_device.create_buffer_with_data(&BufferInitDescriptor {
+                        label: Some("cascades_subsamples"),
+                        contents: &subsamples,
+                        usage: BufferUsages::STORAGE,
+                    }),
+                    storage("cascades_hits", layout.hit_words * HITS_PER_RAY, readback),
+                    render_device.create_buffer(&BufferDescriptor {
+                        label: Some("cascades_uniforms"),
+                        size: bytes.as_ref().len() as u64,
+                        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    // Zero-filled, which is what `blend_sh` wants before
+                    // `dispatch_cascades` has written a frame: alpha 0 reads
+                    // the previous relight.
+                    render_device.create_buffer(&BufferDescriptor {
+                        label: Some("cascades_blend_uniforms"),
+                        size: BlendUniforms::min_size().get(),
+                        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                )
+            }
+        };
+    // The sun moves every frame, so this is a write rather than the
+    // allocation it used to be.
+    render_queue.write_buffer(&uniform_buffer, 0, bytes.as_ref());
+
+    // Once the bake is confirmed, every image these bind groups name has
+    // settled: the heightmap and the winding map are written exactly once
+    // (and only then, while the bake is still unverified), and the rest are
+    // written by compute without ever being re-uploaded. Keeping the previous
+    // frame's groups avoids four allocations and four rounds of wgpu
+    // validation per frame.
+    if existing.is_some() && bake.as_ref().is_some_and(|b| b.is_verified()) {
+        return;
+    }
 
     let bind_group =
         |label: &'static str, layout: &BindGroupLayoutDescriptor, entries: &[BindGroupEntry]| {
@@ -406,7 +563,7 @@ fn prepare_buffers(
             uniform_buffer.as_entire_binding(),
             normal_min,
             normal_max,
-            solid,
+            winding,
         )),
     );
     let light_bind_group = bind_group(
@@ -428,6 +585,7 @@ fn prepare_buffers(
             radiance_min,
             radiance_max,
             rays_buffer.as_entire_binding(),
+            hits_buffer.as_entire_binding(),
         )),
     );
     let gather_bind_group = bind_group(
@@ -439,15 +597,37 @@ fn prepare_buffers(
             subsamples_buffer.as_entire_binding(),
         )),
     );
+    let march_bind_group = bind_group(
+        "cascades_march",
+        &pipeline.march_layout,
+        &BindGroupEntries::sequential((hits_buffer.as_entire_binding(),)),
+    );
+    let blend_bind_group = bind_group(
+        "cascades_blend_sh",
+        &pipeline.blend_layout,
+        &BindGroupEntries::sequential((
+            sh_probes_prev_buffer.as_entire_binding(),
+            sh_probes_buffer.as_entire_binding(),
+            sh_probes_blend_buffer.as_entire_binding(),
+            blend_uniform_buffer.as_entire_binding(),
+        )),
+    );
 
     commands.insert_resource(CascadesRenderData {
         rays_buffer,
         sh_probes_buffer,
+        sh_probes_prev_buffer,
+        sh_probes_blend_buffer,
+        hits_buffer,
+        uniform_buffer,
+        blend_uniform_buffer,
         subsamples_buffer,
         common_bind_group,
         light_bind_group,
         trace_bind_group,
         gather_bind_group,
+        march_bind_group,
+        blend_bind_group,
     });
 }
 
@@ -457,7 +637,12 @@ fn dispatch_cascades(
     pipeline: Res<CascadesPipeline>,
     heightmap: Option<Res<Heightmap>>,
     render_data: Option<Res<CascadesRenderData>>,
+    bake: Option<Res<BakeState>>,
+    mut relight: ResMut<Relight>,
+    render_queue: Res<RenderQueue>,
     mut render_context: RenderContext,
+    mut frame: Local<u32>,
+    mut marched: Local<bool>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
         return;
@@ -465,7 +650,7 @@ fn dispatch_cascades(
     // Every pass reads the previous one's output; skip the frame until all
     // have compiled.
     let get = |id: &CachedComputePipelineId| pipeline_cache.get_compute_pipeline(*id);
-    let (Some(light), Some(traces), Some(gathers)) = (
+    let (Some(light), Some(traces), Some(gathers), Some(marches), Some(blend)) = (
         get(&pipeline.light_pipeline),
         pipeline
             .trace_pipelines
@@ -477,9 +662,66 @@ fn dispatch_cascades(
             .iter()
             .map(get)
             .collect::<Option<Vec<_>>>(),
+        pipeline
+            .march_pipelines
+            .iter()
+            .map(get)
+            .collect::<Option<Vec<_>>>(),
+        get(&pipeline.blend_pipeline),
     ) else {
         return;
     };
+
+    // The march depends only on the scene, so it happens once. A bake that has
+    // to retry rewrites the heightmap underneath it, so an unverified map
+    // invalidates the stored hits and sends the march back through.
+    let verified = bake.as_ref().is_some_and(|b| b.is_verified());
+    let need_march = !*marched;
+    if need_march && !verified {
+        return;
+    }
+
+    // Which frame of the relight interval this is, counted from 0 on the frame
+    // the probes are rewritten. The march counts as one: it is the first write
+    // after verification, and relighting before it has anywhere to land would
+    // gather against an empty hit cache.
+    let interval = relight.interval.max(1);
+    let since = *frame % interval;
+    *frame = frame.wrapping_add(1);
+    relight.alpha = since as f32 / interval as f32;
+    let relight_now = need_march || since == 0;
+
+    // `blend_sh` runs every frame whatever else does, so its alpha is written
+    // unconditionally - the cross-fade is the only thing `shade` can read.
+    let probe_words = layout
+        .layout
+        .cascades
+        .iter()
+        .map(|c| (c.size.x * c.size.y) as u64)
+        .sum::<u64>()
+        * SH_STRIDE;
+    let mut bytes = encase::UniformBuffer::new(Vec::new());
+    bytes
+        .write(&BlendUniforms {
+            alpha: relight.alpha,
+            probe_words: probe_words as u32,
+            ..default()
+        })
+        .unwrap();
+    render_queue.write_buffer(&render_data.blend_uniform_buffer, 0, bytes.as_ref());
+
+    if relight_now {
+        // Keep the previous relight's probes for the cross-fade. Recorded ahead
+        // of the pass that overwrites them, since this runs before the gather in
+        // the same encoder.
+        render_context.command_encoder().copy_buffer_to_buffer(
+            &render_data.sh_probes_buffer,
+            0,
+            &render_data.sh_probes_prev_buffer,
+            0,
+            render_data.sh_probes_buffer.size(),
+        );
+    }
 
     let mut pass = render_context
         .command_encoder()
@@ -489,24 +731,43 @@ fn dispatch_cascades(
         });
     pass.set_bind_group(0, &render_data.common_bind_group, &[]);
 
-    pass.set_pipeline(light);
-    pass.set_bind_group(1, &render_data.light_bind_group, &[]);
-    pass.dispatch_workgroups(
-        heightmap.resolution.x.div_ceil(LIGHT_WORKGROUP),
-        heightmap.resolution.y.div_ceil(LIGHT_WORKGROUP),
-        1,
-    );
-
-    // Top-down: each cascade merges the one above it.
-    pass.set_bind_group(1, &render_data.trace_bind_group, &[]);
-    for (c, trace) in layout.layout.cascades.iter().zip(&traces).rev() {
-        pass.set_pipeline(trace);
-        pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
+    if need_march {
+        // Where every ray lands, computed here and never again while the sun
+        // moves. Top-down so a cascade's segments exist before the one below
+        // reads them as parents.
+        pass.set_bind_group(1, &render_data.march_bind_group, &[]);
+        for (c, march) in layout.layout.cascades.iter().zip(&marches).rev() {
+            pass.set_pipeline(march);
+            pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
+        }
+        *marched = true;
     }
 
-    pass.set_bind_group(1, &render_data.gather_bind_group, &[]);
-    for (c, gather) in layout.layout.cascades.iter().zip(&gathers) {
-        pass.set_pipeline(gather);
-        pass.dispatch_workgroups((c.size.x * c.size.y).div_ceil(WORKGROUP), 1, 1);
+    if relight_now {
+        pass.set_pipeline(light);
+        pass.set_bind_group(1, &render_data.light_bind_group, &[]);
+        pass.dispatch_workgroups(
+            heightmap.resolution.x.div_ceil(LIGHT_WORKGROUP),
+            heightmap.resolution.y.div_ceil(LIGHT_WORKGROUP),
+            1,
+        );
+
+        // Top-down: each cascade merges the one above it.
+        pass.set_bind_group(1, &render_data.trace_bind_group, &[]);
+        for (c, trace) in layout.layout.cascades.iter().zip(&traces).rev() {
+            pass.set_pipeline(trace);
+            pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
+        }
+
+        pass.set_bind_group(1, &render_data.gather_bind_group, &[]);
+        for (c, gather) in layout.layout.cascades.iter().zip(&gathers) {
+            pass.set_pipeline(gather);
+            pass.dispatch_workgroups((c.size.x * c.size.y).div_ceil(WORKGROUP), 1, 1);
+        }
     }
+
+    // Last, so a relight frame blends against the probes it just gathered.
+    pass.set_pipeline(blend);
+    pass.set_bind_group(1, &render_data.blend_bind_group, &[]);
+    pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
 }

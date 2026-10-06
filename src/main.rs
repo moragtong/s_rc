@@ -1,5 +1,4 @@
 use crate::cascades2_5d::Cascades2_5dPlugin;
-mod bake_caps;
 mod cascades2_5d;
 mod heightmap;
 mod heightmap_bake;
@@ -11,6 +10,7 @@ mod scene3d;
 mod screenshot;
 mod shade;
 mod ui;
+mod winding;
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::core_pipeline::prepass::{DeferredPrepass, DepthPrepass, NormalPrepass};
@@ -29,7 +29,7 @@ use hi_z_debug::HiZDebugPlugin;
 fn main() {
     let measure_fps = std::env::var("S_RC_FPS").is_ok();
     let mut app = App::new();
-    app.add_systems(Update, (draw_probes_gizmos, camera_readout))
+    app.add_systems(Update, (draw_probes_gizmos, camera_readout, animate_sun))
         .insert_resource(DefaultOpaqueRendererMethod::deferred())
         .add_plugins((
             DefaultPlugins,
@@ -38,6 +38,7 @@ fn main() {
             FreeCameraPlugin,
             HeightmapPlugin,
             HeightmapBakePlugin,
+            winding::WindingPlugin,
             heightmap_verify::HeightmapVerifyPlugin,
             HeightmapViewPlugin,
             ui::UiPlugin,
@@ -65,6 +66,34 @@ fn log_fps(mut frames: Local<Option<(std::time::Instant, u32)>>) {
         frames.1 = 0;
         frames.0 = std::time::Instant::now();
     }
+}
+
+/// One turn of the sun, in seconds. Fast enough that the four-frame relight
+/// interval shows: the direct light and its shadows move every frame while the
+/// probes catch up over the interval, which is the whole point of the
+/// cross-fade.
+const SUN_SWEEP_PERIOD_SECS: f32 = 20.0;
+
+/// Sweeps the sun so the lag between direct and indirect lighting is visible.
+/// `S_RC_SUN_STILL` freezes it, for any shot that has to be reproducible.
+fn animate_sun(
+    time: Res<Time>,
+    mut frozen: Local<Option<bool>>,
+    mut lights: Query<&mut Transform, With<DirectionalLight>>,
+) {
+    if frozen.is_none() {
+        *frozen = Some(std::env::var("S_RC_SUN_STILL").is_ok());
+    }
+    if frozen.unwrap() {
+        return;
+    }
+    let Ok(mut light) = lights.single_mut() else {
+        return;
+    };
+    // Pre-multiply so the sweep is about the world's up axis: the elevation
+    // stays put and only the azimuth moves.
+    let step = Quat::from_rotation_y(time.delta_secs() * std::f32::consts::TAU / SUN_SWEEP_PERIOD_SECS);
+    light.rotation = step * light.rotation;
 }
 
 fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {

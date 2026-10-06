@@ -5,10 +5,14 @@
 // where the shading point's ray would meet that sphere.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, trace, MISS, PI, SH_STRIDE, height_agreement, stencil_touches_solid}
+#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, trace, MISS, PI, SH_STRIDE, height_agreement, probe_buried}
 
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var gbuffer: texture_2d<u32>;
+// The blended probe set: `blend_sh` writes mix(previous relight, current
+// relight, alpha) here every frame before this pass runs, so the cross-fade
+// costs one storage read rather than two. Probe positions and parallax radii
+// are the same in both relights, so they survive the mix unchanged.
 @group(1) @binding(2) var<storage, read> sh_probes: array<vec4<f32>>;
 
 struct ShadeUniforms {
@@ -45,11 +49,18 @@ fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
     return hit.t == MISS;
 }
 
+// The SH coefficients are radiance, and `sh_probes` is already the cross-fade
+// between two relights (see blend_sh.wgsl), so this is a plain read: the blend
+// is done once over 18k words instead of once per coefficient per pixel.
+fn sh_coeff(base: u32, i: u32) -> vec3<f32> {
+    return sh_probes[base + i].xyz;
+}
+
 fn sh_radiance(base: u32, d: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(d);
     var l = vec3<f32>(0.0);
     for (var i = 0u; i < 9u; i++) {
-        l += sh_probes[base + i].xyz * basis[i];
+        l += sh_coeff(base, i) * basis[i];
     }
     return max(l, vec3<f32>(0.0));
 }
@@ -61,7 +72,7 @@ fn sh_irradiance(base: u32, n: vec3<f32>) -> vec3<f32> {
     var e = vec3<f32>(0.0);
     for (var i = 0u; i < 9u; i++) {
         let l = select(select(2u, 1u, i < 4u), 0u, i == 0u);
-        e += sh_probes[base + i].xyz * (basis[i] * band[l]);
+        e += sh_coeff(base, i) * (basis[i] * band[l]);
     }
     return max(e, vec3<f32>(0.0));
 }
@@ -218,15 +229,25 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // weight; w_sum below renormalises, so down-weighting a probe
         // redistributes its share instead of removing light.
         var w = w_loc * height_agreement(slot.y - p.y, info.spacing);
-        // Drop the probe outright if its cell is inside solid material. The
-        // renormalisation below then hands its share to the probes that
-        // survive, so a wall column loses its contribution rather than
-        // subtracting energy - which is what put probes inside walls and let
-        // them collect a share from both storeys.
-        if stencil_touches_solid(cell + vec2<i32>(corner)) {
+        // Drop the probe outright if it is inside solid material where it
+        // actually ended up. The renormalisation below then hands its share to
+        // the probes that survive, so a wall column loses its contribution
+        // rather than subtracting energy - which is what put probes inside
+        // walls and let them collect a share from both storeys.
+        //
+        // `slot.xyz`, not the grid cell: a probe that `probe_position` nudged
+        // out of a wall is read at its new position, and testing the cell it
+        // was gathered for would throw away exactly the probes the nudge just
+        // rescued. What is left here is a probe the nudge could not help.
+        if probe_buried(slot.xyz) {
             w = 0.0;
         }
-        if probe_visible(p, n, slot.xyz) {
+        // A probe at w = 0 contributes nothing whether or not it is visible,
+        // so neither its trace nor its 32-sample integral needs doing: it is
+        // outside this footprint, out of height agreement, or buried. This is
+        // the single most expensive thing per probe, and a large share of them
+        // are at zero on any given pixel.
+        if w > 0.0 && probe_visible(p, n, slot.xyz) {
             e += w * probe_irradiance(probe, p, n);
             w_sum += w;
         }

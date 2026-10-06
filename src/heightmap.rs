@@ -27,16 +27,13 @@ pub struct Heightmap {
     /// on the GPU by the cascades' surface light pass.
     pub radiance_min: Handle<Image>,
     pub radiance_max: Handle<Image>,
-    /// 1 where the column is inside solid material at the split.
-    ///
-    /// The heightmap stores only a floor and a ceiling, so it cannot express
-    /// "this column is inside a wall". A column through a hollow wall reads
-    /// like an ordinary tall interval - the same floor, ceiling and normals as
-    /// a column under an atrium, because a vertical ray cannot tell them apart -
-    /// so probes get placed inside walls and nothing downstream rejects them.
-    /// This is the one channel that can, and the trace pass uses it to drop
-    /// probes whose bilinear stencil touches it.
-    pub solid: Handle<Image>,
+    /// 2D generalized winding number of the scene cut at `SPLIT`, written on
+    /// the CPU by `winding`. The horizontal containment signal the stored
+    /// normals cannot carry: a vertical wall is invisible to a bake whose rays
+    /// only run up and down, so both sides of a wall record open air and
+    /// `is_solid` never fires there. Same resolution and bounds as the
+    /// heightmap, so a heightmap texel indexes it directly.
+    pub winding: Handle<Image>,
     /// Highest ceiling or floor in the map; above it rays can't hit.
     pub top: f32,
 }
@@ -51,11 +48,6 @@ pub const EMPTY_FLOOR: f32 = SPLIT - 10.0;
 /// Near plane offset of both bake cameras from `SPLIT`, along the direction
 /// they face. Everything within this distance of the split is clipped away.
 pub const BAKE_NEAR: f32 = 0.05;
-/// How far past the near plane a cap sits, on the camera's side of it. A cap
-/// exactly on the plane is a coin toss: it is inside the clip region by
-/// whatever way the rasteriser rounds, so it would be clipped along with the
-/// geometry it exists to replace.
-pub const CAP_INSET: f32 = 0.002;
 /// Resolution along each axis. The map need not be square; it covers
 /// `MIN_BOUNDS`..`MAX_BOUNDS`, so its texels need not be either.
 pub const RESOLUTION: UVec2 = UVec2::new(512, 512);
@@ -121,21 +113,37 @@ fn setup_heightmap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     let (albedo_min, albedo_max) = rgba(&mut images);
     let (radiance_min, radiance_max) = rgba(&mut images);
 
+    // Read-only on the GPU, and written from the CPU rather than by a
+    // compute pass, so it needs no storage binding — R32Float is not a
+    // storage format in core WebGPU.
+    let mut winding = Image::new(
+        Extent3d {
+            width: RESOLUTION.x,
+            height: RESOLUTION.y,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        vec![0u8; (RESOLUTION.x * RESOLUTION.y) as usize * 4],
+        TextureFormat::R32Float,
+        RenderAssetUsages::default(),
+    );
+    winding.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+        | TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC;
+    let winding = images.add(winding);
+
     commands.insert_resource(Heightmap {
         min_bounds: MIN_BOUNDS,
         max_bounds: MAX_BOUNDS,
         resolution: RESOLUTION,
         texture: images.add(create_empty_image(RESOLUTION, TextureFormat::Rg32Float, 2)),
-        // Cleared to 0 and written by the bake's reduce pass. Until a stencil
-        // pass fills it, every texel reads as air, so probe rejection keyed off
-        // it is inert and nothing else changes.
-        solid: images.add(create_empty_image(RESOLUTION, TextureFormat::R32Float, 1)),
         metadata_min,
         metadata_max,
         albedo_min,
         albedo_max,
         radiance_min,
         radiance_max,
+        winding,
         top: SPLIT,
     });
 }

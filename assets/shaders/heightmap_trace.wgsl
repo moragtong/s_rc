@@ -44,12 +44,10 @@ struct Uniforms {
 // and h.y (floor) with the floor normal, same as src/heightmap_bake.rs.
 @group(0) @binding(2) var ceiling_normal: texture_2d<f32>;
 @group(0) @binding(3) var floor_normal: texture_2d<f32>;
-// 1 where the column is inside solid material. The heightmap's floor and
-// ceiling cannot express that, so a hollow column is indistinguishable from a
-// tall room and probes form inside walls. This is the only channel that can say
-// so. Written by the bake's reduce pass; inert (all zero) until a stencil pass
-// fills it, which is why the rejection below is safe to land first.
-@group(0) @binding(4) var solid: texture_2d<f32>;
+// 2D winding number of the mesh cut at SPLIT, one texel per heightmap texel
+// and with the same bounds, so `texel` indexes it directly. The horizontal
+// containment signal; see `is_solid`.
+@group(0) @binding(4) var winding: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 // Stored instead of a distance for rays that hit nothing.
@@ -64,6 +62,11 @@ const PROBE_MAX_LIFT: f32 = 2.0;
 // inside the open column, large enough that the surface it just left does not
 // immediately re-embed it.
 const PROBE_SURFACE_EPS: f32 = 0.02;
+// Smallest ring a buried probe is moved out over, m. The storey slab that
+// makes up almost every flagged column on Sponza is 0.76 m thick, so a move
+// shorter than this leaves the probe inside it; the clearance a cascade needs
+// on top of this is RELOCATE's business, not the ring's.
+const RELOCATE_MIN_RADIUS: f32 = 0.75;
 // Floor on |n.y| when turning a vertical push into a distance along the
 // surface normal. A vertical wall has n.y near zero, and dividing by it would
 // turn a few centimetres of overshoot into a huge sideways leap.
@@ -120,16 +123,42 @@ fn texel_at(xz: vec2<f32>) -> vec2<i32> {
 }
 
 fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
-    let s = uniforms.cascades[c].spacing;
+    let info = uniforms.cascades[c];
+    let s = info.spacing;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
-    let t = texel_at(xz);
-    let h = textureLoad(heightmap, t, 0).xy;
+    let t0 = texel_at(xz);
+
+    // Nudge out of the wall the bake recorded this column inside, before the
+    // lift: the lift measures the column's floor and ceiling, so relocating
+    // first is what makes the probe end up in the air it was moved into rather
+    // than at the same height inside the material it left.
+    //
+    // How far it may look depends on the cascade. Each one gathers from its own
+    // `interval.x` outward - 0, 1, 2, 4 m - so a coarse cascade's rays start
+    // beyond a wall that cascade-0's still run into, and it can afford to send
+    // the probe further to clear it. Half a spacing caps the reach, because
+    // past that the probe has left the bilinear footprint that reads it and is
+    // dropped for being adrift rather than for being buried.
+    let reach = max(RELOCATE_MIN_RADIUS, min(info.interval.x, 0.5 * s));
+    let ring = max(i32(ceil(reach / min(cell_size().x, cell_size().y))), 1);
+    let t = escape_texel(t0, lifted_height(t0), ring);
+
+    // A probe that moved is read at its new position, so it goes there. One
+    // that did not keeps its grid position to the millimetre: snapping every
+    // probe to a texel centre would shift the whole field by up to half a
+    // texel and change the image for no reason.
+    var xz_out = xz;
+    if any(t != t0) {
+        xz_out = uniforms.hmap_min + (vec2<f32>(t) + 0.5) * cell_size();
+    }
+
+    let h = textureLoad(heightmap, vec2<u32>(t), 0).xy;
     let lift = clamp(0.5 * (h.x - h.y), PROBE_MIN_LIFT, PROBE_MAX_LIFT);
     let nominal = h.y + lift;
-    let p = vec3<f32>(xz.x, nominal, xz.y);
+    let p = vec3<f32>(xz_out.x, nominal, xz_out.y);
 
-    let n_ceiling = textureLoad(ceiling_normal, t, 0).xyz;
-    let n_floor = textureLoad(floor_normal, t, 0).xyz;
+    let n_ceiling = textureLoad(ceiling_normal, vec2<u32>(t), 0).xyz;
+    let n_floor = textureLoad(floor_normal, vec2<u32>(t), 0).xyz;
     // A zero normal is how the bake marks a texel it found no surface in, and
     // those columns keep their sentinel height. There is no surface there to
     // push out of, so relocation has to leave them alone: with an empty floor
@@ -180,29 +209,160 @@ fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
 // footprint are renormalised against each other, that residual share was
 // enough to leak. The soft shoulder only exists to keep the transition from
 // aliasing as the pixel moves; it spans a small fraction of the tolerance.
-// Whether a texel is inside solid material.
+// How far a stored normal must lean *away* from the open column before its
+// column counts as buried. A surface in open air always faces the ray that
+// found it: a floor from above, a ceiling from below. Only a column that starts
+// inside material records the far side of it.
+const BURIED_MIN_Y: f32 = -0.5;
+
+// How far around a column the split cut has to wind before it counts as
+// material. A closed loop gives exactly 1 inside and 0 outside, so 0.5 is the
+// midpoint; Sponza's shells are open, so the sum is fractional and the
+// reference implementation was measured against this value rather than
+// assumed: 98.5% of the texels the normals flag, 0.0% of clearly open ones.
+const WINDING_SOLID: f32 = 0.5;
+
+// Whether the column at `texel` is inside solid material at the split.
+//
+// A floor and a ceiling cannot say "this column is inside a wall", which is what
+// let probes form inside masonry and collect a bilinear share from both
+// storeys. The normals can, for free, because the bake cameras rasterise
+// backfaces: a column that starts in open air records the surface its ray lands
+// on, while a column that starts inside a wall records the surface the ray
+// *leaves* through - the wall's underside going down, its top going up. Both of
+// those face away from the split, and the bake negates the ceiling's normal so
+// that both channels land on the same sign: a negative y.
+//
+// Either channel is enough, and either alone would throw most of it away. The
+// two cameras look at opposite sides of the split, so whichever surface a buried
+// column happens to be made of is only visible to one of them: on Sponza the
+// floor channel catches the perimeter band and the ceiling channel catches the
+// colonnade, and requiring both would keep 468 of the 2300 flagged texels.
+//
+// What neither channel can see is a vertical surface, because the bake's rays
+// run only up and down and so never cross one: both sides of a wall record open
+// air, no normal leans away, and 115 probes sit inside the drawn sphere of a
+// wall with every one of their columns called open. The winding term is the
+// missing half - a horizontal cut through the same geometry, which a wall
+// crosses head-on. It is an addition, not a replacement: on Sponza it reproduces
+// 98.5% of what the normals already catch and adds columns they cannot reach.
 fn is_solid(texel: vec2<i32>) -> bool {
-    let dims = textureDimensions(solid);
+    let dims = textureDimensions(ceiling_normal);
     if (texel.x < 0 || texel.y < 0 || texel.x >= i32(dims.x) || texel.y >= i32(dims.y)) {
         return false;
     }
-    return textureLoad(solid, texel, 0).x > 0.5;
+    // A zero normal is how the bake marks a column it found nothing in, which
+    // is empty rather than buried, and compares greater than the threshold
+    // anyway - so the empty columns need no case of their own.
+    let t = vec2<u32>(texel);
+    return textureLoad(ceiling_normal, t, 0).y < BURIED_MIN_Y
+        || textureLoad(floor_normal, t, 0).y < BURIED_MIN_Y
+        || abs(textureLoad(winding, t, 0).x) > WINDING_SOLID;
 }
 
-// Whether any texel of the footprint `texel` belongs to is solid.
+// Whether `t` is an open column a probe can be lifted from at all.
 //
-// All four, not just the one the probe is lifted from. A probe lifted from an
-// open texel next to a wall still bilinearly blends the wall's texels in, and
-// that blend is exactly what puts a probe inside masonry; rejecting only the
-// source texel would leave the fringe this is meant to remove. The cost is
-// thinner probes along every wall, which is the intended direction - a missing
-// probe along a wall reads as a slightly dark seam, a probe inside one reads as
-// a leak.
-fn stencil_touches_solid(texel: vec2<i32>) -> bool {
-    return is_solid(texel)
-        || is_solid(texel + vec2<i32>(1, 0))
-        || is_solid(texel + vec2<i32>(0, 1))
-        || is_solid(texel + vec2<i32>(1, 1));
+// Not solid, and with both stored surfaces, so there is a real interval to sit
+// in. The interval has to be tall enough for the lift to land inside it. A
+// column the bake found no ceiling in is open sky, and relocating a buried
+// probe out of a wall into one of those is the worst possible answer: the probe
+// would gather sky it can see from outside and pour it into the room it was
+// just rescued from.
+//
+// No height is required here. The destination column places the probe wherever
+// its own lift puts it, so a column that only opens above or below the probe's
+// original height is still a valid - and much closer - escape than one that
+// happens to straddle it.
+fn column_open(t: vec2<i32>) -> bool {
+    let dims = vec2<i32>(textureDimensions(heightmap));
+    if (t.x < 0 || t.y < 0 || t.x >= dims.x || t.y >= dims.y) {
+        return false;
+    }
+    if (is_solid(t)) {
+        return false;
+    }
+    let u = vec2<u32>(t);
+    let n_ceiling = textureLoad(ceiling_normal, u, 0).xyz;
+    let n_floor = textureLoad(floor_normal, u, 0).xyz;
+    if (dot(n_ceiling, n_ceiling) < 0.5 || dot(n_floor, n_floor) < 0.5) {
+        return false;
+    }
+    let h = textureLoad(heightmap, u, 0).xy;
+    return h.x - h.y >= 2.0 * PROBE_MIN_LIFT;
+}
+
+// Where a probe lifted from column `t` would end up: the column's own floor
+// plus the same lift `probe_position` applies. Named so the search can measure
+// how far a candidate actually moves the probe.
+fn lifted_height(t: vec2<i32>) -> f32 {
+    let h = textureLoad(heightmap, vec2<u32>(t), 0).xy;
+    return h.y + clamp(0.5 * (h.x - h.y), PROBE_MIN_LIFT, PROBE_MAX_LIFT);
+}
+
+// The open column whose lift puts the probe closest to where it is now, within
+// `ring` texels, in any direction.
+//
+// The rings grow in Chebyshev steps - they have to, to enumerate a square
+// neighbourhood - but Chebyshev is only the enumeration. Every candidate in
+// every ring is scored and the smallest wins, so the answer is the nearest
+// escape rather than whichever one a square happened to reach first: stopping
+// at the first ring with anything open picks by square, which on a diagonal
+// settles for a texel up to sqrt(2) further off than one the same ring held.
+//
+// The score is in metres, not texels. A texel is 7.8 cm across in x and 6.2 cm
+// in z, so texel-space distance silently over-weights x by a quarter, and it
+// ignores height entirely - which is the axis a buried probe most often has to
+// move along, since the destination column places the probe by its own lift.
+// Scoring the full 3D move is what makes "any direction, closest" true rather
+// than approximately true on a flat map.
+fn escape_texel(origin: vec2<i32>, y: f32, ring: i32) -> vec2<i32> {
+    if !is_solid(origin) {
+        return origin;
+    }
+    let cell = cell_size();
+    var best = origin;
+    var best_d = -1.0;
+    for (var r = 1; r <= ring; r = r + 1) {
+        for (var i = -r; i <= r; i = i + 1) {
+            var c: array<vec2<i32>, 4>;
+            c[0] = origin + vec2<i32>(i, -r);
+            c[1] = origin + vec2<i32>(i, r);
+            c[2] = origin + vec2<i32>(-r, i);
+            c[3] = origin + vec2<i32>(r, i);
+            for (var k = 0; k < 4; k = k + 1) {
+                if (column_open(c[k])) {
+                    let dx = f32(c[k].x - origin.x) * cell.x;
+                    let dz = f32(c[k].y - origin.y) * cell.y;
+                    let dy = lifted_height(c[k]) - y;
+                    let d2 = dx * dx + dy * dy + dz * dz;
+                    if (best_d < 0.0 || d2 < best_d) {
+                        best_d = d2;
+                        best = c[k];
+                    }
+                }
+            }
+        }
+    }
+    return best;
+}
+
+// Whether the probe *as it ended up* is inside material, which after a nudge is
+// not a question about the grid cell it was gathered for. Testing that cell
+// instead would reject exactly the probes relocation just rescued, and accept
+// a probe that never moved because its cell looked open while the position it
+// is read at does not.
+//
+// The probe grid and the heightmap are not the same lattice: cascade 0 is one
+// probe per metre, the heightmap one texel per 7.8 cm, so a grid index has to
+// go through `probe_position`'s world-space round trip before it can index a
+// heightmap texture. Handing a grid index straight to `is_solid` silently
+// looks 12.8x/16x too far west and north, which for cascade 0 reaches only the
+// map's far corner - 0 of Sponza's flagged texels, so the test rejected
+// nothing anywhere in the scene while reading as if it were live. `p` is a
+// world position, so that round trip has already happened by the time it gets
+// here.
+fn probe_buried(p: vec3<f32>) -> bool {
+    return is_solid(texel_at(p.xz));
 }
 
 fn height_agreement(dy: f32, spacing: f32) -> f32 {

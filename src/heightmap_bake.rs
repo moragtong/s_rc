@@ -29,7 +29,6 @@ use bevy::{
         schedule::Core3d,
     },
     prelude::*,
-    render::mesh::VertexAttributeValues,
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
         extract_component::{ExtractComponent, ExtractComponentPlugin},
@@ -45,10 +44,8 @@ use bevy::{
     },
 };
 
-use crate::bake_caps::{CapGrid, CapStats, Contour, cap_mesh, cut_contours};
 use crate::heightmap::{
-    BAKE_LAYER, BAKE_NEAR, CAP_INSET, EMPTY_FLOOR, Heightmap, NO_CEILING, RESOLUTION, SCENE_LAYER,
-    SPLIT,
+    BAKE_LAYER, BAKE_NEAR, EMPTY_FLOOR, Heightmap, NO_CEILING, RESOLUTION, SCENE_LAYER, SPLIT,
 };
 use crate::heightmap_view::HeightmapViewMesh;
 
@@ -104,10 +101,6 @@ pub struct BakeState {
     attempts: Arc<AtomicU32>,
     /// Set when a bake came back empty and the cameras must come back on.
     retry: Arc<AtomicBool>,
-    /// Whether this scene produced cap geometry at all. Without it a scene with
-    /// no walls crossing the split would fail the verifier's cap postcondition
-    /// forever and retry itself out of attempts.
-    caps_expected: Arc<AtomicBool>,
 }
 
 impl BakeState {
@@ -140,16 +133,6 @@ impl BakeState {
         MIN_CEILING_HITS
     }
 
-    /// Whether any cap geometry was spawned, which is what makes the cap
-    /// postcondition in the verifier checkable.
-    pub fn caps_expected(&self) -> bool {
-        self.caps_expected.load(Ordering::Relaxed)
-    }
-
-    pub fn set_caps_expected(&self) {
-        self.caps_expected.store(true, Ordering::Relaxed);
-    }
-
     pub fn attempts(&self) -> u32 {
         self.attempts.load(Ordering::Relaxed)
     }
@@ -170,18 +153,6 @@ impl BakeState {
 
     fn wants_retry(&self) -> bool {
         self.retry.swap(false, Ordering::Relaxed)
-    }
-
-    /// Bring the bake cameras back for another attempt. The reduction rewrites
-    /// every texel, so nothing needs clearing first.
-    /// Discard a bake that completed against a prepass the scene has since
-    /// invalidated - the near-plane caps arriving - and start again. This is not
-    /// a failed attempt, so unlike [`Self::rearm`] it does not consume one of the
-    /// retries.
-    pub fn invalidate(&self) {
-        self.baked.store(0, Ordering::Relaxed);
-        self.done.store(false, Ordering::Relaxed);
-        self.verified.store(false, Ordering::Relaxed);
     }
 
     fn rearm(&self) {
@@ -242,10 +213,7 @@ impl Plugin for HeightmapBakePlugin {
                 Update,
                 (
                     measure_scene_extent,
-                    spawn_bake_caps
-                        .after(tag_scene_meshes)
-                        .after(measure_scene_extent),
-                    finish_bake.after(spawn_bake_caps),
+                    finish_bake.after(measure_scene_extent),
                     rearm_bake.after(finish_bake),
                 ),
             );
@@ -297,7 +265,11 @@ struct OriginalCullModes {
     modes: std::collections::HashMap<AssetId<StandardMaterial>, Option<Face>>,
 }
 
-/// Turn face culling off while the bake cameras are live, then put it back.
+/// Cull mode the bake cameras run with, so the experiment can be flipped by
+/// changing one line.
+const BAKE_CULL_MODE: Option<Face> = None;
+
+/// Set the face culling the bake cameras need, then put it back.
 ///
 /// Bevy 0.19 has no per-camera cull mode: `Camera3d` carries only the depth
 /// load op and texture usages, and triangle culling is baked into the
@@ -309,10 +281,14 @@ struct OriginalCullModes {
 /// So it is scoped by lifetime instead: `BakeState::is_done` is set once the
 /// bake cameras have been switched off, so the main camera renders every frame
 /// it is actually visible with the authored cull modes, and only the bake
-/// frames are affected. Turning culling off matters because a single-sided
-/// surface whose normals face away from a bake camera would otherwise be
-/// culled before it reaches the depth/G-buffer pass, and the recorded
-/// floor/ceiling would be some deeper surface instead.
+/// frames are affected.
+///
+/// The bake runs with back faces *culled* (`BAKE_CULL_MODE` above). A bake
+/// camera sitting inside material then cannot record the surface it exits
+/// through, because that exit face points away from it and is culled before it
+/// reaches the depth/G-buffer pass; it sees straight through to whatever is
+/// outside. That is the containment signal `is_solid` reads, and it is the only
+/// place a surface can be seen edge-on by a camera looking straight up or down.
 fn toggle_scene_culling(
     mut materials: ResMut<Assets<StandardMaterial>>,
     state: Res<BakeState>,
@@ -325,7 +301,7 @@ fn toggle_scene_culling(
             let Some(mut material) = materials.get_mut(id) else {
                 continue;
             };
-            if material.cull_mode.is_none() {
+            if material.cull_mode == BAKE_CULL_MODE {
                 material.cull_mode = mode;
             }
         }
@@ -335,29 +311,16 @@ fn toggle_scene_culling(
     for (id, material) in materials.iter_mut() {
         // Only write when the value actually changes: touching an asset every
         // frame would emit `AssetEvent::Modified` and churn the pipeline cache.
-        if material.cull_mode.is_some() {
+        if material.cull_mode != BAKE_CULL_MODE {
             original.modes.insert(id, material.cull_mode);
-            material.cull_mode = None;
+            material.cull_mode = BAKE_CULL_MODE;
         }
     }
 }
 
-/// Marks a glTF mesh, so the capping pass can find the scene's own meshes
-/// without guessing from their layers. Layers are not usable as the filter:
-/// `tag_scene_meshes` adds them in the same schedule, and a query keyed on
-/// their absence would match or miss depending on which ran first.
-#[derive(Component)]
-struct SceneMesh;
-
 /// The glTF's meshes default to layer 0 only, which the bake cameras can't
 /// see. Add `SCENE_LAYER` and `BAKE_LAYER` to them, without disturbing the
 /// debug overlay, which carries its own layer.
-///
-/// The bake cameras need both the originals and the capped copies: the caps
-/// only add a surface on the near planes, they do not replace the geometry
-/// behind them. The main camera is on `SCENE_LAYER` only, so it never sees a
-/// cap - a cap is a flat horizontal sheet across the middle of the room, not
-/// part of the scene.
 fn tag_scene_meshes(
     mut commands: Commands,
     query: Query<
@@ -370,177 +333,10 @@ fn tag_scene_meshes(
     >,
 ) {
     for entity in &query {
-        commands.entity(entity).insert((
-            RenderLayers::from_layers(&[SCENE_LAYER, BAKE_LAYER]),
-            SceneMesh,
-        ));
+        commands
+            .entity(entity)
+            .insert(RenderLayers::from_layers(&[SCENE_LAYER, BAKE_LAYER]));
     }
-}
-
-/// Spawn a capped copy of every scene mesh on `BAKE_LAYER`.
-///
-/// The caps sit on the bake cameras' near planes, which is the only place a cap
-/// survives clipping: see `bake_caps`. Runs once, after the extent has settled,
-/// and the copies outlive a retry, so the cameras simply render them again.
-///
-/// The copies carry their vertices in world space and sit at the identity
-/// transform. Decomposing the source's `GlobalTransform` back into
-/// translation/rotation/scale is lossy - a glTF node may hold shear, which TRS
-/// cannot express - and a cap built on the lossy form lands somewhere else
-/// entirely, where the bake cameras never see it.
-///
-/// Gated on the scene having finished loading, so the mesh set is complete, and
-/// it invalidates any bake that already finished. Both matter: capping early
-/// catches only the meshes loaded so far and never runs again, and capping late
-/// leaves the bake free to complete against a prepass without the caps - the
-/// reduction reads the prepass as it stands, finds a perfectly good *uncapped*
-/// heightmap, and the verifier accepts it.
-fn spawn_bake_caps(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    heightmap: Res<Heightmap>,
-    bake: Res<BakeState>,
-    mut cameras: Query<&mut Camera, With<BakeView>>,
-    scene: Query<(&Mesh3d, &MeshMaterial3d<StandardMaterial>, &GlobalTransform), With<SceneMesh>>,
-    mut spawned: Local<bool>,
-) {
-    if *spawned || !bake.is_ready() {
-        return;
-    }
-    // Only the ceiling, and only on the upper plane.
-    //
-    // The bake cameras sit on `SPLIT` with `near = BAKE_NEAR`, so a cap on the
-    // plane just past a camera's near plane is the *nearest* surface that camera
-    // sees - which is the whole mechanism, and also why the caps must be one
-    // plane and not two. The up camera looks for the ceiling and the leak is
-    // there: an upper storey with no ceiling has nothing to stop the ray, so it
-    // escapes and the ground-floor texel records a ceiling twelve metres up.
-    // The down camera has no such problem - looking for a floor it finds real
-    // geometry, or nothing, and "nothing" is already handled by `EMPTY_FLOOR`.
-    // Capping it too would make the cap the nearest surface for the down camera
-    // and overwrite 76k texels of genuine floor with a value 2mm under the
-    // ceiling, collapsing the stored interval to ~0.1m. Every probe then falls
-    // under `HEIGHT_TOLERANCE_SPACING` and is discarded, so indirect light
-    // disappears entirely - the heightmap still looks plausible, because the
-    // numbers are self-consistent, they are just uniformly wrong.
-    let planes = [SPLIT + BAKE_NEAR + CAP_INSET];
-    let mut stats = CapStats::default();
-    let (mut capped_meshes, mut total) = (0usize, 0usize);
-    // Every mesh's contours, combined before anything is rasterised.
-    let grid = CapGrid {
-        min: Vec2::new(heightmap.min_bounds.x, heightmap.min_bounds.y),
-        texel: (heightmap.max_bounds.x - heightmap.min_bounds.x) / heightmap.resolution.x as f32,
-        res: heightmap.resolution.x,
-    };
-    let mut contours: Vec<Contour> = Vec::new();
-    // Any scene material will do: culling is off during the bake and the cap is
-    // only ever drawn into the bake layer's prepass.
-    let mut cap_material: Option<MeshMaterial3d<StandardMaterial>> = None;
-    for (mesh, material, transform) in &scene {
-        total += 1;
-        let Some(source) = meshes.get(&mesh.0) else {
-            continue;
-        };
-        let world = into_world_space(source.clone(), transform);
-        let (found, mesh_stats) = cut_contours(&world, &planes);
-        if !mesh_stats.reject.is_empty() {
-            debug!("heightmap cap skipped: {}", mesh_stats.reject);
-        }
-        if found.is_empty() {
-            continue;
-        }
-        stats.merge(&mesh_stats);
-        capped_meshes += 1;
-        cap_material.get_or_insert_with(|| material.clone());
-        contours.extend(found);
-    }
-
-    // One cap proxy for the whole scene. Building it per mesh would put each
-    // mesh's contours in a mask of their own, where a wall's inner faces cannot
-    // subtract its outer ones and every mask can only add.
-    let cap = cap_mesh(&contours, &grid, planes[0], &mut stats);
-    if let (Some(cap), Some(material)) = (cap, cap_material) {
-        commands.spawn((
-            Mesh3d(meshes.add(cap)),
-            material.clone(),
-            Transform::default(),
-            RenderLayers::layer(BAKE_LAYER),
-        ));
-    } else if !contours.is_empty() {
-        warn!("heightmap caps: contours found but no texels masked");
-    }
-    *spawned = true;
-    // Every frame the bake goes on to count must render with the caps present,
-    // so throw away whatever it has and bring the cameras back up if they had
-    // already switched themselves off.
-    if !contours.is_empty() {
-        bake.set_caps_expected();
-    }
-    bake.invalidate();
-    for mut camera in &mut cameras {
-        camera.is_active = true;
-    }
-    info!(
-        "heightmap caps: {}/{} meshes capped at y={:.3}; \
-         {} solid contours, {} air contours skipped, {} left open, \
-         {} cap texels, {} triangles, {} non-manifold points; \
-         solid contour areas {} m2, all contour areas {} m2",
-        capped_meshes,
-        total,
-        planes[0],
-        stats.contours_solid,
-        stats.contours_air,
-        stats.runs_chorded,
-        stats.quads,
-        stats.triangles,
-        stats.junctions,
-        fmt_areas(&stats.solid_areas_m2),
-        fmt_areas(&stats.areas_m2)
-    );
-}
-
-/// Move every vertex of `mesh` through `xform`, returning a new world-space
-/// mesh. Normals are rescaled rather than rotated by an inverse transpose, which
-/// `Affine3A` does not expose; the scene's capped meshes are uniformly scaled,
-/// where the two agree.
-/// Largest few areas, biggest first, so the log stays one line.
-fn fmt_areas(areas: &[f32]) -> String {
-    let mut a: Vec<f32> = areas.to_vec();
-    a.sort_by(|x, y| y.partial_cmp(x).unwrap());
-    a.iter()
-        .take(6)
-        .map(|v| format!("{v:.1}"))
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn into_world_space(mut mesh: Mesh, xform: &GlobalTransform) -> Mesh {
-    let affine = xform.affine();
-    let scale = Vec3::new(
-        affine.matrix3.x_axis.length(),
-        affine.matrix3.y_axis.length(),
-        affine.matrix3.z_axis.length(),
-    );
-    let safe = scale.max(Vec3::splat(1e-12));
-    let inv_scale = Vec3::new(1.0 / safe.x, 1.0 / safe.y, 1.0 / safe.z);
-    if let Some(VertexAttributeValues::Float32x3(positions)) =
-        mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
-    {
-        for p in positions.iter_mut() {
-            *p = affine.transform_point3(Vec3::from(*p)).to_array();
-        }
-    }
-    if let Some(VertexAttributeValues::Float32x3(normals)) =
-        mesh.attribute_mut(Mesh::ATTRIBUTE_NORMAL)
-    {
-        for n in normals.iter_mut() {
-            *n = affine
-                .transform_vector3(Vec3::from(*n) * inv_scale)
-                .normalize_or_zero()
-                .to_array();
-        }
-    }
-    mesh
 }
 
 fn spawn_bake_cameras(
@@ -573,8 +369,7 @@ fn spawn_bake_cameras(
             },
             Projection::Orthographic(OrthographicProjection {
                 // The near plane sits just off the split, so anything on the
-                // far side of it is clipped away. The caps go here too, just
-                // inside it: see `bake_caps`.
+                // far side of it is clipped away.
                 near: BAKE_NEAR,
                 // Patched by measure_scene_extent once the scene has loaded.
                 far: 1.0,
@@ -620,7 +415,7 @@ fn spawn_bake_cameras(
 
 /// Sets each camera's far plane from the scene's Y extent, and `top` from the
 /// scene's max: nothing the bake can see is above it.
-fn measure_scene_extent(
+pub(crate) fn measure_scene_extent(
     mut settle: Local<Option<(usize, u32, u32)>>,
     bake: Res<BakeState>,
     scene: Res<SceneAsset>,
@@ -842,15 +637,12 @@ fn prepare_bake(
     // to count BAKE_FRAMES bakes against one bind group, reading whatever that
     // group still points at.
     //
-    // This is not hypothetical. `spawn_bake_caps` calls `invalidate`, which
-    // switches the bake cameras back on; `ViewPrepassTextures` are absent for a
-    // frame or two while the render graph rebuilds, and in that window
-    // `prepare_bake` bails out early. With the old dispatch left behind, the
-    // bake then "completed" against prepass textures filled *before* the caps
-    // existed and wrote a map identical to the uncapped one - which looked like
-    // the caps having had no effect, and came and went between runs depending on
-    // how the frames landed. Clearing up front is the only way to be sure every
-    // early path is covered.
+    // This is not hypothetical. A retry switches the bake cameras back on, and
+    // `ViewPrepassTextures` are absent for a frame or two while the render graph
+    // rebuilds, so `prepare_bake` bails out early right after one. With the old
+    // dispatch left behind, the bake then goes on counting BAKE_FRAMES against a
+    // bind group whose prepasses are gone. Clearing up front is the only way to
+    // be sure every early path is covered.
     commands.remove_resource::<BakeDispatch>();
 
     let mut up: Option<ViewBake> = None;

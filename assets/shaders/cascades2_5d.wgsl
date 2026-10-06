@@ -1,23 +1,44 @@
-// Traces and merges one cascade, one thread per probe ray, top cascade
-// first. Each ray stores the radiance arriving along it from its interval
-// start outward (its own interval merged with every cascade above), and how
-// far away that radiance came from.
+// Merges one cascade, one thread per probe ray, top cascade first. Each ray
+// stores the radiance arriving along it from its interval start outward (its
+// own interval merged with every cascade above), and how far away that
+// radiance came from.
+//
+// Where each ray lands was decided once, by `march_hits.wgsl`: the scene is
+// static, so the marching itself is never repeated here. This pass only looks
+// the current surface radiance up at the stored hits and folds it into the
+// cascades, which is what makes relighting cheap enough to run on its own
+// schedule.
 
-#import s_rc::heightmap_trace::{
-    uniforms, trace, Hit, probe_position, cell_direction, MISS,
-}
+#import s_rc::heightmap_trace::{uniforms, probe_position, cell_direction, MISS}
 
 @group(1) @binding(0) var radiance_min: texture_2d<f32>;
 @group(1) @binding(1) var radiance_max: texture_2d<f32>;
 // Per ray: rgb = radiance, a = distance from the probe to where it came
 // from (MISS if nothing was hit).
 @group(1) @binding(2) var<storage, read_write> rays: array<vec4<f32>>;
+// Per ray: texel, ceiling flag and distance, as recorded by the one-shot
+// march. Read-only — nothing here writes geometry back.
+@group(1) @binding(3) var<storage, read> hits: array<vec4<u32>>;
 
-fn surface_radiance(hit: Hit) -> vec3<f32> {
-    if hit.ceiling {
-        return textureLoad(radiance_min, hit.texel, 0).rgb;
+const HITS_PER_RAY: u32 = 4u;
+
+// A stored hit, left exactly as the march wrote it: (texel.x, texel.y,
+// ceiling, t). naga will not build a `Hit` literal out of an imported type,
+// so the encoding stays packed and is unpacked field by field instead.
+fn hit_at(base: u32, slot: u32) -> vec4<u32> {
+    return hits[base * HITS_PER_RAY + slot];
+}
+
+fn hit_t(e: vec4<u32>) -> f32 {
+    return bitcast<f32>(e.w);
+}
+
+fn surface_radiance(e: vec4<u32>) -> vec3<f32> {
+    let texel = vec2<i32>(e.xy);
+    if e.z != 0u {
+        return textureLoad(radiance_min, texel, 0).rgb;
     }
-    return textureLoad(radiance_max, hit.texel, 0).rgb;
+    return textureLoad(radiance_max, texel, 0).rgb;
 }
 
 fn cascade(c: u32, id: u32) {
@@ -34,9 +55,10 @@ fn cascade(c: u32, id: u32) {
 
     if c + 1u >= uniforms.cascade_count {
         var out = vec4<f32>(0.0, 0.0, 0.0, MISS);
-        let hit = trace(p, d, info.interval.x, info.interval.y);
-        if hit.t != MISS {
-            out = vec4<f32>(surface_radiance(hit), hit.t);
+        let e = hit_at(info.ray_base + id, 0u);
+        let t = hit_t(e);
+        if t != MISS {
+            out = vec4<f32>(surface_radiance(e), t);
         }
         rays[info.ray_base + id] = out;
         return;
@@ -68,15 +90,16 @@ fn cascade(c: u32, id: u32) {
 
         let seg = q + d * parent.interval.x - a;
         let len = length(seg);
-        if len > 1e-5 {
+        // Too short to have been traced: the march stored a miss, so this
+        // falls through to the parent rays below, as it always did.
+        let e = hit_at(info.ray_base + id, k);
+        let t = hit_t(e);
+        if t != MISS {
             let dir = seg / len;
-            let hit = trace(a, dir, 0.0, len);
-            if hit.t != MISS {
-                radiance += w * surface_radiance(hit);
-                distance_sum += w * distance(p, a + dir * hit.t);
-                distance_weight += w;
-                continue;
-            }
+            radiance += w * surface_radiance(e);
+            distance_sum += w * distance(p, a + dir * t);
+            distance_weight += w;
+            continue;
         }
 
         let parent_rays = parent.ray_base + (qi.y * parent.size.x + qi.x) * parent_side * parent_side;
