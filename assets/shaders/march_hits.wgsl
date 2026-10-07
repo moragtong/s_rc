@@ -100,6 +100,10 @@ fn parent_dir_hits(
     return out;
 }
 
+// Whether the child trace's segments end at the nearest projected parent hit.
+// Off restores the old handoff. See `parent_dir_hits` above.
+const PARALLAX_ENDPOINT: bool = true;
+
 fn march(c: u32, id: u32) {
     let info = uniforms.cascades[c];
     let side = info.octa_side;
@@ -145,7 +149,10 @@ fn march(c: u32, id: u32) {
                 nearest = dirs[j].x;
             }
         }
-        if nearest >= 0.0 {
+        // A/B toggle: PARALLAX_ENDPOINT=false restores the pre-parallax
+        // handoff, `end = q + d * parent.interval.x`, which the fallback above
+        // always gives. Measured away from the interior camera runs.
+        if PARALLAX_ENDPOINT && nearest >= 0.0 {
             end = p + d * nearest;
         }
         let seg = end - a;
