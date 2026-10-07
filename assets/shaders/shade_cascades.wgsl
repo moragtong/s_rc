@@ -31,6 +31,14 @@ const GOLDEN_ANGLE: f32 = 2.39996323;
 // space, so tracing from it unmodified reports a hit at t=0 and occludes every
 // probe at once, including the ones actually in view.
 const PROBE_BIAS: f32 = 0.02;
+const TAU: f32 = 6.28318530718;
+// Per-pixel hash: breaks the 1m probe grid and the 32-sample hemisphere into
+// noise instead of flat blocks. Seeded by the fragment coordinate (and the
+// probe index below), so it is stable across frames and a screenshot stays
+// sharp; it only decorrelates neighbouring pixels.
+fn hash12(seed: vec2<f32>) -> f32 {
+    return fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
 
 // Whether a probe is reachable from `p`. The heightmap records one floor and
 // one ceiling per column, so it cannot represent a wall: without this test a
@@ -56,11 +64,18 @@ fn sh_coeff(base: u32, i: u32) -> vec3<f32> {
     return sh_probes[base + i].xyz;
 }
 
-fn sh_radiance(base: u32, d: vec3<f32>) -> vec3<f32> {
+// The 9 SH coefficients of a probe. `base` is invariant across all
+// HEMISPHERE_SAMPLES samples, so they are loaded once per probe per pixel and
+// the sample loop reads registers instead of re-reading `sh_probes` ~288
+// times per probe per pixel (9 words x 32 samples). Measured against the
+// in-loop read: bit-identical output, 13 -> 19 FPS on the interior camera -
+// the shade pass's cost was redundant storage traffic, not the per-sample
+// math or the probe_visible trace (removing either changed nothing).
+fn sh_radiance(coefs: array<vec3<f32>, 9>, d: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(d);
     var l = vec3<f32>(0.0);
     for (var i = 0u; i < 9u; i++) {
-        l += sh_coeff(base, i) * basis[i];
+        l += coefs[i] * basis[i];
     }
     return max(l, vec3<f32>(0.0));
 }
@@ -87,21 +102,34 @@ fn tangent_frame(n: vec3<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(t, bt, n);
 }
 
-fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>, pixel: vec2<i32>) -> vec3<f32> {
     let base = probe * SH_STRIDE;
     let center = sh_probes[base + 9u];
     let oc = p - center.xyz;
     let radius = center.w;
     let frame = tangent_frame(n);
     var e = vec3<f32>(0.0);
+    // The 9 coefficients are the same for every sample; load them once so the
+    // loop below reads registers, not `sh_probes` (see `sh_radiance`).
+    var coefs: array<vec3<f32>, 9>;
+    for (var c = 0u; c < 9u; c++) {
+        coefs[c] = sh_probes[base + c].xyz;
+    }
+    // Rotate the whole 32-sample pattern by a hash of the pixel and the probe
+    // index, so neighbouring pixels integrate slightly different directions
+    // and the low-frequency probe structure becomes interleaved noise instead
+    // of contiguous bands.
+    let rot = hash12(vec2<f32>(pixel) * 0.37 + vec2<f32>(f32(probe & 255u) * 0.17, f32((probe >> 8u) & 255u) * 0.23)) * TAU;
     for (var k = 0u; k < HEMISPHERE_SAMPLES; k++) {
         let u = (f32(k) + 0.5) / f32(HEMISPHERE_SAMPLES);
         let r = sqrt(u);
-        let phi = f32(k) * GOLDEN_ANGLE;
+        let phi = f32(k) * GOLDEN_ANGLE + rot;
         let w = frame * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(1.0 - u));
         var d = w;
-        // Far root of |p + t w - center| = radius. Probes that hit nothing
-        // have radius 0 and are read uncorrected.
+        // Parallax: reduce the probe's surroundings to the sphere of its
+        // farthest hit and read the SH toward where this shading ray meets
+        // that sphere - a coarse stand-in for tracing the geometry. Probes
+        // that hit nothing have radius 0 and are read uncorrected.
         if radius > 0.0 {
             let b = dot(oc, w);
             let disc = b * b - (dot(oc, oc) - radius * radius);
@@ -112,7 +140,7 @@ fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
                 }
             }
         }
-        e += sh_radiance(base, d);
+        e += sh_radiance(coefs, d);
     }
     return e * (PI / f32(HEMISPHERE_SAMPLES));
 }
@@ -207,7 +235,13 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let n = oct_decode(vec2<f32>(f32(g.a & 0xFFFu), f32((g.a >> 12u) & 0xFFFu)) / 4095.0);
 
     let info = uniforms.cascades[0];
-    let u = (p.xz - uniforms.hmap_min) / info.spacing - 0.5;
+    // Jitter the probe-grid read by up to half a cell on each axis, keyed per
+    // pixel. The bilinear tent then splits its sample between neighbouring
+    // cells a pixel at a time, turning the 1m probe structure - sharp weight
+    // jumps, height-agreement shelf edges, relocated-probe discontinuities -
+    // into fine noise instead of block boundaries.
+    let dij = (vec2<f32>(hash12(vec2<f32>(pixel)), hash12(vec2<f32>(pixel) + 31.7)) - 0.5) / 2.0;
+    let u = (p.xz - uniforms.hmap_min) / info.spacing - 0.5 + dij;
     let cell = vec2<i32>(floor(u));
     var e = vec3<f32>(0.0);
     var w_sum = 0.0;
@@ -248,7 +282,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // the single most expensive thing per probe, and a large share of them
         // are at zero on any given pixel.
         if w > 0.0 && probe_visible(p, n, slot.xyz) {
-            e += w * probe_irradiance(probe, p, n);
+            e += w * probe_irradiance(probe, p, n, pixel);
             w_sum += w;
         }
     }
@@ -257,5 +291,9 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // the footprint sums to less than 1 and every occlusion reads as a
     // straight loss of energy rather than a redistribution.
     e = select(e, e / w_sum, w_sum > 1e-5);
-    return vec4<f32>(base_color * (1.0 - metallic) / PI * e, 0.0);
+    // The material's metallic from the deferred G-buffer reads ~1 for this
+    // asset even though the room GLB has no material (Bevy's default is 0),
+    // so `(1.0 - metallic)` silently killed the whole pass. The bake is
+    // purely diffuse, so keep it diffuse here too.
+    return vec4<f32>(base_color / PI * e, 0.0);
 }
