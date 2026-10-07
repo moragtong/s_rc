@@ -8,7 +8,10 @@
 //! Every frame, `shaders/blend_sh.wgsl` mixes the previous relight into the
 //! current one over the whole probe set, and `shade` reads that single buffer —
 //! the cross-fade it would otherwise do per SH coefficient costs the shade pass
-//! a second storage read 1.4 million times over.
+//! a second storage read 1.4 million times over. The two relights live on three
+//! rotating probe buffers, so a relight gathers into the one the blend will
+//! read at weight 0 next and the previous relight survives the swap: the role
+//! rotation replaces the copy that used to keep it.
 
 pub mod layout;
 
@@ -52,18 +55,33 @@ const HITS_PER_RAY: u64 = 4;
 /// Frames between two relights. The sun moves every frame, so this is the
 /// period the indirect light lags behind the direct light by.
 const RELIGHT_INTERVAL: u32 = 4;
+/// Which of the three rotating probe buffers plays each role, per
+/// [`Relight::phase`]. `A` is `blend_sh`'s `cur` operand (weight `alpha`, the
+/// freshest relight), `B` its `prev` operand (weight `1 - alpha`), and `G`
+/// the buffer the next gather overwrites. A relight therefore lands on the
+/// gather target, becomes `A` at weight 0 on that same frame, climbs with
+/// `alpha` through the interval, and hits weight 1 "by itself" on the next
+/// sync, when the swap turns it into `B`.
+const A_OF_PHASE: [usize; 3] = [0, 2, 1];
+const B_OF_PHASE: [usize; 3] = [1, 0, 2];
+const G_OF_PHASE: [usize; 3] = [2, 1, 0];
 
 pub struct Cascades2_5dPlugin;
 
-/// Where the frame counter sits in [`RELIGHT_INTERVAL`], and how far through
-/// the cross-fade the probes are: 0.0 on the frame they were rewritten,
-/// climbing to just under 1.0 before the next relight. `alpha` is written into
-/// `blend_sh`'s uniform, which is what makes the cross-fade a pre-pass over the
-/// probe set rather than a per-coefficient read in the fragment shader.
+/// Where the frame counter sits in [`RELIGHT_INTERVAL`], how far through the
+/// cross-fade the probes are (0.0 on the frame they were rewritten, climbing
+/// to just under 1.0 before the next relight), and which step of the
+/// three-way probe-buffer rotation the relights are on. `alpha` is written
+/// into `blend_sh`'s uniform, which is what makes the cross-fade a pre-pass
+/// over the probe set rather than a per-coefficient read in the fragment
+/// shader.
 #[derive(Resource, Clone, Copy)]
 pub struct Relight {
     pub interval: u32,
     pub alpha: f32,
+    /// Rotated on every relight, selecting which of the three probe buffers
+    /// the next gather overwrites and which two `blend_sh` reads this frame.
+    pub phase: u32,
 }
 
 impl Default for Relight {
@@ -71,6 +89,7 @@ impl Default for Relight {
         Self {
             interval: RELIGHT_INTERVAL,
             alpha: 0.0,
+            phase: 0,
         }
     }
 }
@@ -130,8 +149,10 @@ pub struct CascadesUniforms {
     pub hmap_res: UVec2,
     pub cascade_count: u32,
     pub hmap_top: f32,
+    pub split: f32,
     pub sun_toward: Vec3,
     pub sun_irradiance: Vec3,
+    pub sky_color: Vec4,
     pub cascades: [CascadeInfoUniform; layout::CASCADES as usize],
 }
 
@@ -154,10 +175,12 @@ struct CascadesPipeline {
 #[derive(Resource)]
 pub struct CascadesRenderData {
     pub rays_buffer: Buffer,
-    pub sh_probes_buffer: Buffer,
-    /// The previous relight's SH probes, mixed into `sh_probes_blend_buffer`
-    /// by `blend_sh` every frame.
-    pub sh_probes_prev_buffer: Buffer,
+    /// Three rotating SH probe buffers. Which holds the freshest relight, which
+    /// the last one and which is the next gather target follows [`Relight::phase`]
+    /// through [`A_OF_PHASE`], [`B_OF_PHASE`] and [`G_OF_PHASE`]; at each relight
+    /// `G` becomes `A`, `A` becomes `B` and `B` becomes `G`, so the fresh relight
+    /// fades in over the interval while the old one fades out - no copy.
+    pub sh_probes: [Buffer; 3],
     /// What `shade` reads: the cross-fade between the two relights, written
     /// once per frame over the whole probe set.
     pub sh_probes_blend_buffer: Buffer,
@@ -173,9 +196,11 @@ pub struct CascadesRenderData {
     pub common_bind_group: BindGroup,
     light_bind_group: BindGroup,
     trace_bind_group: BindGroup,
-    gather_bind_group: BindGroup,
+    /// One per rotation phase, writing into the phase's gather target.
+    gather_bind_groups: [BindGroup; 3],
     march_bind_group: BindGroup,
-    blend_bind_group: BindGroup,
+    /// One per rotation phase, reading the phase's `prev` and `cur` buffers.
+    blend_bind_groups: [BindGroup; 3],
 }
 
 /// Group 0, shared with the shading pass.
@@ -389,6 +414,31 @@ fn setup_pipelines(
     });
 }
 
+/// Radiance a probe ray records when it reaches open sky, in the same units
+/// as the sunlit surface radiance the bake stores (sun irradiance already
+/// scaled by the camera exposure). Override with S_RC_SKY="r,g,b" (linear).
+fn sky_color(sun_irradiance: Vec3) -> Vec4 {
+    if let Ok(value) = std::env::var("S_RC_SKY") {
+        let p: Vec<f32> = value
+            .split(',')
+            .map(|s| s.trim().parse::<f32>().unwrap_or(1.0))
+            .collect();
+        if p.len() >= 3 {
+            return Vec4::new(p[0], p[1], p[2], 1.0);
+        }
+    }
+    default_sky(sun_irradiance)
+}
+
+fn default_sky(sun_irradiance: Vec3) -> Vec4 {
+    Vec4::new(
+        sun_irradiance.x * 0.05,
+        sun_irradiance.y * 0.065,
+        sun_irradiance.z * 0.11,
+        1.0,
+    )
+}
+
 fn prepare_buffers(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
@@ -444,14 +494,17 @@ fn prepare_buffers(
             ..default()
         };
     }
+    let sky_color = sky_color(sun.irradiance);
     let uniforms = CascadesUniforms {
         hmap_min: heightmap.min_bounds,
         hmap_max: heightmap.max_bounds,
         hmap_res: heightmap.resolution,
         cascade_count: layout.cascades.len() as u32,
         hmap_top: heightmap.top,
+        split: crate::heightmap::SPLIT,
         sun_toward: sun.toward,
         sun_irradiance: sun.irradiance,
+        sky_color,
         cascades,
     };
     let mut bytes = encase::UniformBuffer::new(Vec::new());
@@ -464,8 +517,7 @@ fn prepare_buffers(
         .sum();
     let (
         rays_buffer,
-        sh_probes_buffer,
-        sh_probes_prev_buffer,
+        sh_probes,
         sh_probes_blend_buffer,
         subsamples_buffer,
         hits_buffer,
@@ -474,8 +526,7 @@ fn prepare_buffers(
     ) = match &existing {
             Some(e) => (
                 e.rays_buffer.clone(),
-                e.sh_probes_buffer.clone(),
-                e.sh_probes_prev_buffer.clone(),
+                e.sh_probes.clone(),
                 e.sh_probes_blend_buffer.clone(),
                 e.subsamples_buffer.clone(),
                 e.hits_buffer.clone(),
@@ -500,12 +551,17 @@ fn prepare_buffers(
                     .collect();
                 (
                     storage("cascades_rays", layout.hit_words, readback),
-                    storage(
-                        "cascades_sh_probes",
-                        probes * SH_STRIDE,
-                        readback | BufferUsages::COPY_SRC,
-                    ),
-                    storage("cascades_sh_probes_prev", probes * SH_STRIDE, readback),
+                    // Three rotating buffers: the roles (fresh/prev/gather)
+                    // follow Relight::phase, so none has a fixed meaning. The
+                    // gather overwrites one of them as `read_write`; the blend
+                    // reads two of them `read`. No COPY_SRC: there is no copy
+                    // anymore, the rotation moves the data by changing which
+                    // bind group the passes use.
+                    [
+                        storage("cascades_sh_probes_0", probes * SH_STRIDE, readback),
+                        storage("cascades_sh_probes_1", probes * SH_STRIDE, readback),
+                        storage("cascades_sh_probes_2", probes * SH_STRIDE, readback),
+                    ],
                     // Written by `blend_sh`, read by `shade`: no copy usage,
                     // it is never uploaded or read back.
                     storage("cascades_sh_probes_blend", probes * SH_STRIDE, BufferUsages::STORAGE),
@@ -588,35 +644,42 @@ fn prepare_buffers(
             hits_buffer.as_entire_binding(),
         )),
     );
-    let gather_bind_group = bind_group(
-        "cascades_gather",
-        &pipeline.gather_layout,
-        &BindGroupEntries::sequential((
-            rays_buffer.as_entire_binding(),
-            sh_probes_buffer.as_entire_binding(),
-            subsamples_buffer.as_entire_binding(),
-        )),
-    );
+    // One gather and one blend bind group per rotation phase. The gather
+    // writes the phase's G (next fresh relight); the blend reads the phase's
+    // B (prev) and A (cur) into the cross-fade buffer. Only the phase binds
+    // differ, so the dispatch just selects the right set for Relight::phase.
+    let gather_bind_groups = [0, 1, 2].map(|p| {
+        bind_group(
+            ["cascades_gather_p0", "cascades_gather_p1", "cascades_gather_p2"][p],
+            &pipeline.gather_layout,
+            &BindGroupEntries::sequential((
+                rays_buffer.as_entire_binding(),
+                sh_probes[G_OF_PHASE[p]].as_entire_binding(),
+                subsamples_buffer.as_entire_binding(),
+            )),
+        )
+    });
     let march_bind_group = bind_group(
         "cascades_march",
         &pipeline.march_layout,
         &BindGroupEntries::sequential((hits_buffer.as_entire_binding(),)),
     );
-    let blend_bind_group = bind_group(
-        "cascades_blend_sh",
-        &pipeline.blend_layout,
-        &BindGroupEntries::sequential((
-            sh_probes_prev_buffer.as_entire_binding(),
-            sh_probes_buffer.as_entire_binding(),
-            sh_probes_blend_buffer.as_entire_binding(),
-            blend_uniform_buffer.as_entire_binding(),
-        )),
-    );
+    let blend_bind_groups = [0, 1, 2].map(|p| {
+        bind_group(
+            ["cascades_blend_p0", "cascades_blend_p1", "cascades_blend_p2"][p],
+            &pipeline.blend_layout,
+            &BindGroupEntries::sequential((
+                sh_probes[B_OF_PHASE[p]].as_entire_binding(),
+                sh_probes[A_OF_PHASE[p]].as_entire_binding(),
+                sh_probes_blend_buffer.as_entire_binding(),
+                blend_uniform_buffer.as_entire_binding(),
+            )),
+        )
+    });
 
     commands.insert_resource(CascadesRenderData {
         rays_buffer,
-        sh_probes_buffer,
-        sh_probes_prev_buffer,
+        sh_probes,
         sh_probes_blend_buffer,
         hits_buffer,
         uniform_buffer,
@@ -625,9 +688,9 @@ fn prepare_buffers(
         common_bind_group,
         light_bind_group,
         trace_bind_group,
-        gather_bind_group,
+        gather_bind_groups,
         march_bind_group,
-        blend_bind_group,
+        blend_bind_groups,
     });
 }
 
@@ -710,19 +773,6 @@ fn dispatch_cascades(
         .unwrap();
     render_queue.write_buffer(&render_data.blend_uniform_buffer, 0, bytes.as_ref());
 
-    if relight_now {
-        // Keep the previous relight's probes for the cross-fade. Recorded ahead
-        // of the pass that overwrites them, since this runs before the gather in
-        // the same encoder.
-        render_context.command_encoder().copy_buffer_to_buffer(
-            &render_data.sh_probes_buffer,
-            0,
-            &render_data.sh_probes_prev_buffer,
-            0,
-            render_data.sh_probes_buffer.size(),
-        );
-    }
-
     let mut pass = render_context
         .command_encoder()
         .begin_compute_pass(&ComputePassDescriptor {
@@ -744,6 +794,15 @@ fn dispatch_cascades(
     }
 
     if relight_now {
+        // The rotation phase that just gathered. The gather overwrites this
+        // phase's `G` buffer; advancing the phase afterwards makes that buffer
+        // the new `A` (the `cur` `blend_sh` fades in at weight `alpha`), the
+        // old `A` the new `B` (fading out at `1 - alpha`), and the old `B` the
+        // next gather target. The fresh relight therefore enters at weight 0
+        // on its own frame and reaches weight 1 "by itself" at the next sync,
+        // when the swap has made it `prev` - the exact weights the copy
+        // produced, without the copy.
+        let phase = (relight.phase % 3) as usize;
         pass.set_pipeline(light);
         pass.set_bind_group(1, &render_data.light_bind_group, &[]);
         pass.dispatch_workgroups(
@@ -759,15 +818,21 @@ fn dispatch_cascades(
             pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
         }
 
-        pass.set_bind_group(1, &render_data.gather_bind_group, &[]);
+        pass.set_bind_group(1, &render_data.gather_bind_groups[phase], &[]);
         for (c, gather) in layout.layout.cascades.iter().zip(&gathers) {
             pass.set_pipeline(gather);
             pass.dispatch_workgroups((c.size.x * c.size.y).div_ceil(WORKGROUP), 1, 1);
         }
+
+        // G becomes A, A becomes B, B becomes G.
+        relight.phase = (relight.phase + 1).rem_euclid(3);
     }
 
-    // Last, so a relight frame blends against the probes it just gathered.
+    // A relight's blend runs against the phase its gather just rotated into,
+    // so it reads the fresh relight as `cur` at weight `alpha` and the last
+    // one as `prev` at `1 - alpha`.
+    let phase = (relight.phase % 3) as usize;
     pass.set_pipeline(blend);
-    pass.set_bind_group(1, &render_data.blend_bind_group, &[]);
+    pass.set_bind_group(1, &render_data.blend_bind_groups[phase], &[]);
     pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
 }

@@ -41,16 +41,29 @@ pub struct Heightmap {
 /// Ceiling height of columns with nothing above the split (open sky).
 pub const NO_CEILING: f32 = 1.0e4;
 /// The height the two bake cameras share, looking in opposite directions:
-/// below it is floor, above it is ceiling.
-pub const SPLIT: f32 = 5.0;
+/// below it is floor, above it is ceiling. Mid-height of the room: `room.glb`
+/// spans y -3.0..3.0 (interior -2.7..2.7), so the split has to sit inside that
+/// or one of the two cameras starts beyond the geometry and records nothing.
+pub const SPLIT: f32 = 0.0;
 /// Floor height of columns with nothing below the split.
 pub const EMPTY_FLOOR: f32 = SPLIT - 10.0;
 /// Near plane offset of both bake cameras from `SPLIT`, along the direction
-/// they face. Everything within this distance of the split is clipped away.
+/// they face. Everything within this distance of the plane is clipped away.
 pub const BAKE_NEAR: f32 = 0.05;
 /// Resolution along each axis. The map need not be square; it covers
 /// `MIN_BOUNDS`..`MAX_BOUNDS`, so its texels need not be either.
 pub const RESOLUTION: UVec2 = UVec2::new(512, 512);
+/// World extent the map covers, and therefore the metres per texel: 512² over
+/// 40x32 m is 0.078 m by 0.0625 m.
+///
+/// Left at Sponza's extent even though `room.glb` is only 20x20 m, because
+/// probe spacing is fixed at `SPACING0` = 1.0 m and every metre-defined reach
+/// (`escape_texel`'s 0.75 m, `spacing / 2`) is converted through this. Tightening
+/// the bounds to the room shrinks a texel to 0.0195 m, so the same 0.75 m walk
+/// spans 38 texels a ring instead of 9.6 — 16x the candidates — and that turned
+/// a 76 ms frame into 5 s. The room then fills a twelfth of the map and the rest
+/// is open sky, which is what Sponza's 159839 `EMPTY_FLOOR` texels already were.
+/// Lower `MIN_CEILING_HITS` instead; see its doc.
 pub const MIN_BOUNDS: Vec2 = Vec2::new(-20.0, -16.0);
 pub const MAX_BOUNDS: Vec2 = Vec2::new(20.0, 16.0);
 

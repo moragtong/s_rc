@@ -68,6 +68,31 @@ fn log_fps(mut frames: Local<Option<(std::time::Instant, u32)>>) {
     }
 }
 
+/// `S_RC_SUN=azimuth,elevation` in degrees: azimuth about world +Y measured
+/// from +Z, elevation above the horizon. Pins the sun so a state can be
+/// reproduced and A/B'd, which the 20 s sweep cannot be; the default matches
+/// `Transform::from_xyz(4, 8, 4).looking_at(ZERO, Y)`, az 45 el 54.7. Pair
+/// with `S_RC_SUN_STILL` to stop it sweeping off that mark.
+fn sun_transform() -> Transform {
+    let mut transform = Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y);
+    let Ok(value) = std::env::var("S_RC_SUN") else {
+        return transform;
+    };
+    let mut parts = value.split(',');
+    let parse = |part: Option<&str>, fallback: f32| {
+        part.and_then(|p| p.trim().parse::<f32>().ok())
+            .unwrap_or(fallback)
+    };
+    let azimuth = parse(parts.next(), 45.0).to_radians();
+    let elevation = parse(parts.next(), 54.7).to_radians();
+    // The light shines along -Z of its transform, so -Z becomes the direction
+    // of travel: down at `elevation`, swung round by `azimuth`. The sun the
+    // shaders use is the negation of that.
+    transform.rotation =
+        Quat::from_rotation_y(azimuth) * Quat::from_rotation_x(-elevation);
+    transform
+}
+
 /// One turn of the sun, in seconds. Fast enough that the four-frame relight
 /// interval shows: the direct light and its shadows move every frame while the
 /// probes catch up over the interval, which is the whole point of the
@@ -79,27 +104,46 @@ const SUN_SWEEP_PERIOD_SECS: f32 = 20.0;
 fn animate_sun(
     time: Res<Time>,
     mut frozen: Local<Option<bool>>,
+    mut printed: Local<Option<f32>>,
     mut lights: Query<&mut Transform, With<DirectionalLight>>,
 ) {
     if frozen.is_none() {
         *frozen = Some(std::env::var("S_RC_SUN_STILL").is_ok());
     }
-    if frozen.unwrap() {
-        return;
-    }
     let Ok(mut light) = lights.single_mut() else {
         return;
     };
-    // Pre-multiply so the sweep is about the world's up axis: the elevation
-    // stays put and only the azimuth moves.
-    let step = Quat::from_rotation_y(time.delta_secs() * std::f32::consts::TAU / SUN_SWEEP_PERIOD_SECS);
-    light.rotation = step * light.rotation;
+    if !frozen.unwrap() {
+        // Pre-multiply so the sweep is about the world's up axis: the elevation
+        // stays put and only the azimuth moves.
+        let step =
+            Quat::from_rotation_y(time.delta_secs() * std::f32::consts::TAU / SUN_SWEEP_PERIOD_SECS);
+        light.rotation = step * light.rotation;
+    }
+    // The sweep makes the sun position something you can see but not otherwise
+    // recover, so print it in the form `S_RC_SUN` accepts, once a second: at
+    // 20 s per turn that is 20 samples a revolution, and the line's timestamp
+    // puts any frame of the sweep within a degree or two of its position.
+    // Frozen runs print too, which is how a pinned run states its own pin.
+    let now = time.elapsed_secs();
+    if printed.is_none_or(|next| now >= next) {
+        *printed = Some(now + 1.0);
+        // The light travels along -Z of its transform, so the sun is the
+        // negation of that, and azimuth is measured about +Y from +Z.
+        let sun = -(light.rotation * Vec3::NEG_Z);
+        // +360 before the modulo so azimuth 0 comes out as `0` rather than
+        // `-0`, which would not round-trip through `S_RC_SUN`'s parser as
+        // written.
+        let azimuth = (sun.x.atan2(sun.z).to_degrees() + 360.0) % 360.0;
+        let elevation = sun.y.clamp(-1.0, 1.0).asin().to_degrees();
+        info!("S_RC_SUN={azimuth:.0},{elevation:.1}");
+    }
 }
 
 fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
     use bevy::world_serialization::WorldAssetRoot;
     let scene: Handle<bevy::world_serialization::WorldAsset> =
-        asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/Sponza/glTF/Sponza.gltf"));
+        asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/room.glb"));
     // The bake waits on this rather than guessing from a mesh count: until the
     // glTF and its dependencies have loaded there are no scene meshes at all,
     // and measuring then would bake an empty map.
@@ -116,7 +160,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         // Restricting the light to LIGHT_LAYER alone silently empties the
         // shadow map.
         RenderLayers::from_layers(&[SCENE_LAYER, LIGHT_LAYER]),
-        Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+        sun_transform(),
     ));
 
     commands.spawn((

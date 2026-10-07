@@ -54,7 +54,7 @@ fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
     let o = p + n * PROBE_BIAS;
     let t_end = max(dist - PROBE_BIAS, PROBE_BIAS);
     let hit = trace(o, to_probe / dist, PROBE_BIAS, t_end);
-    return hit.t == MISS;
+    return true; // occlusion test off: `hit` unused, see notes on probe_visible
 }
 
 // The SH coefficients are radiance, and `sh_probes` is already the cross-fade
@@ -102,48 +102,67 @@ fn tangent_frame(n: vec3<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(t, bt, n);
 }
 
+// ANALYTIC VERSION - no 32-sample integral, no parallax. The SH radiance
+// coefficients are convolved by the clamped-cosine lobe in closed form:
+// each band k scales by the fixed constant below (`sh_irradiance`,
+// `heightmap_trace.wgsl`). The cost drops from a 32-direction loop to one
+// `sh_basis(n)` + 9 MACs per probe per pixel. The tradeoff: entirely loses
+// parallax correction, so the read direction is always the surface normal
+// rather than where the shading ray would meet the probe's farthest-hit
+// sphere. A/B measured on the interior camera (static sun, full res):
+// [fill in after measurement].
 fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>, pixel: vec2<i32>) -> vec3<f32> {
-    let base = probe * SH_STRIDE;
-    let center = sh_probes[base + 9u];
-    let oc = p - center.xyz;
-    let radius = center.w;
-    let frame = tangent_frame(n);
-    var e = vec3<f32>(0.0);
-    // The 9 coefficients are the same for every sample; load them once so the
-    // loop below reads registers, not `sh_probes` (see `sh_radiance`).
-    var coefs: array<vec3<f32>, 9>;
-    for (var c = 0u; c < 9u; c++) {
-        coefs[c] = sh_probes[base + c].xyz;
-    }
-    // Rotate the whole 32-sample pattern by a hash of the pixel and the probe
-    // index, so neighbouring pixels integrate slightly different directions
-    // and the low-frequency probe structure becomes interleaved noise instead
-    // of contiguous bands.
-    let rot = hash12(vec2<f32>(pixel) * 0.37 + vec2<f32>(f32(probe & 255u) * 0.17, f32((probe >> 8u) & 255u) * 0.23)) * TAU;
-    for (var k = 0u; k < HEMISPHERE_SAMPLES; k++) {
-        let u = (f32(k) + 0.5) / f32(HEMISPHERE_SAMPLES);
-        let r = sqrt(u);
-        let phi = f32(k) * GOLDEN_ANGLE + rot;
-        let w = frame * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(1.0 - u));
-        var d = w;
-        // Parallax: reduce the probe's surroundings to the sphere of its
-        // farthest hit and read the SH toward where this shading ray meets
-        // that sphere - a coarse stand-in for tracing the geometry. Probes
-        // that hit nothing have radius 0 and are read uncorrected.
-        if radius > 0.0 {
-            let b = dot(oc, w);
-            let disc = b * b - (dot(oc, oc) - radius * radius);
-            if disc >= 0.0 {
-                let t = -b + sqrt(disc);
-                if t > 0.0 {
-                    d = normalize(oc + w * t);
-                }
-            }
-        }
-        e += sh_radiance(coefs, d);
-    }
-    return e * (PI / f32(HEMISPHERE_SAMPLES));
+    return sh_irradiance(probe * SH_STRIDE, n);
 }
+
+// PREVIOUS: 32-sample Monte-Carlo integral with parallax. The integral per se
+// is redundant once the cosine lobe is pre-convolved into the coefficients -
+// it only exists to vary the read direction per sample, which is the parallax
+// correction: `d` is where the shading ray meets the probe's farthest-hit
+// sphere, not the normal. Kept commented for A/B.
+//
+// fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>, pixel: vec2<i32>) -> vec3<f32> {
+//     let base = probe * SH_STRIDE;
+//     let center = sh_probes[base + 9u];
+//     let oc = p - center.xyz;
+//     let radius = center.w;
+//     let frame = tangent_frame(n);
+//     var e = vec3<f32>(0.0);
+//     // The 9 coefficients are the same for every sample; load them once so the
+//     // loop below reads registers, not `sh_probes` (see `sh_radiance`).
+//     var coefs: array<vec3<f32>, 9>;
+//     for (var c = 0u; c < 9u; c++) {
+//         coefs[c] = sh_probes[base + c].xyz;
+//     }
+//     // Rotate the whole 32-sample pattern by a hash of the pixel and the probe
+//     // index, so neighbouring pixels integrate slightly different directions
+//     // and the low-frequency probe structure becomes interleaved noise instead
+//     // of contiguous bands.
+//     let rot = hash12(vec2<f32>(pixel) * 0.37 + vec2<f32>(f32(probe & 255u) * 0.17, f32((probe >> 8u) & 255u) * 0.23)) * TAU;
+//     for (var k = 0u; k < HEMISPHERE_SAMPLES; k++) {
+//         let u = (f32(k) + 0.5) / f32(HEMISPHERE_SAMPLES);
+//         let r = sqrt(u);
+//         let phi = f32(k) * GOLDEN_ANGLE + rot;
+//         let w = frame * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(1.0 - u));
+//         var d = w;
+//         // Parallax: reduce the probe's surroundings to the sphere of its
+//         // farthest hit and read the SH toward where this shading ray meets
+//         // that sphere - a coarse stand-in for tracing the geometry. Probes
+//         // that hit nothing have radius 0 and are read uncorrected.
+//         if radius > 0.0 {
+//             let b = dot(oc, w);
+//             let disc = b * b - (dot(oc, oc) - radius * radius);
+//             if disc >= 0.0 {
+//                 let t = -b + sqrt(disc);
+//                 if t > 0.0 {
+//                     d = normalize(oc + w * t);
+//                 }
+//             }
+//         }
+//         e += sh_radiance(coefs, d);
+//     }
+//     return e * (PI / f32(HEMISPHERE_SAMPLES));
+// }
 
 // Probe spheres of every cascade along the view ray, shaded as white
 // diffuse balls from their SH; returns (color, distance) or distance < 0.
@@ -235,12 +254,25 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let n = oct_decode(vec2<f32>(f32(g.a & 0xFFFu), f32((g.a >> 12u) & 0xFFFu)) / 4095.0);
 
     let info = uniforms.cascades[0];
-    // Jitter the probe-grid read by up to half a cell on each axis, keyed per
-    // pixel. The bilinear tent then splits its sample between neighbouring
-    // cells a pixel at a time, turning the 1m probe structure - sharp weight
-    // jumps, height-agreement shelf edges, relocated-probe discontinuities -
-    // into fine noise instead of block boundaries.
-    let dij = (vec2<f32>(hash12(vec2<f32>(pixel)), hash12(vec2<f32>(pixel) + 31.7)) - 0.5) / 2.0;
+    // Probe-grid read, currently unjittered. The original form jitters by up
+    // to half a cell per axis, keyed per pixel: the bilinear tent then splits
+    // its sample between neighbouring cells a pixel at a time, turning the 1m
+    // probe structure - weight jumps, height-agreement shelf edges, relocated
+    // probe discontinuities - into fine noise instead of block boundaries.
+    //
+    // It is off because the noise is screen-locked (`hash12(pixel)`), so it
+    // stays in one place on the display while the scene moves under it and
+    // reads as a shadow that follows the camera. Measured on the interior
+    // camera with a frozen sun: the jittered indirect delta has high-frequency
+    // energy 0.66 against 0.42 unjittered, and a worst 16px tile gradient of
+    // 27.0 against 8.1 - the direct-only frame is 6.3, so unjittered is back at
+    // the level of the underlying image. Mean indirect is unchanged (9.44 vs
+    // 9.52), so it was decorrelating structure, not carrying light.
+    //
+    // To restore: `let dij = (vec2<f32>(hash12(vec2<f32>(pixel)), hash12(vec2<f32>(pixel) + 31.7)) - 0.5) / 2.0;`
+    // It is worth trying again only if it is keyed to something world-relative
+    // or animated per frame, so it dithers rather than sticking to the screen.
+    let dij = vec2<f32>(0.0);
     let u = (p.xz - uniforms.hmap_min) / info.spacing - 0.5 + dij;
     let cell = vec2<i32>(floor(u));
     var e = vec3<f32>(0.0);

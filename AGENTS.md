@@ -2,7 +2,20 @@
 
 Handoff for whoever picks this up next. Delete freely — the git history carries
 the reasoning. Kept short on purpose; ARCHITECTURE.md and EXPLAINED.md were
-dropped before because they outlived the code they described.
+drawn up by the same people who let old handoff notes drift. AGENTS.md is read
+and (usually) updated by the assistant each session, so keep asking "is this
+still true?".
+
+## Workstyle
+
+**Never delete machinery to turn it off.** When the user asks to disable
+something, comment it out and write a comment explaining why it is off and
+what would put it back. The git history is a one-way rescue: a committed diff
+survives, but anything deleted locally with the working tree uncommitted is
+gone. That bit us with `stencil_touches_solid`, the caps, and the probe lift —
+all had to be re-derived. Same for alternative implementations: keep the
+previous one commented next to the new one with the measurement that decided
+it, and delete freely once it is committed.
 
 ## What this is
 
@@ -59,6 +72,12 @@ comes out 0% and every count looks like noise.
   `S_RC_PROBES=1` also changes pixels, so keep it off for A/B shots.
 
 ## State
+
+**Planned (not yet done):** the user wants every probe placed exactly mid-way
+between its column's floor and ceiling heights as stored in the heightmap.
+Currently `probe_position` sits probes on the bake plane at `uniforms.split`;
+the lift/escape machinery is commented out in `heightmap_trace.wgsl`. When this
+is implemented, keep the old placement commented next to it.
 
 Uncommitted working tree. The inside-wall test is now **derived from the two
 stored normals** instead of a dedicated channel, and the cap machinery is gone.
@@ -460,8 +479,12 @@ through the existing `common_bind_group`.
 Three things are in now: the ray march runs **once** into `hits_buffer`
 (`march_hits.wgsl`, and `cascades2_5d.wgsl` reads hits instead of tracing);
 light/trace/gather relight every `RELIGHT_INTERVAL = 4` frames; and the sun
-sweeps on a 20 s period (`animate_sun`, `S_RC_SUN_STILL` freezes it). A double
-buffer of SH probes cross-fades the gap.
+sweeps on a 20 s period (`animate_sun`, `S_RC_SUN_STILL` freezes it). Three
+rotating SH probe buffers cross-fade the gap: each relight gathers into the
+phase's `G`, and the phase advance makes `G`→`A`, `A`→`B`, `B`→`G` via the
+`A_OF_PHASE`/`B_OF_PHASE`/`G_OF_PHASE` tables, so no relight is ever copied -
+the fresh one enters the blend at weight 0, climbs to 0.25/0.5/0.75, and hits
+1 "by itself" on the next sync when the swap turns it into `prev`.
 
 **`S_RC_INDIRECT`, `S_RC_PROBES` and `S_RC_OVERLAY` used to do nothing unless
 `S_RC_SCREENSHOT` was also set.** They are read on frame 2 unconditionally now.

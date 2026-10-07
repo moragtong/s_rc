@@ -28,11 +28,17 @@ struct Uniforms {
     cascade_count: u32,
     // Highest surface in the map; rays climbing above it can't hit.
     hmap_top: f32,
+    // The bake plane (SPLIT): the height probes sit at now that the lift is
+    // disabled.
+    split: f32,
     // Unit vector toward the sun.
     sun_toward: vec3<f32>,
     // Sun irradiance, already multiplied by the camera exposure, so every
     // radiance here is in the same units as the main pass's output.
     sun_irradiance: vec3<f32>,
+    // Radiance a probe ray stores when it hits nothing: the open sky. Enters
+    // the same bilinear merge as surface radiance, no special casing.
+    sky_color: vec4<f32>,
     cascades: array<CascadeInfo, 4>,
 }
 
@@ -72,14 +78,25 @@ const RELOCATE_MIN_RADIUS: f32 = 0.75;
 // turn a few centimetres of overshoot into a huge sideways leap.
 const PROBE_NORMAL_MIN_Y: f32 = 0.2;
 
-/// Vertical tolerance of a probe footprint, in units of cascade spacing.
 // Height tolerance between a probe's own height and the shaded pixel's, as a
-// multiple of the cascade's spacing. Cascade-0 spacing is ~0.078 m, so 0.5 puts
-// the cutoff at ~0.04 m. A probe is either at the pixel's height or it is
-// somewhere else entirely: on another storey, or inside a wall whose column
-// floor is the ground floor. There is no useful middle ground between the two,
-// which is why this is a cutoff rather than a falloff.
-const HEIGHT_TOLERANCE_SPACING: f32 = 2.0;
+// multiple of the cascade's spacing. Cascade-0 spacing is 1.0 m, so this is a
+// 3.0 m tolerance - wider than the 2.7 m from the probe plane to the floor or
+// the ceiling, which is what the room needs: every probe sits at
+// `uniforms.split` (see `probe_position`), so a pixel on the floor or the
+// ceiling is a full 2.7 m away from every probe that can light it.
+//
+// At 2.0 the cutoff fell inside the room and the whole floor and ceiling lost
+// indirect light: 47.8% of the scene's pixels came back with zero contribution
+// and the top and bottom of the frame read as flat slices. At 3.0 that is 0.6%
+// and no band edges survive. The lower bound on the tolerance is therefore
+// the height of the space, not the cascade's cell size.
+//
+// The cutoff itself is unchanged: past the tolerance a probe contributes
+// nothing at all rather than fading, because a probe on another storey - or
+// inside a wall whose column floor is the ground floor - must not keep a small
+// nonzero share when the four probes of a footprint renormalise against each
+// other. This is a cutoff, not a falloff; only its width moved.
+const HEIGHT_TOLERANCE_SPACING: f32 = 3.0;
 
 // Fraction of the tolerance over which the cutoff fades, to avoid aliasing.
 const HEIGHT_CUTOFF_SHOULDER: f32 = 0.85;
@@ -126,70 +143,13 @@ fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
     let info = uniforms.cascades[c];
     let s = info.spacing;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
-    let t0 = texel_at(xz);
-
-    // Nudge out of the wall the bake recorded this column inside, before the
-    // lift: the lift measures the column's floor and ceiling, so relocating
-    // first is what makes the probe end up in the air it was moved into rather
-    // than at the same height inside the material it left.
-    //
-    // How far it may look depends on the cascade. Each one gathers from its own
-    // `interval.x` outward - 0, 1, 2, 4 m - so a coarse cascade's rays start
-    // beyond a wall that cascade-0's still run into, and it can afford to send
-    // the probe further to clear it. Half a spacing caps the reach, because
-    // past that the probe has left the bilinear footprint that reads it and is
-    // dropped for being adrift rather than for being buried.
-    let reach = max(RELOCATE_MIN_RADIUS, min(info.interval.x, 0.5 * s));
-    let ring = max(i32(ceil(reach / min(cell_size().x, cell_size().y))), 1);
-    let t = escape_texel(t0, lifted_height(t0), ring);
-
-    // A probe that moved is read at its new position, so it goes there. One
-    // that did not keeps its grid position to the millimetre: snapping every
-    // probe to a texel centre would shift the whole field by up to half a
-    // texel and change the image for no reason.
-    var xz_out = xz;
-    if any(t != t0) {
-        xz_out = uniforms.hmap_min + (vec2<f32>(t) + 0.5) * cell_size();
-    }
-
-    let h = textureLoad(heightmap, vec2<u32>(t), 0).xy;
-    let lift = clamp(0.5 * (h.x - h.y), PROBE_MIN_LIFT, PROBE_MAX_LIFT);
-    let nominal = h.y + lift;
-    let p = vec3<f32>(xz_out.x, nominal, xz_out.y);
-
-    let n_ceiling = textureLoad(ceiling_normal, vec2<u32>(t), 0).xyz;
-    let n_floor = textureLoad(floor_normal, vec2<u32>(t), 0).xyz;
-    // A zero normal is how the bake marks a texel it found no surface in, and
-    // those columns keep their sentinel height. There is no surface there to
-    // push out of, so relocation has to leave them alone: with an empty floor
-    // at EMPTY_FLOOR the lift clamp would otherwise fire on every one of them.
-    let has_ceiling = dot(n_ceiling, n_ceiling) > 0.5;
-    let has_floor = dot(n_floor, n_floor) > 0.5;
-    if !has_floor || !has_ceiling {
-        return p;
-    }
-
-    // Solid is everything outside (h.y, h.x); the interval itself is the open
-    // column. PROBE_MIN_LIFT can push the nominal position straight through a
-    // thin ceiling - a column 5 cm tall still gets lifted 10 cm - which parks
-    // the probe inside the surface meant to bound it, and a probe inside
-    // solid gathers the light of whatever it is buried in.
-    let d_floor = nominal - h.y;
-    let d_ceiling = h.x - nominal;
-    if d_floor >= 0.0 && d_ceiling >= 0.0 {
-        return p;
-    }
-
-    // Buried: leave along the normal of the nearer of the two surfaces, which
-    // is the one whose solid the probe is inside. Both stored normals already
-    // point out of their surface into the open column - the ceiling's is
-    // negated at bake time so that it points down - so the same expression
-    // works for either branch.
-    let n = select(n_floor, n_ceiling, d_ceiling < d_floor);
-    let overshoot = max(-d_ceiling, -d_floor) + PROBE_SURFACE_EPS;
-    // |n.y| is the fraction of that distance that goes into Y, so the push
-    // lands exactly PROBE_SURFACE_EPS clear of the surface whatever its tilt.
-    return p + n * (overshoot / max(abs(n.y), PROBE_NORMAL_MIN_Y));
+    // Every probe sits on the bake plane now: no relocation out of a buried
+    // column, no lift off the floor, no burial push. The lift and the escape
+    // search both read surfaces off a floor/ceiling map, which is the
+    // machinery this experiment is removing; `escape_texel`, `lifted_height`
+    // and the constants they use stay in the module, unreferenced, so the
+    // original placement is one function's worth of code away.
+    return vec3<f32>(xz.x, uniforms.split, xz.y);
 }
 
 // The grid is top-down but each probe is lifted off its own column's floor, so
@@ -427,6 +387,14 @@ fn trace(o: vec3<f32>, d: vec3<f32>, t_start: f32, t_end: f32) -> Hit {
         if y_in >= h.x {
             hit.t = t;
             hit.ceiling = true;
+            return hit;
+        }
+        // A solid column is material between its floor and ceiling, not the
+        // open air a wall's [top, bottom] interval reads as. Block rays that
+        // cross the band, at the face they entered through.
+        if is_solid(texel) {
+            hit.t = t;
+            hit.ceiling = false;
             return hit;
         }
         if d.y < 0.0 {

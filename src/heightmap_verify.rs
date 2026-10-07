@@ -125,22 +125,6 @@ fn request(
         false,
         heightmap.albedo_max.clone(),
     );
-    spawn(
-        &mut commands,
-        "radiance_min",
-        0,
-        16,
-        false,
-        heightmap.radiance_min.clone(),
-    );
-    spawn(
-        &mut commands,
-        "radiance_max",
-        0,
-        16,
-        false,
-        heightmap.radiance_max.clone(),
-    );
     // The winding map is the one channel written by the CPU rather than by a
     // compute pass, so it is the only one whose readback is checking that a
     // Rust routine ran at all rather than that a shader compiled. Whole-image
@@ -155,21 +139,84 @@ fn request(
     );
 }
 
+#[derive(Component)]
+struct Radiance;
+
+/// `S_RC_DUMP_RADIANCE_MIN` / `S_RC_DUMP_RADIANCE_MAX`: the sunlit outgoing
+/// radiance the cascade rays read at their hits, i.e. the bounce the probes
+/// gather. Deliberately *not* part of `request` — the surface light pass has
+/// not run on the frame the bake verifies, so a readback taken there reports
+/// zero for every texel, which is what happened when these shared `request`'s
+/// spawn. It waits instead for the pass to have run several times.
+fn request_radiance(
+    mut commands: Commands,
+    heightmap: Res<Heightmap>,
+    bake_done: Res<BakeState>,
+    done: Query<(), With<Radiance>>,
+    mut frames: Local<u32>,
+) {
+    let want_min = std::env::var("S_RC_DUMP_RADIANCE_MIN").is_ok();
+    let want_max = std::env::var("S_RC_DUMP_RADIANCE_MAX").is_ok();
+    if (!want_min && !want_max) || !done.is_empty() || !bake_done.is_verified() {
+        return;
+    }
+    // Several relights, so the map is settled rather than mid-cross-fade.
+    *frames += 1;
+    if *frames < 8 {
+        return;
+    }
+    let mut spawn = |commands: &mut Commands, tag: &'static str, handle: Handle<Image>| {
+        commands
+            .spawn((
+                Radiance,
+                Probe {
+                    tag,
+                    chan: 0,
+                    bytes_per_texel: 16,
+                    report: false,
+                },
+            ))
+            .observe(report_event)
+            .insert(Readback::texture(handle));
+    };
+    if want_min {
+        spawn(
+            &mut commands,
+            "radiance_min",
+            heightmap.radiance_min.clone(),
+        );
+    }
+    if want_max {
+        spawn(
+            &mut commands,
+            "radiance_max",
+            heightmap.radiance_max.clone(),
+        );
+    }
+    info!("requesting radiance readback after {} relit frames", *frames);
+}
+
 fn report_event(trigger: On<ReadbackComplete>, mut commands: Commands, probes: Query<&Probe>) {
     let Ok(probe) = probes.get(trigger.entity) else {
         return;
     };
-    if !probe.report {
-        return;
-    }
     // Dump the whole image for whichever tag the caller named, so a channel can
     // be examined off the GPU without a bespoke probe: `S_RC_DUMP_HEIGHT`,
     // `S_RC_DUMP_META_MIN`, `S_RC_DUMP_META_MAX`, `S_RC_DUMP_ALBEDO_MIN`...
     // One write per tag: every tag is read back once per channel, and the
     // channel only selects which float the stats below read.
-    if probe.chan == 0
-        && let Ok(path) = std::env::var(format!("S_RC_DUMP_{}", probe.tag.to_uppercase()))
-    {
+    let dump = if probe.chan == 0 {
+        std::env::var(format!("S_RC_DUMP_{}", probe.tag.to_uppercase())).ok()
+    } else {
+        None
+    };
+    // The radiance channels are read back only to be able to dump them: their
+    // stats say nothing about bake completion, so they stay quiet unless asked
+    // for. Everything else reports unconditionally.
+    if !probe.report && dump.is_none() {
+        return;
+    }
+    if let Some(path) = dump {
         match std::fs::write(&path, &trigger.data) {
             Ok(()) => info!("wrote {} dump ({path})", probe.tag),
             Err(e) => warn!("{} dump failed: {e}", probe.tag),
@@ -277,6 +324,7 @@ impl Plugin for HeightmapVerifyPlugin {
         app.init_resource::<Verdict>()
             .init_resource::<GaveUp>()
             .add_systems(Update, request)
+            .add_systems(Update, request_radiance)
             .add_systems(Update, verdict.after(request));
     }
 }

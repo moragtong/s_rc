@@ -54,7 +54,9 @@ fn cascade(c: u32, id: u32) {
     let d = cell_direction(ray, side);
 
     if c + 1u >= uniforms.cascade_count {
-        var out = vec4<f32>(0.0, 0.0, 0.0, MISS);
+        // A ray that hit nothing reached the open sky: store its radiance in
+        // the MISS slot so the parent merges treat it like any other surface.
+        var out = vec4<f32>(uniforms.sky_color.rgb, MISS);
         let e = hit_at(info.ray_base + id, 0u);
         let t = hit_t(e);
         if t != MISS {

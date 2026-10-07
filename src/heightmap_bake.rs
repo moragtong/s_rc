@@ -55,10 +55,17 @@ const WORKGROUP: u32 = 8;
 const BAKE_FRAMES: u32 = 8;
 /// Attempts before we give up and leave the map as it is rather than loop.
 const MAX_BAKE_ATTEMPTS: u32 = 8;
-/// Ceiling texels a bake must fill to count as real. Sponza bakes 102226 of
-/// 262144 and a failed attempt fills 0, so this sits in a wide gap between the
-/// two and also rejects a mostly-empty partial.
-const MIN_CEILING_HITS: u32 = 60_000;
+/// Ceiling texels a bake must fill to count as real, and a failed attempt
+/// fills 0, so any value in that gap also rejects a mostly-empty partial.
+///
+/// Dropped from 60000 for `room.glb`: the room is 10x10 m inside Sponza's
+/// 40x32 m bounds, so at 0.078 x 0.0625 m per texel its ceiling covers ~95 m²
+/// and lands around 19500 hits — under the Sponza threshold, which would have
+/// burned all eight attempts on a bake that was correct. 10000 keeps a factor
+/// of two of headroom below that while staying far above the 0 of an empty
+/// attempt. Raising this again alongside tighter bounds is the mistake the
+/// metre-per-texel note in `heightmap.rs` warns about.
+const MIN_CEILING_HITS: u32 = 10_000;
 
 /// Which half of the split a bake camera looks at. Extracted so the render
 /// world can tell the two bake views apart from the main camera.
