@@ -39,8 +39,8 @@ BEVY_ASSET_ROOT=$PWD S_RC_CAM="-10.58,4.86,-3.21,-1.17,8.18,-3.83" \
 # S_RC_SCREENSHOT=/tmp/x.png    also exits at frame 240
 # Dump any baked image whole, to poke at it in numpy:
 #   S_RC_DUMP_HEIGHT=/tmp/h.bin     Rg32Float  512x512x2, **x = ceiling, y = floor**
-#   S_RC_DUMP_META_MIN=/tmp/m.bin   Rgba32Float, xyz = ceiling normal, negated
-#   S_RC_DUMP_META_MAX=/tmp/m.bin   Rgba32Float, xyz = floor normal, not negated
+#   S_RC_DUMP_META_MIN=/tmp/m.bin   Rgba32Float, xyz = ceiling normal, true world-space
+#   S_RC_DUMP_META_MAX=/tmp/m.bin   Rgba32Float, xyz = floor normal, true world-space
 ```
 
 Dumps are row-major, so numpy indexes them `[z][x]`, the opposite of the shader's
@@ -88,8 +88,9 @@ stored normals** instead of a dedicated channel, and the cap machinery is gone.
 rasterise backfaces: a column in open air records the surface its ray *lands* on
 (floor up, ceiling down), while a column that starts inside material records the
 surface it *leaves* through — the underside going down, the top going up, both
-facing away from the split. The bake negates the ceiling normal so both channels
-land on the same sign. `Heightmap::solid`, its bind-group slot and its bind-group
+facing away from the split. The metadata holds the true world-space normals
+(no negation), so a buried column is the inverted pair: ceiling up, floor
+down. `Heightmap::solid`, its bind-group slot and its bind-group
 entry are deleted; `src/bake_caps.rs` is deleted with them.
 
 Measured on Sponza, no caps:

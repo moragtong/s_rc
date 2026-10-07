@@ -178,7 +178,7 @@ fn escape_texel_xz(origin: vec2<i32>) -> vec2<i32> {
             c[2] = origin + vec2<i32>(-r, i);
             c[3] = origin + vec2<i32>(r, i);
             for (var k = 0; k < 4; k = k + 1) {
-                if (!column_buried(c[k])) {
+                if (!is_solid(c[k])) {
                     let dx = f32(c[k].x - origin.x) * cell.x;
                     let dz = f32(c[k].y - origin.y) * cell.y;
                     let d2 = dx * dx + dz * dz;
@@ -416,8 +416,13 @@ fn column_buried(texel: vec2<i32>) -> bool {
         return false;
     }
     let t = vec2<u32>(texel);
-    return textureLoad(ceiling_normal, t, 0).y < BURIED_MIN_Y
-        || textureLoad(floor_normal, t, 0).y < BURIED_MIN_Y;
+    let c = textureLoad(ceiling_normal, t, 0).xyz;
+    let f = textureLoad(floor_normal, t, 0).xyz;
+    // True (unnegated) normals: an open column records its surfaces as the
+    // ray lands on them (floor up, ceiling down); a column that starts inside
+    // material records the surfaces it leaves through (ceiling up, floor
+    // down) - the inverted pair is the wall signature.
+    return c.y > 0.5 || f.y < -0.5;
 }
 
 fn height_agreement(dy: f32, spacing: f32) -> f32 {

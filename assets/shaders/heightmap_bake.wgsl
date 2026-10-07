@@ -157,7 +157,7 @@ fn bake(@builtin(global_invocation_id) id: vec3<u32>) {
     textureStore(heights, t, vec4<f32>(ceiling.height, floor.height, 0.0, 0.0));
     // A zero normal is how surface_light.wgsl and the cascades tell a texel
     // apart from one the bake found nothing in.
-    textureStore(ceiling_normal, t, vec4<f32>(select(zero, -ceiling.normal, ceiling.hit), 0.0));
+    textureStore(ceiling_normal, t, vec4<f32>(select(zero, ceiling.normal, ceiling.hit), 0.0));
     textureStore(floor_normal, t, vec4<f32>(select(zero, floor.normal, floor.hit), 0.0));
     textureStore(ceiling_albedo, t, vec4<f32>(select(zero, ceiling.albedo, ceiling.hit), 0.0));
     textureStore(floor_albedo, t, vec4<f32>(select(zero, floor.albedo, floor.hit), 0.0));
