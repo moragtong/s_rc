@@ -157,14 +157,21 @@ fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
     let cell = cell_size();
     let escape_xz = (vec2<f32>(escape) + 0.5) * cell + uniforms.hmap_min;
     let p_xz = select(xz, escape_xz, !all(origin == escape));
-    return vec3<f32>(p_xz.x, uniforms.split, p_xz.y);
+    // Sit exactly halfway between the column's stored floor and ceiling
+    // rather than on the bake plane. Columns with no recorded split region
+    // (open sky, empty floor) fall back to the plane.
+    let h = textureLoad(heightmap, vec2<u32>(escape), 0).xy;
+    let mid = 0.5 * (h.x + h.y);
+    let usable = h.x < 5000.0 && h.y > -1000.0 && (h.x - h.y) > 0.0;
+    let y = select(uniforms.split, mid, usable);
+    return vec3<f32>(p_xz.x, y, p_xz.y);
 }
 
 // The open column nearest to `origin` in the horizontal plane. Used as the
 // lateral when a buried probe is moved sideways rather than lifted. Mirrors
 // `escape_texel` but the score is XZ distance only.
 fn escape_texel_xz(origin: vec2<i32>) -> vec2<i32> {
-    if !column_buried(origin) {
+    if !is_solid(origin) {
         return origin;
     }
     let cell = cell_size();
