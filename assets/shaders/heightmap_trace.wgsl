@@ -149,13 +149,48 @@ fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
     let info = uniforms.cascades[c];
     let s = info.spacing;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
-    // Every probe sits on the bake plane now: no relocation out of a buried
-    // column, no lift off the floor, no burial push. The lift and the escape
-    // search both read surfaces off a floor/ceiling map, which is the
-    // machinery this experiment is removing; `escape_texel`, `lifted_height`
-    // and the constants they use stay in the module, unreferenced, so the
-    // original placement is one function's worth of code away.
-    return vec3<f32>(xz.x, uniforms.split, xz.y);
+    // Buried probe: move sideways to the nearest open column rather than
+    // tossing its contribution. Height stays on the bake plane - no lift -
+    // so only the XZ changes, and the score is horizontal distance only.
+    let origin = texel_at(xz);
+    let escape = escape_texel_xz(origin);
+    let cell = cell_size();
+    let escape_xz = (vec2<f32>(escape) + 0.5) * cell + uniforms.hmap_min;
+    let p_xz = select(xz, escape_xz, !all(origin == escape));
+    return vec3<f32>(p_xz.x, uniforms.split, p_xz.y);
+}
+
+// The open column nearest to `origin` in the horizontal plane. Used as the
+// lateral when a buried probe is moved sideways rather than lifted. Mirrors
+// `escape_texel` but the score is XZ distance only.
+fn escape_texel_xz(origin: vec2<i32>) -> vec2<i32> {
+    if !is_solid(origin) {
+        return origin;
+    }
+    let cell = cell_size();
+    var best = origin;
+    var best_d = -1.0;
+    for (var r = 1; r <= 16; r = r + 1) {
+        for (var i = -r; i <= r; i = i + 1) {
+            var c: array<vec2<i32>, 4>;
+            c[0] = origin + vec2<i32>(i, -r);
+            c[1] = origin + vec2<i32>(i, r);
+            c[2] = origin + vec2<i32>(-r, i);
+            c[3] = origin + vec2<i32>(r, i);
+            for (var k = 0; k < 4; k = k + 1) {
+                if (!is_solid(c[k])) {
+                    let dx = f32(c[k].x - origin.x) * cell.x;
+                    let dz = f32(c[k].y - origin.y) * cell.y;
+                    let d2 = dx * dx + dz * dz;
+                    if (best_d < 0.0 || d2 < best_d) {
+                        best_d = d2;
+                        best = c[k];
+                    }
+                }
+            }
+        }
+    }
+    return best;
 }
 
 // One of the segments `march_hits.wgsl` stored for a ray: where it started and
