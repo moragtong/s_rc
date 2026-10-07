@@ -712,6 +712,11 @@ fn dispatch_cascades(
     mut render_context: RenderContext,
     mut frame: Local<u32>,
     mut marched: Local<bool>,
+    // The one-shot march records segment geometry at march time; changing the
+    // toggle silently invalidates that cache, so record the value it saw and
+    // invalidate when it differs from the current uniform.
+    mut marched_parallax: Local<Option<bool>>,
+    parallax: Res<ParallaxState>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
         return;
@@ -745,6 +750,10 @@ fn dispatch_cascades(
     // to retry rewrites the heightmap underneath it, so an unverified map
     // invalidates the stored hits and sends the march back through.
     let verified = bake.as_ref().is_some_and(|b| b.is_verified());
+    if *marched_parallax != Some(parallax.enabled) {
+        *marched = false;
+        *marched_parallax = Some(parallax.enabled);
+    }
     let need_march = !*marched;
     if need_march && !verified {
         return;
