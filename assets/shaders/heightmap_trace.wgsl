@@ -164,7 +164,7 @@ fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
 // lateral when a buried probe is moved sideways rather than lifted. Mirrors
 // `escape_texel` but the score is XZ distance only.
 fn escape_texel_xz(origin: vec2<i32>) -> vec2<i32> {
-    if !is_solid(origin) {
+    if !column_buried(origin) {
         return origin;
     }
     let cell = cell_size();
@@ -178,7 +178,7 @@ fn escape_texel_xz(origin: vec2<i32>) -> vec2<i32> {
             c[2] = origin + vec2<i32>(-r, i);
             c[3] = origin + vec2<i32>(r, i);
             for (var k = 0; k < 4; k = k + 1) {
-                if (!is_solid(c[k])) {
+                if (!column_buried(c[k])) {
                     let dx = f32(c[k].x - origin.x) * cell.x;
                     let dz = f32(c[k].y - origin.y) * cell.y;
                     let d2 = dx * dx + dz * dz;
@@ -403,6 +403,21 @@ fn escape_texel(origin: vec2<i32>, y: f32, ring: i32) -> vec2<i32> {
 // here.
 fn probe_buried(p: vec3<f32>) -> bool {
     return is_solid(texel_at(p.xz));
+}
+
+// The buried-in-wall test as the normals used to provide it: one of the two
+// stored bake normals pointing down-ish says the column either ends or starts
+// inside material at the split. `is_solid` stayed winding-only for `trace` /
+// `probe_visible` / `probe_buried`; the probe nudge is the one consumer that
+// still wants the normals.
+fn column_buried(texel: vec2<i32>) -> bool {
+    let dims = textureDimensions(ceiling_normal);
+    if (texel.x < 0 || texel.y < 0 || texel.x >= i32(dims.x) || texel.y >= i32(dims.y)) {
+        return false;
+    }
+    let t = vec2<u32>(texel);
+    return textureLoad(ceiling_normal, t, 0).y < BURIED_MIN_Y
+        || textureLoad(floor_normal, t, 0).y < BURIED_MIN_Y;
 }
 
 fn height_agreement(dy: f32, spacing: f32) -> f32 {
