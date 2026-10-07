@@ -9,7 +9,9 @@
 // cascades, which is what makes relighting cheap enough to run on its own
 // schedule.
 
-#import s_rc::heightmap_trace::{uniforms, probe_position, cell_direction, MISS}
+#import s_rc::heightmap_trace::{
+    uniforms, probe_position, cell_direction, stored_segment, MISS,
+}
 
 @group(1) @binding(0) var radiance_min: texture_2d<f32>;
 @group(1) @binding(1) var radiance_max: texture_2d<f32>;
@@ -41,6 +43,79 @@ fn surface_radiance(e: vec4<u32>) -> vec3<f32> {
     return textureLoad(radiance_max, texel, 0).rgb;
 }
 
+// Distance along this ray at which the parent probe's nearest stored surface
+// appears, with the parent direction cell it came from; x is -1 when the
+// parent has none in this direction. **Must give the same answer
+// `march_hits.wgsl` gave**, or the stored hit's `t` would be measured along a
+// different segment than the one derived here; only the reads differ (its
+// group binds `hits` at binding 0, this one at binding 3).
+//
+// The mapping is the parallax correction: the parent's hit is measured from
+// the parent, so the endpoint `q + d * parent.interval.x` - what this used to
+// use - is a point in the *parent's* frame and the segment bent sideways to
+// reach it. Projecting the parent's hit point `s` onto the child's direction
+// keeps the geometry and drops the offset,
+//
+//     t_child = dot(s - p, d) = t_parent + dot(q - p, d),
+//
+// so the segment lies along `d`, `seg / len` below is `d`, and the distance
+// stored for the child is its own distance along its own ray.
+//
+// Candidates are the parent's four direction cells covering this ray (twice
+// the angular resolution, so this cell is a 2x2 block of the parent's) times
+// that ray's four stored segments - the parent probe's own hit points, not the
+// ones it inherited from coarser cascades. Nearest wins: the segment is a
+// first-hit search and only has to reach the closest surface the parent
+// already knows about. `y` is the direction cell that surface was seen in,
+// which is the direction the parent's radiance for it is stored under - so the
+// merge below reads *that* ray rather than averaging the whole block, which
+// is what it does when there is no hit to correct against.
+fn parent_dir_hits(
+    cc: u32,
+    qi: vec2<u32>,
+    ray: vec2<u32>,
+    p: vec3<f32>,
+    d: vec3<f32>,
+    t_start: f32,
+) -> array<vec4<f32>, 4> {
+    let info = uniforms.cascades[cc];
+    // The top cascade's slots 1..3 are never written; only slot 0 is a trace.
+    let slots = select(4u, 1u, cc + 1u >= uniforms.cascade_count);
+    let ray_base = info.ray_base + (qi.y * info.size.x + qi.x) * info.octa_side * info.octa_side;
+    var out = array<vec4<f32>, 4>(
+        vec4<f32>(-1.0, 0.0, 0.0, 0.0),
+        vec4<f32>(-1.0, 0.0, 0.0, 0.0),
+        vec4<f32>(-1.0, 0.0, 0.0, 0.0),
+        vec4<f32>(-1.0, 0.0, 0.0, 0.0),
+    );
+    for (var by = 0u; by < 2u; by++) {
+        for (var bx = 0u; bx < 2u; bx++) {
+            let pc = ray * 2u + vec2<u32>(bx, by);
+            let pr = pc.y * info.octa_side + pc.x;
+            var nearest = -1.0;
+            for (var k = 0u; k < slots; k++) {
+                let e = hit_at(ray_base + pr, k);
+                if hit_t(e) == MISS {
+                    continue;
+                }
+                let s = stored_segment(cc, qi, pr, k);
+                let len = length(s.dir);
+                if len <= 1e-5 {
+                    continue;
+                }
+                let ts = dot(s.start + s.dir * (hit_t(e) / len) - p, d);
+                if ts > t_start && (nearest < 0.0 || ts < nearest) {
+                    nearest = ts;
+                }
+            }
+            if nearest >= 0.0 {
+                out[by * 2u + bx] = vec4<f32>(nearest, f32(pr), 0.0, 0.0);
+            }
+        }
+    }
+    return out;
+}
+
 fn cascade(c: u32, id: u32) {
     let info = uniforms.cascades[c];
     let side = info.octa_side;
@@ -67,18 +142,21 @@ fn cascade(c: u32, id: u32) {
     }
 
     // Bilinear fix: toward each of the 4 bilinear parents, trace from this
-    // ray's interval start to where that parent's ray of the same direction
-    // starts, and take the parent's radiance only if nothing is in between.
-    // Parents sit at their own column's height, so the segment also carries
-    // the parallax between child and parent.
+    // ray's interval start to where the parent's own hit appears along this
+    // ray, and take the parent's radiance only if nothing is in between.
+    // The endpoint is distance-mapped rather than raw - see
+    // `parent_dir_hits` - so the segment runs along `d` and the offset
+    // between the two probes is carried by the endpoint's distance instead of
+    // by a sideways bend.
     let parent = uniforms.cascades[c + 1u];
     let parent_side = parent.octa_side;
     let u = (p.xz - uniforms.hmap_min) / parent.spacing - 0.5;
     let base = vec2<i32>(floor(u));
     let f = u - floor(u);
     let a = p + d * info.interval.x;
+    let ray_cell = vec2<u32>(ray % side, ray / side);
     // The 2x2 parent cells covering this ray's cell.
-    let cell = vec2<u32>(ray % side, ray / side) * 2u;
+    let cell = ray_cell * 2u;
 
     var radiance = vec3<f32>(0.0);
     var distance_sum = 0.0;
@@ -90,7 +168,26 @@ fn cascade(c: u32, id: u32) {
         let qi = vec2<u32>(clamp(base + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(parent.size) - 1));
         let q = probe_position(c + 1u, qi);
 
-        let seg = q + d * parent.interval.x - a;
+        // Same endpoint the march traced: the nearest of the parent's hits
+        // projected onto this ray, falling back to the parent's ray start when
+        // it has none in this direction - which is the case the march stored a
+        // miss for.
+        let dirs = parent_dir_hits(c + 1u, qi, ray_cell, p, d, info.interval.x);
+        var end = q + d * parent.interval.x;
+        var n_dirs = 0u;
+        var nearest = -1.0;
+        for (var j = 0u; j < 4u; j++) {
+            if dirs[j].x >= 0.0 {
+                n_dirs += 1u;
+                if nearest < 0.0 || dirs[j].x < nearest {
+                    nearest = dirs[j].x;
+                }
+            }
+        }
+        if n_dirs > 0u {
+            end = p + d * nearest;
+        }
+        let seg = end - a;
         let len = length(seg);
         // Too short to have been traced: the march stored a miss, so this
         // falls through to the parent rays below, as it always did.
@@ -105,6 +202,12 @@ fn cascade(c: u32, id: u32) {
         }
 
         let parent_rays = parent.ray_base + (qi.y * parent.size.x + qi.x) * parent_side * parent_side;
+        // The inheritance is the full 2x2 parent block, always: the child's
+        // direction sits centrally in that block, and pruning the directions
+        // that ended in sky or whose projected point is short of the child's
+        // interval throws out answers the parent already owns - the sky
+        // especially, whose `MISS` slot carries `sky_color` for exactly this.
+        // Radiance Cascades gathers from all four parent rays unconditionally.
         var l = vec3<f32>(0.0);
         var parent_distance = 0.0;
         var parent_hits = 0.0;

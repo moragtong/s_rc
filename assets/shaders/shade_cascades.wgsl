@@ -31,6 +31,27 @@ const GOLDEN_ANGLE: f32 = 2.39996323;
 // space, so tracing from it unmodified reports a hit at t=0 and occludes every
 // probe at once, including the ones actually in view.
 const PROBE_BIAS: f32 = 0.02;
+// Half-extent of the room's inner faces, from `house_gltf.py`: ROOM is 20x6x20
+// with WALL = 0.3, so the interior runs -9.7..9.7 in both x and z.
+//
+// Tried as a clamp on the probe grid, then taken out in favour of rejecting on
+// the winding signal: three quarters of the grid is the void outside this
+// building, those probes sit in open columns so neither `probe_buried` nor
+// `height_agreement` stops them, and of the weight `probe_visible` would have
+// rejected 90% was probes at |x| or |z| >= 9.7 - on a wall pixel, whose
+// footprint is probes at 9.5 and 10.5, that is half of its footprint.
+//
+// Measured, clamp on vs the build without it (interior camera, pinned sun):
+// mean |d| 0.0053, max 0.188, 1.15% of pixels past 0.05 and 0.23% past 0.10,
+// every changed pixel darker and all of them in rows 58..533 x cols 407..829 -
+// the wall the camera faces, losing the sky-lit radiance it was reading from
+// outside. Inside the room it looked more correct; the exterior, lit from the
+// interior, is expected to leak either way.
+//
+// To restore:
+//   const PROBE_CLAMP_HALF: f32 = 9.7;
+// and in the loop below, before `probe_buried`:
+//   if abs(slot.x) >= PROBE_CLAMP_HALF || abs(slot.z) >= PROBE_CLAMP_HALF { w = 0.0; }
 const TAU: f32 = 6.28318530718;
 // Per-pixel hash: breaks the 1m probe grid and the 32-sample hemisphere into
 // noise instead of flat blocks. Seeded by the fragment coordinate (and the
@@ -54,7 +75,26 @@ fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
     let o = p + n * PROBE_BIAS;
     let t_end = max(dist - PROBE_BIAS, PROBE_BIAS);
     let hit = trace(o, to_probe / dist, PROBE_BIAS, t_end);
-    return true; // occlusion test off: `hit` unused, see notes on probe_visible
+    return true; // occlusion test off: `hit` unused
+
+    // To turn it on: `return hit.t == MISS;`
+    //
+    // It was on for one build while `is_solid` was being made winding-only,
+    // and the A/B (interior camera, pinned sun, all against this build with
+    // occlusion off, mean luminance 0.2040) is kept because it separates the
+    // two changes:
+    //
+    //   occlusion on, is_solid = normals || winding : mean|d| 0.0362, 31.9% of
+    //     px past 0.05, 4.01% brighter / 9.86% darker, luminance 0.2044
+    //   occlusion on, is_solid = winding only       : mean|d| 0.0509, 64.7%
+    //     px past 0.05, 33.91% brighter / 0.06% darker, luminance 0.2417
+    //
+    // The rule change is the bigger half of that, not the occlusion, and it
+    // goes bright rather than dark - 0.0593 mean|d| between the two occluded
+    // builds, max 0.92 - because `is_solid` is shared with `trace`, so it also
+    // moves where the cascade rays stop and what the probes gather. Turning
+    // occlusion on on top of it was worth 0.0362, and left 10% of pixels
+    // darker, which is the wall rejection doing its job.
 }
 
 // The SH coefficients are radiance, and `sh_probes` is already the cross-fade
@@ -308,6 +348,10 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         if probe_buried(slot.xyz) {
             w = 0.0;
         }
+        // Grid clamp to the room, off - see `PROBE_CLAMP_HALF` above.
+        // if abs(slot.x) >= PROBE_CLAMP_HALF || abs(slot.z) >= PROBE_CLAMP_HALF {
+        //     w = 0.0;
+        // }
         // A probe at w = 0 contributes nothing whether or not it is visible,
         // so neither its trace nor its 32-sample integral needs doing: it is
         // outside this footprint, out of height agreement, or buried. This is

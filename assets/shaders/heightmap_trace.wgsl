@@ -152,6 +152,45 @@ fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
     return vec3<f32>(xz.x, uniforms.split, xz.y);
 }
 
+// One of the segments `march_hits.wgsl` stored for a ray: where it started and
+// which way it ran (not necessarily unit - `trace` was given `dir / length(dir)`,
+// so `t` is measured from `start` along the normalised direction).
+struct Segment {
+    start: vec3<f32>,
+    dir: vec3<f32>,
+}
+
+// The segment cascade `cc` stored for probe `qi`, direction cell `pr`, slot `k`.
+// The march writes these and `cascade()` reads them back, so both derive the
+// geometry here rather than in parallel: the top cascade's own trace runs
+// straight out from `q`, and every other cascade's four segments run from the
+// ray's interval start to where its own parent's rays of the same direction
+// start - the same reconstruction `march_hits` did when it traced them.
+//
+// `pr` is both the direction the segment runs in and the direction whose
+// radiance `rays` holds for it, which is what lets the merge read the parent
+// back in the direction that was actually intersected - see
+// `parent_dir_hits` in `cascades2_5d.wgsl`.
+fn stored_segment(cc: u32, qi: vec2<u32>, pr: u32, k: u32) -> Segment {
+    let info = uniforms.cascades[cc];
+    let q = probe_position(cc, qi);
+    let d = cell_direction(pr, info.octa_side);
+    var seg: Segment;
+    seg.start = q;
+    seg.dir = d;
+    if cc + 1u >= uniforms.cascade_count {
+        return seg;
+    }
+    let grand = uniforms.cascades[cc + 1u];
+    seg.start = q + d * info.interval.x;
+    let u = (q.xz - uniforms.hmap_min) / grand.spacing - 0.5;
+    let cell = vec2<i32>(floor(u));
+    let corner = vec2<i32>(i32(k & 1u), i32(k >> 1u));
+    let qi2 = vec2<u32>(clamp(cell + corner, vec2<i32>(0), vec2<i32>(grand.size) - 1));
+    seg.dir = probe_position(cc + 1u, qi2) + d * grand.interval.x - seg.start;
+    return seg;
+}
+
 // The grid is top-down but each probe is lifted off its own column's floor, so
 // the four probes of a footprint sit at four unrelated heights - and 14% of
 // cascade-0 footprints straddle a storey by more than 2 m. An XZ bilinear
@@ -184,40 +223,40 @@ const WINDING_SOLID: f32 = 0.5;
 
 // Whether the column at `texel` is inside solid material at the split.
 //
-// A floor and a ceiling cannot say "this column is inside a wall", which is what
-// let probes form inside masonry and collect a bilinear share from both
-// storeys. The normals can, for free, because the bake cameras rasterise
-// backfaces: a column that starts in open air records the surface its ray lands
-// on, while a column that starts inside a wall records the surface the ray
-// *leaves* through - the wall's underside going down, its top going up. Both of
-// those face away from the split, and the bake negates the ceiling's normal so
-// that both channels land on the same sign: a negative y.
+// Decided by the winding number alone. A floor and a ceiling cannot say "this
+// column is inside a wall" - they only say where the air is - which is what let
+// probes form inside masonry and take a bilinear share from both sides of it.
+// The winding cut is a horizontal slice through the same geometry that a wall
+// crosses head-on, so it is the term that is actually about a wall.
 //
-// Either channel is enough, and either alone would throw most of it away. The
-// two cameras look at opposite sides of the split, so whichever surface a buried
-// column happens to be made of is only visible to one of them: on Sponza the
-// floor channel catches the perimeter band and the ceiling channel catches the
-// colonnade, and requiring both would keep 468 of the 2300 flagged texels.
+// The two stored normals used to be the first term. They are a backface
+// signal: the bake cameras rasterise backfaces, so a column that starts in
+// open air records the surface its ray lands on while one that starts inside a
+// wall records the surface the ray *leaves* through, and both of those face
+// away from the split - hence `BURIED_MIN_Y` on either channel. That works,
+// but it is a statement about the floor and the ceiling of a column, not about
+// what is between them, and it is blind to a vertical surface in exactly the
+// way the heightmap itself is: the bake's rays run only up and down, so both
+// sides of a wall record open air. The previous form is kept in the body,
+// commented, with the reasoning that went with it.
 //
-// What neither channel can see is a vertical surface, because the bake's rays
-// run only up and down and so never cross one: both sides of a wall record open
-// air, no normal leans away, and 115 probes sit inside the drawn sphere of a
-// wall with every one of their columns called open. The winding term is the
-// missing half - a horizontal cut through the same geometry, which a wall
-// crosses head-on. It is an addition, not a replacement: on Sponza it reproduces
-// 98.5% of what the normals already catch and adds columns they cannot reach.
+// It was an addition, not a replacement, on Sponza: there it reproduced 98.5%
+// of what the normals flagged and added columns they could not reach (14187
+// texels, of which 11922 were new).
+//
+// Measured on `room.glb` with the two channels dumped (`S_RC_DUMP_META_MIN` /
+// `_MAX`, 512^2): the normals are *not* dead here - 2520 ceiling and 2328
+// floor texels read y < -0.5 out of 262144 - so this is a real swap and not a
+// cleanup. It also reaches further than `probe_buried`: `trace` shares this
+// function, so cascade rays change where they stop as well, and the frame
+// moves as a result (see under `probe_visible`).
 fn is_solid(texel: vec2<i32>) -> bool {
-    let dims = textureDimensions(ceiling_normal);
+    let dims = textureDimensions(winding);
     if (texel.x < 0 || texel.y < 0 || texel.x >= i32(dims.x) || texel.y >= i32(dims.y)) {
         return false;
     }
-    // A zero normal is how the bake marks a column it found nothing in, which
-    // is empty rather than buried, and compares greater than the threshold
-    // anyway - so the empty columns need no case of their own.
     let t = vec2<u32>(texel);
-    return textureLoad(ceiling_normal, t, 0).y < BURIED_MIN_Y
-        || textureLoad(floor_normal, t, 0).y < BURIED_MIN_Y
-        || abs(textureLoad(winding, t, 0).x) > WINDING_SOLID;
+    return abs(textureLoad(winding, t, 0).x) > WINDING_SOLID;
 }
 
 // Whether `t` is an open column a probe can be lifted from at all.
