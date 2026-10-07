@@ -44,7 +44,7 @@ pub const NO_CEILING: f32 = 1.0e4;
 /// below it is floor, above it is ceiling. Mid-height of the room: `room.glb`
 /// spans y -3.0..3.0 (interior -2.7..2.7), so the split has to sit inside that
 /// or one of the two cameras starts beyond the geometry and records nothing.
-pub const SPLIT: f32 = 2.35;
+pub const SPLIT: f32 = 0.0;
 /// Floor height of columns with nothing below the split.
 pub const EMPTY_FLOOR: f32 = SPLIT - 10.0;
 /// Near plane offset of both bake cameras from `SPLIT`, along the direction
@@ -140,9 +140,8 @@ fn setup_heightmap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureFormat::R32Float,
         RenderAssetUsages::default(),
     );
-    winding.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
-        | TextureUsages::COPY_DST
-        | TextureUsages::COPY_SRC;
+    winding.texture_descriptor.usage =
+        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
     let winding = images.add(winding);
 
     commands.insert_resource(Heightmap {
