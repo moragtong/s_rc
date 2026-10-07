@@ -262,7 +262,8 @@ fn is_solid(texel: vec2<i32>) -> bool {
         return false;
     }
     let t = vec2<u32>(texel);
-    return abs(textureLoad(winding, t, 0).x) > WINDING_SOLID;
+    return textureLoad(ceiling_normal, t, 0).y < BURIED_MIN_Y
+        || textureLoad(floor_normal, t, 0).y < BURIED_MIN_Y;
 }
 
 // Whether `t` is an open column a probe can be lifted from at all.
