@@ -75,14 +75,10 @@ fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
     let o = p + n * PROBE_BIAS;
     let t_end = max(dist - PROBE_BIAS, PROBE_BIAS);
     let hit = trace(o, to_probe / dist, PROBE_BIAS, t_end);
-    return true; // occlusion test off: `hit` unused
+    return hit.t == MISS;
 
-    // To turn it on: `return hit.t == MISS;`
-    //
-    // It was on for one build while `is_solid` was being made winding-only,
-    // and the A/B (interior camera, pinned sun, all against this build with
-    // occlusion off, mean luminance 0.2040) is kept because it separates the
-    // two changes:
+    // It was off for a while; when the build that turned it on (interior
+    // camera, pinned sun, mean luminance 0.2040 without) was A/B:
     //
     //   occlusion on, is_solid = normals || winding : mean|d| 0.0362, 31.9% of
     //     px past 0.05, 4.01% brighter / 9.86% darker, luminance 0.2044
