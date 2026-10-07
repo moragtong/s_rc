@@ -36,6 +36,7 @@ use bevy::{
 
 use crate::heightmap::Heightmap;
 use crate::heightmap_bake::BakeState;
+use crate::ui::ParallaxState;
 
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
 const LIGHT_SHADER_PATH: &str = "shaders/surface_light.wgsl";
@@ -154,6 +155,8 @@ pub struct CascadesUniforms {
     pub sun_irradiance: Vec3,
     pub sky_color: Vec4,
     pub cascades: [CascadeInfoUniform; layout::CASCADES as usize],
+    pub parallax_endpoint: u32,
+    pub parallax_pad: u32,
 }
 
 #[derive(Resource)]
@@ -451,6 +454,7 @@ fn prepare_buffers(
     bake: Option<Res<BakeState>>,
     existing: Option<Res<CascadesRenderData>>,
     gpu_images: Res<RenderAssets<GpuImage>>,
+    parallax: Res<ParallaxState>,
 ) {
     let Some(heightmap) = heightmap else {
         return;
@@ -506,6 +510,8 @@ fn prepare_buffers(
         sun_irradiance: sun.irradiance,
         sky_color,
         cascades,
+        parallax_endpoint: parallax.enabled as u32,
+        parallax_pad: 0,
     };
     let mut bytes = encase::UniformBuffer::new(Vec::new());
     bytes.write(&uniforms).unwrap();

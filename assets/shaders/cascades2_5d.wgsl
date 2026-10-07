@@ -116,9 +116,6 @@ fn parent_dir_hits(
     return out;
 }
 
-// Matches the toggle in march_hits.wgsl - same A/B, keep both in sync.
-const PARALLAX_ENDPOINT: bool = true;
-
 fn cascade(c: u32, id: u32) {
     let info = uniforms.cascades[c];
     let side = info.octa_side;
@@ -187,7 +184,7 @@ fn cascade(c: u32, id: u32) {
                 }
             }
         }
-        if PARALLAX_ENDPOINT && n_dirs > 0u {
+        if uniforms.parallax_endpoint != 0u && n_dirs > 0u {
             end = p + d * nearest;
         }
         let seg = end - a;

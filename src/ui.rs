@@ -17,6 +17,17 @@ impl Default for LightingState {
     }
 }
 
+#[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
+pub struct ParallaxState {
+    pub enabled: bool,
+}
+
+impl Default for ParallaxState {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Component)]
 pub struct ActionButton(pub Action);
 
@@ -25,13 +36,18 @@ pub enum Action {
     ToggleHeightmap,
     ToggleIndirect,
     ToggleProbes,
+    ToggleParallax,
 }
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LightingState>()
+            .init_resource::<ParallaxState>()
             .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
                 LightingState,
+            >::default())
+            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
+                ParallaxState,
             >::default())
             .add_systems(Startup, setup_ui)
             .add_systems(Update, button_system);
@@ -92,21 +108,39 @@ fn setup_ui(mut commands: Commands) {
                     ActionButton(Action::ToggleProbes),
                 ))
                 .with_child((Text::new("Toggle Probes (P)"), TextColor(Color::WHITE)));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
+                    ActionButton(Action::ToggleParallax),
+                ))
+                .with_child((
+                    Text::new("Parallax Endpoint (O)"),
+                    TextColor(Color::WHITE),
+                ));
         });
 }
 
 fn button_system(
     mut interaction_query: Query<
         (&Interaction, &mut BackgroundColor, &ActionButton),
-        (Changed<Interaction>, With<Button>),
+        With<Button>,
     >,
     keys: Res<ButtonInput<KeyCode>>,
     mut heightmap_query: Query<&mut Visibility, With<crate::heightmap_view::HeightmapViewMesh>>,
     mut lighting_state: ResMut<LightingState>,
+    mut parallax_state: ResMut<ParallaxState>,
 ) {
     let mut toggle_h = keys.just_pressed(KeyCode::KeyM);
     let mut toggle_i = keys.just_pressed(KeyCode::KeyI);
     let mut toggle_p = keys.just_pressed(KeyCode::KeyP);
+    let mut toggle_par = keys.just_pressed(KeyCode::KeyO);
 
     for (interaction, mut color, action) in &mut interaction_query {
         match *interaction {
@@ -116,6 +150,7 @@ fn button_system(
                     Action::ToggleHeightmap => toggle_h = true,
                     Action::ToggleIndirect => toggle_i = true,
                     Action::ToggleProbes => toggle_p = true,
+                    Action::ToggleParallax => toggle_par = true,
                 }
             }
             Interaction::Hovered => {
@@ -143,5 +178,22 @@ fn button_system(
 
     if toggle_p {
         lighting_state.probes_enabled = !lighting_state.probes_enabled;
+    }
+
+    if toggle_par {
+        parallax_state.enabled = !parallax_state.enabled;
+        bevy::log::info!("Parallax endpoint: {}", parallax_state.enabled);
+    }
+
+    // The button colour is the on-screen indicator: green while the toggle is
+    // enabled, dark grey while it is disabled.
+    for (_interaction, mut color, action) in &mut interaction_query {
+        if let Action::ToggleParallax = action.0 {
+            *color = BackgroundColor(if parallax_state.enabled {
+                Color::srgb(0.35, 0.75, 0.35)
+            } else {
+                Color::srgb(0.15, 0.15, 0.15)
+            });
+        }
     }
 }

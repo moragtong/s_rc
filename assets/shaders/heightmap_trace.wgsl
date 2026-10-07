@@ -40,6 +40,12 @@ struct Uniforms {
     // the same bilinear merge as surface radiance, no special casing.
     sky_color: vec4<f32>,
     cascades: array<CascadeInfo, 4>,
+    // 1 to end a child trace's segments at the nearest projected parent hit,
+    // 0 to hand over to the old `q + d * parent.interval` endpoint. Only the
+    // segment ends move; everything else in the parent/grid plumbing is the
+    // same either way.
+    parallax_endpoint: u32,
+    parallax_pad: u32,
 }
 
 // x: ceiling (lowest surface above the split), y: floor (highest below).
