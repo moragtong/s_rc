@@ -60,6 +60,9 @@ struct Uniforms {
 // and with the same bounds, so `texel` indexes it directly. The horizontal
 // containment signal; see `is_solid`.
 @group(0) @binding(4) var winding: texture_2d<f32>;
+// The one-time result of the expensive disk scan/nudge for every probe.
+// `probe_position` reads this so march/trace/gather do not redo the scan.
+@group(0) @binding(5) var<storage, read> probe_positions: array<vec4<f32>>;
 
 const PI: f32 = 3.14159265;
 // Stored instead of a distance for rays that hit nothing.
@@ -145,7 +148,34 @@ fn texel_at(xz: vec2<f32>) -> vec2<i32> {
     return clamp(t, vec2<i32>(0), vec2<i32>(uniforms.hmap_res) - 1);
 }
 
+fn sphere_is_buried(center: vec2<f32>, r: f32) -> bool {
+    let cell = cell_size();
+    let dims = vec2<i32>(uniforms.hmap_res);
+    let lo = vec2<i32>(floor((center - r - uniforms.hmap_min) / cell));
+    let hi = vec2<i32>(floor((center + r - uniforms.hmap_min) / cell));
+    let c_lo = clamp(lo, vec2<i32>(0), dims - 1);
+    let c_hi = clamp(hi, vec2<i32>(0), dims - 1);
+    for (var ty = c_lo.y; ty <= c_hi.y; ty = ty + 1) {
+        for (var tx = c_lo.x; tx <= c_hi.x; tx = tx + 1) {
+            let a = uniforms.hmap_min + vec2<f32>(vec2<i32>(tx, ty)) * cell;
+            let b = a + cell;
+            let closest = clamp(center, a, b);
+            let d = center - closest;
+            if (dot(d, d) <= r * r && is_solid(vec2<i32>(tx, ty))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
+    let info = uniforms.cascades[c];
+    let i = info.probe_base + probe.y * info.size.x + probe.x;
+    return probe_positions[i].xyz;
+}
+
+fn probe_position_baked(c: u32, probe: vec2<u32>) -> vec3<f32> {
     let info = uniforms.cascades[c];
     let s = info.spacing;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
@@ -153,7 +183,9 @@ fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
     // tossing its contribution. Height stays on the bake plane - no lift -
     // so only the XZ changes, and the score is horizontal distance only.
     let origin = texel_at(xz);
-    let escape = escape_texel_xz(origin);
+    let r = info.interval.y;
+    let escape = select(origin, escape_texel_xz(origin), sphere_is_buried(xz, r));
+
     let cell = cell_size();
     let escape_xz = (vec2<f32>(escape) + 0.5) * cell + uniforms.hmap_min;
     let p_xz = select(xz, escape_xz, !all(origin == escape));

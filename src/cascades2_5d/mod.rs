@@ -44,6 +44,7 @@ const TRACE_SHADER_PATH: &str = "shaders/cascades2_5d.wgsl";
 const GATHER_SHADER_PATH: &str = "shaders/gather_cascades.wgsl";
 const MARCH_SHADER_PATH: &str = "shaders/march_hits.wgsl";
 const BLEND_SHADER_PATH: &str = "shaders/blend_sh.wgsl";
+const PROBE_POSITIONS_SHADER_PATH: &str = "shaders/probe_positions.wgsl";
 /// Workgroup sizes: 8x8 texels for the light pass, 64 rays or probes for
 /// the others.
 const LIGHT_WORKGROUP: u32 = 8;
@@ -167,17 +168,23 @@ struct CascadesPipeline {
     trace_layout: BindGroupLayoutDescriptor,
     gather_layout: BindGroupLayoutDescriptor,
     march_layout: BindGroupLayoutDescriptor,
+    probe_positions_layout: BindGroupLayoutDescriptor,
     blend_layout: BindGroupLayoutDescriptor,
     light_pipeline: CachedComputePipelineId,
     trace_pipelines: Vec<CachedComputePipelineId>,
     gather_pipelines: Vec<CachedComputePipelineId>,
     march_pipelines: Vec<CachedComputePipelineId>,
+    probe_positions_pipelines: Vec<CachedComputePipelineId>,
     blend_pipeline: CachedComputePipelineId,
 }
 
 #[derive(Resource)]
 pub struct CascadesRenderData {
     pub rays_buffer: Buffer,
+    /// Every probe's final position, baked once after the heightmap/winding
+    /// maps exist. Marshalled here so `probe_position` in march/trace/gather
+    /// does not rerun the disk scan every frame.
+    pub probe_positions_buffer: Buffer,
     /// Three rotating SH probe buffers. Which holds the freshest relight, which
     /// the last one and which is the next gather target follows [`Relight::phase`]
     /// through [`A_OF_PHASE`], [`B_OF_PHASE`] and [`G_OF_PHASE`]; at each relight
@@ -197,6 +204,11 @@ pub struct CascadesRenderData {
     subsamples_buffer: Buffer,
     /// Group 0 of every pass: the heightmap and the uniforms.
     pub common_bind_group: BindGroup,
+    /// Same slots as `common_bind_group`, but with `probe_positions` bound to
+    /// a scratch slab so the pass that writes that buffer can declare the same
+    /// import module without binding the destination twice.
+    pub probe_positions_pass_bind_group: BindGroup,
+    pub probe_positions_bind_group: BindGroup,
     light_bind_group: BindGroup,
     trace_bind_group: BindGroup,
     /// One per rotation phase, writing into the phase's gather target.
@@ -226,6 +238,7 @@ pub fn common_layout() -> BindGroupLayoutDescriptor {
                 // record a vertical wall and `is_solid` therefore cannot see
                 // one. Written on the CPU by `winding`.
                 texture_2d(TextureSampleType::Float { filterable: false }),
+                storage_buffer_read_only::<Vec4>(false), // probe_positions
             ),
         ),
     )
@@ -331,6 +344,13 @@ fn setup_pipelines(
             (storage_buffer::<Vec4>(false),), // hits
         ),
     );
+    let probe_positions_layout = BindGroupLayoutDescriptor::new(
+        "cascades_probe_positions_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (storage_buffer::<Vec4>(false),),
+        ),
+    );
     let blend_layout = BindGroupLayoutDescriptor::new(
         "cascades_blend_layout",
         &BindGroupLayoutEntries::sequential(
@@ -361,6 +381,7 @@ fn setup_pipelines(
     let gather_shader = asset_server.load(GATHER_SHADER_PATH);
     let march_shader = asset_server.load(MARCH_SHADER_PATH);
     let blend_shader = asset_server.load(BLEND_SHADER_PATH);
+    let probe_positions_shader = asset_server.load(PROBE_POSITIONS_SHADER_PATH);
     let cascades = 0..layout::CASCADES;
 
     commands.insert_resource(CascadesPipeline {
@@ -394,12 +415,23 @@ fn setup_pipelines(
             })
             .collect(),
         march_pipelines: cascades
+            .clone()
             .map(|c| {
                 pipeline(
                     format!("cascades_march{c}"),
                     &march_layout,
                     &march_shader,
                     format!("march_{c}"),
+                )
+            })
+            .collect(),
+        probe_positions_pipelines: cascades
+            .map(|c| {
+                pipeline(
+                    format!("cascades_probe_positions{c}"),
+                    &probe_positions_layout,
+                    &probe_positions_shader,
+                    format!("probe_positions_{c}"),
                 )
             })
             .collect(),
@@ -413,6 +445,7 @@ fn setup_pipelines(
         trace_layout,
         gather_layout,
         march_layout,
+        probe_positions_layout,
         blend_layout,
     });
 }
@@ -523,6 +556,7 @@ fn prepare_buffers(
         .sum();
     let (
         rays_buffer,
+        probe_positions_buffer,
         sh_probes,
         sh_probes_blend_buffer,
         subsamples_buffer,
@@ -532,6 +566,7 @@ fn prepare_buffers(
     ) = match &existing {
             Some(e) => (
                 e.rays_buffer.clone(),
+                e.probe_positions_buffer.clone(),
                 e.sh_probes.clone(),
                 e.sh_probes_blend_buffer.clone(),
                 e.subsamples_buffer.clone(),
@@ -557,6 +592,7 @@ fn prepare_buffers(
                     .collect();
                 (
                     storage("cascades_rays", layout.hit_words, readback),
+                    storage("cascades_probe_positions", probes, BufferUsages::STORAGE | BufferUsages::COPY_DST),
                     // Three rotating buffers: the roles (fresh/prev/gather)
                     // follow Relight::phase, so none has a fixed meaning. The
                     // gather overwrites one of them as `read_write`; the blend
@@ -626,6 +662,25 @@ fn prepare_buffers(
             normal_min,
             normal_max,
             winding,
+            probe_positions_buffer.as_entire_binding(),
+        )),
+    );
+    let probe_positions_dummy_buffer = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cascades_probe_positions_dummy"),
+        size: 16,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let probe_positions_pass_bind_group = bind_group(
+        "cascades_probe_positions_pass",
+        &common_layout(),
+        &BindGroupEntries::sequential((
+            heights,
+            uniform_buffer.as_entire_binding(),
+            normal_min,
+            normal_max,
+            winding,
+            probe_positions_dummy_buffer.as_entire_binding(),
         )),
     );
     let light_bind_group = bind_group(
@@ -670,6 +725,11 @@ fn prepare_buffers(
         &pipeline.march_layout,
         &BindGroupEntries::sequential((hits_buffer.as_entire_binding(),)),
     );
+    let probe_positions_bind_group = bind_group(
+        "cascades_probe_positions",
+        &pipeline.probe_positions_layout,
+        &BindGroupEntries::sequential((probe_positions_buffer.as_entire_binding(),)),
+    );
     let blend_bind_groups = [0, 1, 2].map(|p| {
         bind_group(
             ["cascades_blend_p0", "cascades_blend_p1", "cascades_blend_p2"][p],
@@ -685,6 +745,7 @@ fn prepare_buffers(
 
     commands.insert_resource(CascadesRenderData {
         rays_buffer,
+        probe_positions_buffer,
         sh_probes,
         sh_probes_blend_buffer,
         hits_buffer,
@@ -692,6 +753,8 @@ fn prepare_buffers(
         blend_uniform_buffer,
         subsamples_buffer,
         common_bind_group,
+        probe_positions_pass_bind_group,
+        probe_positions_bind_group,
         light_bind_group,
         trace_bind_group,
         gather_bind_groups,
@@ -716,6 +779,7 @@ fn dispatch_cascades(
     // toggle silently invalidates that cache, so record the value it saw and
     // invalidate when it differs from the current uniform.
     mut marched_parallax: Local<Option<bool>>,
+    mut probe_positions_baked: Local<bool>,
     parallax: Res<ParallaxState>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
@@ -724,7 +788,14 @@ fn dispatch_cascades(
     // Every pass reads the previous one's output; skip the frame until all
     // have compiled.
     let get = |id: &CachedComputePipelineId| pipeline_cache.get_compute_pipeline(*id);
-    let (Some(light), Some(traces), Some(gathers), Some(marches), Some(blend)) = (
+    let (
+        Some(light),
+        Some(traces),
+        Some(gathers),
+        Some(marches),
+        Some(probe_positions),
+        Some(blend),
+    ) = (
         get(&pipeline.light_pipeline),
         pipeline
             .trace_pipelines
@@ -738,6 +809,11 @@ fn dispatch_cascades(
             .collect::<Option<Vec<_>>>(),
         pipeline
             .march_pipelines
+            .iter()
+            .map(get)
+            .collect::<Option<Vec<_>>>(),
+        pipeline
+            .probe_positions_pipelines
             .iter()
             .map(get)
             .collect::<Option<Vec<_>>>(),
@@ -795,6 +871,17 @@ fn dispatch_cascades(
             ..default()
         });
     pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+
+    if verified && !*probe_positions_baked {
+        pass.set_bind_group(0, &render_data.probe_positions_pass_bind_group, &[]);
+        pass.set_bind_group(1, &render_data.probe_positions_bind_group, &[]);
+        for (c, pos) in layout.layout.cascades.iter().zip(&probe_positions) {
+            pass.set_pipeline(pos);
+            pass.dispatch_workgroups((c.size.x * c.size.y).div_ceil(WORKGROUP), 1, 1);
+        }
+        *probe_positions_baked = true;
+        pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+    }
 
     if need_march {
         // Where every ray lands, computed here and never again while the sun
