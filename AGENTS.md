@@ -52,6 +52,8 @@ BEVY_ASSET_ROOT=$PWD S_RC_CAM="-10.58,4.86,-3.21,-1.17,8.18,-3.83" \
 # S_RC_BILATERAL=1       cross-bilateral shade gather (B key)
 # S_RC_NORMAL_BIAS=0     read the probe grid at the shading point + probe_visible
 #                        (default is on: fetch at p + n*0.6 + V*0, trace skipped)
+# S_RC_LOWPASS=0         no spatial low-pass in blend_sh (plain cross-fade, F key);
+#                        the neighbour height gate is unconditional
 # S_RC_SCREENSHOT=/tmp/x.png    also exits at frame 240
 # Dump any baked image whole, to poke at it in numpy:
 #   S_RC_DUMP_HEIGHT=/tmp/h.bin     Rg32Float  512x512x2, **x = ceiling, y = floor**
@@ -219,6 +221,46 @@ Measured against the old vertical-normal bake at γ = 32 (new-vs-old mean|d|
 6.9, 50% of pixels past 0.05; scene mean luminance 67.7 vs 63.7, restoring
 it toward the trilinear 68.5), so the baked normals were reaching the shade —
 the wall's γ-invariance was not a wiring bug.
+
+**The relight blend low-passes the SH field across space.** `blend_sh.wgsl` now
+does the temporal cross-fade and, after it, a 5-tap horizontal cross on the 9 SH
+coefficients of each probe: `SH' = 0.5*SH(x,z) + 0.125*[SH(x±1,z)+SH(x,z±1)]`
+(partition of unity: 0.5 + 4×0.125 = 1.0). The point is the 1 m cascade-0 probe
+spacing, whose Nyquist ripple shows as columns/blobs; the stride-10 word 9
+(`position, radius`) differs between probes and is copied through the plain mix,
+not averaged, and neighbours are kept within the probe's own cascade and layer
+and clamped at the grid edge, so floor/ceiling and cascade boundaries never
+bleed. It is fused into the existing per-frame `blend_sh` dispatch (shade still
+reads the same `sh_probes_blend_buffer`, so the shade pass is untouched) and
+reads only the two raw relights, never its own output, so there is no
+feedback/over-blur. The pre-filter body is kept commented at the bottom of the
+shader. The on/off switch is a runtime toggle on `BlendToggleState`
+(`src/ui.rs`; F key / `S_RC_LOWPASS`, default on = gated 5-tap), extracted to
+the render app where the blend dispatch writes it into `BlendUniforms`
+(`dispatch_cascades` reads `Res<Res>…` — note the 16-system-param limit, which
+is why the two march-cache `Local<bool>`s live in one `Local<Option<(bool,bool)>>`).
+The **height gate is unconditional**: every neighbour tap is scaled by
+`height_agreement_tol(q_y - c_y, spacing * LOWPASS_HEIGHT_TOL_SPACING)` (1.5)
+and the surviving weights renormalise, so a height step sharpens the filter
+back towards the center probe instead of dimming it — `height_agreement` itself
+is 4 spacings (too loose to see the room's ~1.5 m platform step), hence the
+tolerance-aware variant added alongside it in `heightmap_trace.wgsl`. The gate
+was briefly a G-key toggle and is reverted: the current default is bit-identical
+to the old `S_RC_LOWPASS_GATE=1` frame.
+
+**The toggle panel is behind `SHOW_TOGGLE_PANEL` (`src/ui.rs`); flip it false to
+recompile the UI out.** The panel is drawn over the scene, so its button pixels
+land in every screenshot and pollute an A/B diff — earlier low-pass numbers
+(`05cc8126...` vs `135ebf38...`) included it. Scene-only, at the wall camera
+(current default, ambient off, crop x > 460): filter-on vs `S_RC_LOWPASS=0`
+mean|d| 1.29, mean luminance 53.87 vs 52.69 (md5 `38990d0f...` vs `27f374b9...`)
+and `S_RC_LOWPASS=0` reproduces the pre-filter frame **bit-exactly** (scene
+equals `135ebf38...`). The gate at 1.5 spacings is tight for this room: it drops
+most neighbours, so the current default (gated filter) sits ~0.24 mean|d| off
+the unfiltered frame (mean|d| 0.24, max 2.3, 1.0% past 1.0 vs `S_RC_LOWPASS=0`,
+scene identical to the old `S_RC_LOWPASS_GATE=1` frame) — effectively the gate
+switches the filter nearly back off, which is the knob to loosen if the step
+bleed is the visible failing.
 
 There is no mid-room probe layer any more; the old "probes mid-way between floor
 and ceiling" state, the `S_RC_*` legacy leak camera and the Sponza numbers all

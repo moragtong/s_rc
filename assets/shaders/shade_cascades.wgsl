@@ -164,7 +164,33 @@ fn sh_radiance(coefs: array<vec3<f32>, 9>, d: vec3<f32>) -> vec3<f32> {
     return max(l, vec3<f32>(0.0));
 }
 
+// Mix-then-clamp order for the gather: accumulate the 4 weighted coefficient
+// vectors per layer and evaluate the clamped cosine lobe ONCE on the blended
+// field, instead of clamping each probe's irradiance and then blending the
+// scalars. The two orders are identical wherever the probe irradiances are
+// already nonneg (evaluation is linear in the coefficients); they differ only
+// in what happens to SH ringing along `n`, where per-probe clamping zeroes a
+// negative lobe before it can cancel a positively-correlated neighbour. Mixed
+// coefficients are the physically faithful reading of the interpolated field:
+// irradiance of L(x) = sum w_k L_k is max(dot(L(x), b(n)), 0).
+const SH_MIX_COEFFS: bool = true;
+
+// Irradiance from a blended coefficient vector. Same kernel as
+// `sh_irradiance(base, n)` but takes the already-mixed coefficients, so the
+// clamp sees the field's value, not a per-probe value.
+fn sh_irradiance_v(coefs: array<vec3<f32>, 9>, n: vec3<f32>) -> vec3<f32> {
+    var basis = sh_basis(n);
+    let band = array<f32, 3>(PI, 2.094395, 0.785398);
+    var e = vec3<f32>(0.0);
+    for (var i = 0u; i < 9u; i++) {
+        let l = select(select(2u, 1u, i < 4u), 0u, i == 0u);
+        e += coefs[i] * (basis[i] * band[l]);
+    }
+    return max(e, vec3<f32>(0.0));
+}
+
 // Irradiance from the SH convolved with the clamped cosine (no parallax).
+// Still the read for the legacy single-layer branch and the bilateral gather.
 fn sh_irradiance(base: u32, n: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(n);
     let band = array<f32, 3>(PI, 2.094395, 0.785398);
@@ -452,9 +478,11 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // the SH is read in closed form against the surface normal.
         // Occlusion still tests the stored probe position, because `trace` is
         // a 3D test and the layers sit centimetres off the actual surfaces.
+        var cf_floor: array<vec3<f32>, 9>;
+        var cf_ceil: array<vec3<f32>, 9>;
         var e_floor = vec3<f32>(0.0);
-        var w_floor = 0.0;
         var e_ceil = vec3<f32>(0.0);
+        var w_floor = 0.0;
         var w_ceil = 0.0;
         var h_floor = 0.0;
         var h_ceil = 0.0;
@@ -477,12 +505,34 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 if w > 0.0
                     && (view_info.normal_bias_enabled != 0u || probe_visible(p, n, center))
                 {
-                    let read = sh_irradiance(base, n);
+                    // PREVIOUS (scalar order, keep for the SH_MIX_COEFFS=0
+                    // build): the per-probe irradiance was clamped by
+                    // `sh_irradiance` before blending, so a negative SH lobe
+                    // along `n` was zeroed in place.
+                    if !SH_MIX_COEFFS {
+                        let read = sh_irradiance(base, n);
+                        if (layer == 0u) {
+                            e_floor += w * read;
+                        } else {
+                            e_ceil += w * read;
+                        }
+                    }
+                    // Blend the 9 coefficient vectors by `w`; the clamped
+                    // cosine kernel is applied once to the field (see the
+                    // `SH_MIX_COEFFS` comment at the top).
+                    if SH_MIX_COEFFS {
+                        for (var i = 0u; i < 9u; i++) {
+                            let c = sh_coeff(base, i) * w;
+                            if (layer == 0u) {
+                                cf_floor[i] += c;
+                            } else {
+                                cf_ceil[i] += c;
+                            }
+                        }
+                    }
                     if (layer == 0u) {
-                        e_floor += w * read;
                         w_floor += w;
                     } else {
-                        e_ceil += w * read;
                         w_ceil += w;
                     }
                 }
@@ -492,9 +542,24 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // probe hands its share to the visible ones instead of subtracting
         // light. Without this the footprint sums to less than 1 and every
         // occlusion reads as a straight loss of energy rather than a
-        // redistribution.
-        e_floor = select(e_floor, e_floor / w_floor, w_floor > 1e-5);
-        e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > 1e-5);
+        // redistribution. In the coefficient order the same division is
+        // applied to the evaluated field, which is equivalent because the
+        // kernel is linear.
+        if SH_MIX_COEFFS {
+            e_floor = select(
+                sh_irradiance_v(cf_floor, n),
+                sh_irradiance_v(cf_floor, n) / w_floor,
+                w_floor > 1e-5,
+            );
+            e_ceil = select(
+                sh_irradiance_v(cf_ceil, n),
+                sh_irradiance_v(cf_ceil, n) / w_ceil,
+                w_ceil > 1e-5,
+            );
+        } else {
+            e_floor = select(e_floor, e_floor / w_floor, w_floor > 1e-5);
+            e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > 1e-5);
+        }
         // The trilinear vertical weight: how far the fetch anchor sits from the
         // floor layer toward the ceiling layer. A pixel on the floor reads the
         // floor layer (and vice versa).

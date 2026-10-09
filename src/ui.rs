@@ -56,6 +56,24 @@ impl Default for CrossLayerState {
     }
 }
 
+/// The `blend_sh` toggle, extracted to the render app where the blend
+/// dispatch reads it (same shape as the other extracted toggle resources).
+/// The height gate is unconditional inside `blend_sh` now, so this is only
+/// the filter's on/off switch.
+#[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
+pub struct BlendToggleState {
+    /// 5-tap horizontal cross on the SH coefficients in `blend_sh`, each
+    /// neighbour gated on vertical agreement and renormalised. Off means the
+    /// plain cross-fade, bit identical to the pre-filter frames.
+    pub lowpass: bool,
+}
+
+impl Default for BlendToggleState {
+    fn default() -> Self {
+        Self { lowpass: true }
+    }
+}
+
 #[derive(Component)]
 pub struct ActionButton(pub Action);
 
@@ -69,6 +87,7 @@ pub enum Action {
     ToggleCrossLayer,
     ToggleBilateral,
     ToggleNormalBias,
+    ToggleLowPass,
 }
 
 impl Plugin for UiPlugin {
@@ -76,6 +95,7 @@ impl Plugin for UiPlugin {
         app.init_resource::<LightingState>()
             .init_resource::<ParallaxState>()
             .init_resource::<CrossLayerState>()
+            .init_resource::<BlendToggleState>()
             .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
                 LightingState,
             >::default())
@@ -85,12 +105,26 @@ impl Plugin for UiPlugin {
             .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
                 CrossLayerState,
             >::default())
+            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
+                BlendToggleState,
+            >::default())
             .add_systems(Startup, setup_ui)
             .add_systems(Update, button_system);
     }
 }
 
+/// Set false to skip rendering the on-screen toggle panel. The panel is drawn
+/// over the scene, so its button pixels land in every screenshot and pollute an
+/// A/B diff (`S_RC_INDIRECT`-style comparisons are on the scene, not the UI);
+/// with it off the resources are still registered, only the nodes are not
+/// spawned. Rebuild to toggle; the panel's own F/G keys still work when it is
+/// on.
+pub const SHOW_TOGGLE_PANEL: bool = true;
+
 fn setup_ui(mut commands: Commands) {
+    if !SHOW_TOGGLE_PANEL {
+        return;
+    }
     commands
         .spawn((Node {
             position_type: PositionType::Absolute,
@@ -224,6 +258,22 @@ fn setup_ui(mut commands: Commands) {
                     Text::new("Normal-Biased Fetch (N)"),
                     TextColor(Color::WHITE),
                 ));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                    ActionButton(Action::ToggleLowPass),
+                ))
+                .with_child((
+                    Text::new("Low-Pass Filter (F)"),
+                    TextColor(Color::WHITE),
+                ));
         });
 }
 
@@ -237,6 +287,7 @@ fn button_system(
     mut lighting_state: ResMut<LightingState>,
     mut parallax_state: ResMut<ParallaxState>,
     mut cross_layer_state: ResMut<CrossLayerState>,
+    mut blend_toggle: ResMut<BlendToggleState>,
 ) {
     let mut toggle_h = keys.just_pressed(KeyCode::KeyM);
     let mut toggle_i = keys.just_pressed(KeyCode::KeyI);
@@ -246,6 +297,7 @@ fn button_system(
     let mut toggle_cross = keys.just_pressed(KeyCode::KeyL);
     let mut toggle_bi = keys.just_pressed(KeyCode::KeyB);
     let mut toggle_bias = keys.just_pressed(KeyCode::KeyN);
+    let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
 
     for (interaction, mut color, action) in &mut interaction_query {
         match *interaction {
@@ -260,6 +312,7 @@ fn button_system(
                     Action::ToggleCrossLayer => toggle_cross = true,
                     Action::ToggleBilateral => toggle_bi = true,
                     Action::ToggleNormalBias => toggle_bias = true,
+                    Action::ToggleLowPass => toggle_lp = true,
                 }
             }
             Interaction::Hovered => {
@@ -321,6 +374,11 @@ fn button_system(
         bevy::log::info!("Normal-biased fetch: {}", lighting_state.normal_bias_enabled);
     }
 
+    if toggle_lp {
+        blend_toggle.lowpass = !blend_toggle.lowpass;
+        bevy::log::info!("Low-pass filter: {}", blend_toggle.lowpass);
+    }
+
     // The button colour is the on-screen indicator: green while the toggle is
     // enabled, dark grey while it is disabled.
     for (_interaction, mut color, action) in &mut interaction_query {
@@ -355,6 +413,13 @@ fn button_system(
             }
             Action::ToggleCrossLayer => {
                 *color = BackgroundColor(if cross_layer_state.enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                });
+            }
+            Action::ToggleLowPass => {
+                *color = BackgroundColor(if blend_toggle.lowpass {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)

@@ -27,6 +27,7 @@ fn take_screenshot(
     mut frames: Local<u32>,
     mut lighting: ResMut<crate::ui::LightingState>,
     mut cross_layer: ResMut<crate::ui::CrossLayerState>,
+    mut blend_toggle: ResMut<crate::ui::BlendToggleState>,
     mut overlay: Query<&mut Visibility, With<crate::heightmap_view::HeightmapViewMesh>>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -38,6 +39,7 @@ fn take_screenshot(
         lighting.bilateral_enabled = std::env::var("S_RC_BILATERAL").as_deref() == Ok("1");
         lighting.normal_bias_enabled = std::env::var("S_RC_NORMAL_BIAS").as_deref() != Ok("0");
         cross_layer.enabled = std::env::var("S_RC_CROSS_LAYER").as_deref() == Ok("1");
+        blend_toggle.lowpass = std::env::var("S_RC_LOWPASS").as_deref() != Ok("0");
         // S_RC_OVERLAY=1 keeps the heightmap debug planes visible, which is
         // how you check what the GPU bake actually produced. They are visible
         // by default, so a plain run has to hide them itself.

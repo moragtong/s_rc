@@ -213,14 +213,20 @@ fn probe_normal(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
 fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     let info = uniforms.cascades[c];
     let s = info.spacing;
+    // TEMPORARY test (review point 4): force the baked probe centers onto the
+    // unmodified regular grid, XZ = hmap_min + (probe + 0.5) * spacing over the
+    // *origin* column, to test whether the sideways escape is what breaks the
+    // bilinear metric. Guarding `sphere_is_buried` here means the escape never
+    // fires, so `probe_position_baked`/`probe_normal_baked` (and therefore the
+    // probe_positions buffer every pass reads) come out on the grid with the
+    // origin column's surface normal. Flip to `true`, run, flip back.
+    const FLAT_GRID_XZ_TEST: bool = false;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
-    // Buried probe: move sideways to the nearest open column rather than
-    // tossing its contribution. Height stays a constant distance off the
-    // destination column's surface - no lift - so only the XZ changes, and the
-    // score is horizontal distance only.
+    // The origin column's taps, and where the escape would move a buried probe
+    // to - the position and the normal must agree on which of the two won.
     let origin = texel_at(xz);
     let r = info.interval.y;
-    let escape = select(origin, escape_texel_xz(origin), sphere_is_buried(xz, r));
+    let escape = select(origin, escape_texel_xz(origin), !FLAT_GRID_XZ_TEST && sphere_is_buried(xz, r));
 
     let cell = cell_size();
     let escape_xz = (vec2<f32>(escape) + 0.5) * cell + uniforms.hmap_min;
@@ -255,10 +261,12 @@ fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
 fn probe_normal_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     let info = uniforms.cascades[c];
     let s = info.spacing;
+    // Same flat-grid escape guard as `probe_position_baked` (test point 4).
+    const FLAT_GRID_XZ_TEST: bool = false;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
     let origin = texel_at(xz);
     let r = info.interval.y;
-    let escape = select(origin, escape_texel_xz(origin), sphere_is_buried(xz, r));
+    let escape = select(origin, escape_texel_xz(origin), !FLAT_GRID_XZ_TEST && sphere_is_buried(xz, r));
 
     if !all(origin == escape) {
         // Nudged: the direction of the sideways move, in world XZ.
@@ -544,10 +552,17 @@ fn column_buried(texel: vec2<i32>) -> bool {
     return c.y > 0.5 || f.y < -0.5;
 }
 
-fn height_agreement(dy: f32, spacing: f32) -> f32 {
-    let s = max(spacing * HEIGHT_TOLERANCE_SPACING, 1e-4);
+fn height_agreement_tol(dy: f32, tol: f32) -> f32 {
+    let s = max(tol, 1e-4);
     let t = abs(dy) / s;
     return 1.0 - smoothstep(HEIGHT_CUTOFF_SHOULDER, 1.0, t);
+}
+
+// Vertical agreement between a probe and a shading point, tolerance tied to
+// the cascade spacing. `blend_sh`'s low-pass gate uses `height_agreement_tol`
+// instead so it can pick its own (tighter) tolerance.
+fn height_agreement(dy: f32, spacing: f32) -> f32 {
+    return height_agreement_tol(dy, spacing * HEIGHT_TOLERANCE_SPACING);
 }
 
 

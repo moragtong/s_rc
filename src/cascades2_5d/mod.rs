@@ -36,6 +36,7 @@ use bevy::{
 
 use crate::heightmap::Heightmap;
 use crate::heightmap_bake::BakeState;
+use crate::ui::BlendToggleState;
 use crate::ui::CrossLayerState;
 use crate::ui::ParallaxState;
 
@@ -97,16 +98,17 @@ impl Default for Relight {
     }
 }
 
-/// What `blend_sh` mixes with. Sized to a whole 16 bytes on purpose: a
-/// two-scalar struct is 8 bytes naturally, but uniform address space rounds a
+/// What `blend_sh` mixes with. Sized to a whole 16 bytes on purpose: the
+/// two scalars would be 8 bytes naturally, but uniform address space rounds a
 /// struct up to 16, and the two sides have to agree on the binding's minimum
-/// size or the bind group fails validation.
+/// size or the bind group fails validation. The height gate is unconditional
+/// in `blend_sh` now, so only the filter's on/off toggle has a field.
 #[derive(ShaderType, Clone, Copy, Default)]
 struct BlendUniforms {
     pub alpha: f32,
     pub probe_words: u32,
+    pub lowpass: u32,
     pub pad0: u32,
-    pub pad1: u32,
 }
 
 #[derive(Resource, Clone, ExtractResource)]
@@ -789,16 +791,14 @@ fn dispatch_cascades(
     mut render_context: RenderContext,
     mut frame: Local<u32>,
     mut marched: Local<bool>,
-    // The one-shot march records segment geometry at march time; changing the
-    // toggle silently invalidates that cache, so record the value it saw and
-    // invalidate when it differs from the current uniform.
-    mut marched_parallax: Local<Option<bool>>,
-    // Same for the cross-layer merge toggle: it changes which layer's parents
-    // the march's segments target, so it is part of `marched`'s cache key.
-    mut marched_cross_layer: Local<Option<bool>>,
+    // The one-shot march records what toggles it ran under; changing either
+    // silently invalidates the hit/march cache, so record both together and
+    // send the march back through when they differ from the uniforms.
+    mut marched_toggles: Local<Option<(bool, bool)>>,
     mut probe_positions_baked: Local<bool>,
     parallax: Res<ParallaxState>,
     cross_layer: Res<CrossLayerState>,
+    blend_toggle: Res<BlendToggleState>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
         return;
@@ -844,13 +844,10 @@ fn dispatch_cascades(
     // to retry rewrites the heightmap underneath it, so an unverified map
     // invalidates the stored hits and sends the march back through.
     let verified = bake.as_ref().is_some_and(|b| b.is_verified());
-    if *marched_parallax != Some(parallax.enabled) {
+    let toggles = (parallax.enabled, cross_layer.enabled);
+    if *marched_toggles != Some(toggles) {
         *marched = false;
-        *marched_parallax = Some(parallax.enabled);
-    }
-    if *marched_cross_layer != Some(cross_layer.enabled) {
-        *marched = false;
-        *marched_cross_layer = Some(cross_layer.enabled);
+        *marched_toggles = Some(toggles);
     }
     let need_march = !*marched;
     if need_march && !verified {
@@ -881,7 +878,8 @@ fn dispatch_cascades(
         .write(&BlendUniforms {
             alpha: relight.alpha,
             probe_words: probe_words as u32,
-            ..default()
+            lowpass: blend_toggle.lowpass as u32,
+            pad0: 0,
         })
         .unwrap();
     render_queue.write_buffer(&render_data.blend_uniform_buffer, 0, bytes.as_ref());
