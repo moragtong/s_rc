@@ -36,6 +36,7 @@ struct ShadeUniforms {
     trilinear_enabled: u32,
     bilateral_enabled: u32,
     normal_bias_enabled: u32,
+    bsp_recon_enabled: u32,
 }
 
 #[derive(Resource)]
@@ -154,6 +155,7 @@ fn draw_shade(
         trilinear_enabled: lighting_state.trilinear_enabled as u32,
         bilateral_enabled: lighting_state.bilateral_enabled as u32,
         normal_bias_enabled: lighting_state.normal_bias_enabled as u32,
+        bsp_recon_enabled: lighting_state.bsp_recon_enabled as u32,
     });
     uniforms.write_buffer(&render_device, &render_queue);
 

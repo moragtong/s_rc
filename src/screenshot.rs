@@ -40,6 +40,7 @@ fn take_screenshot(
         lighting.normal_bias_enabled = std::env::var("S_RC_NORMAL_BIAS").as_deref() != Ok("0");
         cross_layer.enabled = std::env::var("S_RC_CROSS_LAYER").as_deref() == Ok("1");
         blend_toggle.lowpass = std::env::var("S_RC_LOWPASS").as_deref() != Ok("0");
+        lighting.bsp_recon_enabled = std::env::var("S_RC_BSPLINE_RECON").as_deref() == Ok("1");
         // S_RC_OVERLAY=1 keeps the heightmap debug planes visible, which is
         // how you check what the GPU bake actually produced. They are visible
         // by default, so a plain run has to hide them itself.

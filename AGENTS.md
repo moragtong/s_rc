@@ -54,6 +54,7 @@ BEVY_ASSET_ROOT=$PWD S_RC_CAM="-10.58,4.86,-3.21,-1.17,8.18,-3.83" \
 #                        (default is on: fetch at p + n*0.6 + V*0, trace skipped)
 # S_RC_LOWPASS=0         no spatial low-pass in blend_sh (plain cross-fade, F key);
 #                        the neighbour height gate is unconditional
+# S_RC_BSPLINE_RECON=1   cubic B-spline shade reconstruction (C key), default off
 # S_RC_SCREENSHOT=/tmp/x.png    also exits at frame 240
 # Dump any baked image whole, to poke at it in numpy:
 #   S_RC_DUMP_HEIGHT=/tmp/h.bin     Rg32Float  512x512x2, **x = ceiling, y = floor**
@@ -223,10 +224,13 @@ it toward the trilinear 68.5), so the baked normals were reaching the shade —
 the wall's γ-invariance was not a wiring bug.
 
 **The relight blend low-passes the SH field across space.** `blend_sh.wgsl` now
-does the temporal cross-fade and, after it, a 5-tap horizontal cross on the 9 SH
-coefficients of each probe: `SH' = 0.5*SH(x,z) + 0.125*[SH(x±1,z)+SH(x,z±1)]`
-(partition of unity: 0.5 + 4×0.125 = 1.0). The point is the 1 m cascade-0 probe
-spacing, whose Nyquist ripple shows as columns/blobs; the stride-10 word 9
+does the temporal cross-fade and, after it, a spatial pre-filter on the 9 SH
+coefficients of each probe. The **default is a separable cubic B-spline
+pre-filter** (1D mask `[1,4,1]/6`, tensor 3×3 `[1,4,1;4,16,4;1,4,1]/36`,
+partition of unity 36); the previous **5-tap horizontal tent cross**
+(`0.5*SH(x,z) + 0.125*[SH(x±1,z)+SH(x,z±1)]`) is kept behind
+`const TENT_PREFILTER` in the shader for A/B. The point is the 1 m cascade-0
+probe spacing, whose Nyquist ripple shows as columns/blobs; the stride-10 word 9
 (`position, radius`) differs between probes and is copied through the plain mix,
 not averaged, and neighbours are kept within the probe's own cascade and layer
 and clamped at the grid edge, so floor/ceiling and cascade boundaries never
@@ -235,7 +239,7 @@ reads the same `sh_probes_blend_buffer`, so the shade pass is untouched) and
 reads only the two raw relights, never its own output, so there is no
 feedback/over-blur. The pre-filter body is kept commented at the bottom of the
 shader. The on/off switch is a runtime toggle on `BlendToggleState`
-(`src/ui.rs`; F key / `S_RC_LOWPASS`, default on = gated 5-tap), extracted to
+(`src/ui.rs`; F key / `S_RC_LOWPASS`, default on = gated B-spline), extracted to
 the render app where the blend dispatch writes it into `BlendUniforms`
 (`dispatch_cascades` reads `Res<Res>…` — note the 16-system-param limit, which
 is why the two march-cache `Local<bool>`s live in one `Local<Option<(bool,bool)>>`).
@@ -247,6 +251,38 @@ is 4 spacings (too loose to see the room's ~1.5 m platform step), hence the
 tolerance-aware variant added alongside it in `heightmap_trace.wgsl`. The gate
 was briefly a G-key toggle and is reverted: the current default is bit-identical
 to the old `S_RC_LOWPASS_GATE=1` frame.
+
+**Measured: the pre-filter (either kernel) does not move the vertical-seam
+signature.** At the wall camera, `S_RC_LOWPASS=0` vs B-spline vs tent:
+row-averaged vertical-line profile std 2.893 / 2.888 / 2.890 and seam energy
+(per-column mean |Δlum|) 0.497 / 0.492 / 0.493 — indistinguishable. The B-spline
+smooths the samples a little more than the tent (bspline-vs-nofilter mean|d|
+0.324 vs tent's 0.241; bspline-vs-tent mean|d| 0.085, max 1.0, 22% past 0.05),
+but a pre-filter only removes the grid's high-frequency ripple. The C⁰ gradient
+kink at a cell boundary is a property of the **reconstruction**, so the other
+half of the scheme — the cubic B-spline *basis* at shade time — is implemented
+too (below).
+
+**The shade can reconstruct with the cubic B-spline basis (`bsp_recon_enabled`,
+C key / `S_RC_BSPLINE_RECON=1`, off by default).** `bspline_weights` in
+`shade_cascades.wgsl` returns the four 1D B-spline basis weights
+`B(t+1), B(t), B(1-t), B(2-t)` (C², sum to 1) at the raw in-cell fraction `ft`;
+the branch reads a 4×4 XZ patch per probe layer (offsets -1..+2, clamped) instead
+of the smootherstep-weighted 2×2, keeps the same two-layer vertical fade and
+occlusion path, and accumulates coefficients mix-then-clamp like the default.
+The default scene is bit-identical to the pre-reconstruction default (the diff
+is only the widened UI panel, cols < 458); 0 shader errors.
+
+**Measured: the reconstruction changes the frame but does not reduce seams
+either.** At the wall camera, B-spline recon vs default: 58% of pixels change,
+mean|d| 0.92, max 30.7. But vertical-line profile std 2.888 → 2.886, seam energy
+0.492 → 0.498, and on the **isolated indirect term** (subtracting a direct-only
+frame, `S_RC_INDIRECT=0`) 2.642 → 2.676; a flat-wall second-derivative roughness
+rises (|∂²y| 0.66 → 0.84), and an FFT of a wall patch shows no probe-spacing
+periodic peak (energy sits at ~0.34 cyc/px, i.e. texture detail, not the ~0.01
+the ~1 m spacing would give). So neither interpolation order, pre-filter kernel,
+nor reconstruction basis moves the seam signature — the seams are not produced
+by the SH interpolation, and the reconstruction is left gated off.
 
 **The toggle panel is behind `SHOW_TOGGLE_PANEL` (`src/ui.rs`); flip it false to
 recompile the UI out.** The panel is drawn over the scene, so its button pixels

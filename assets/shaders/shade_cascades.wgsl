@@ -40,6 +40,7 @@ struct ShadeUniforms {
     trilinear_enabled: u32,
     bilateral_enabled: u32,
     normal_bias_enabled: u32,
+    bsp_recon_enabled: u32,
 }
 @group(1) @binding(3) var<uniform> view_info: ShadeUniforms;
 
@@ -200,6 +201,26 @@ fn sh_irradiance(base: u32, n: vec3<f32>) -> vec3<f32> {
         e += sh_coeff(base, i) * (basis[i] * band[l]);
     }
     return max(e, vec3<f32>(0.0));
+}
+
+// Uniform cubic B-spline basis weights at fractional `t` in [0,1) for the four
+// control points at offsets -1, 0, +1, +2 relative to the cell. B(x) is the
+// standard cubic B-spline (support 2): the returned weights are
+// B(t+1), B(t), B(1-t), B(2-t), which sum to 1 and are C^2 in `t`. This is the
+// reconstruction half of the C^2 scheme whose control coefficients the
+// `blend_sh` B-spline pre-filter supplies.
+fn bspline_weights(t: f32) -> array<f32, 4> {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let omt = 1.0 - t;
+    let omt2 = omt * omt;
+    let omt3 = omt2 * omt;
+    return array<f32, 4>(
+        omt3 / 6.0,                          // B(t+1)
+        (2.0 / 3.0) - t2 + 0.5 * t3,         // B(t)
+        (2.0 / 3.0) - omt2 + 0.5 * omt3,     // B(1-t)
+        t3 / 6.0,                            // B(2-t)
+    );
 }
 
 // Duff et al., "Building an Orthonormal Basis, Revisited".
@@ -383,6 +404,9 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // below); the bilinear gather reads them at their stored height.
     let gu = (fetch.xz - uniforms.hmap_min) / info.spacing - 0.5 + dij;
     let cell = vec2<i32>(floor(gu));
+    // Raw in-cell fraction for the cubic B-spline reconstruction; the bilinear
+    // shapes smooth it (below) so their tent hits zero slope at the cell edge.
+    let ft = gu - vec2<f32>(cell);
     var frac = gu - vec2<f32>(cell);
     frac = frac * frac * frac * (frac * (frac * 6.0 - 15.0) + 10.0);
     var e = vec3<f32>(0.0);
@@ -467,6 +491,98 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             }
         }
         e = select(e_bi, e_bi / w_bi, w_bi > 1e-5);
+    } else if view_info.bsp_recon_enabled != 0u {
+        // Cubic B-spline reconstruction (`C` key / `S_RC_BSPLINE_RECON=1`).
+        // The bilinear/trilinear read reconstructs with a 2x2 tent per layer,
+        // which is only C^0: the field is continuous across a cell boundary but
+        // its gradient kinks, so the probe grid reads as vertical/horizontal
+        // seams under steep contrast. Here the in-cell fraction `ft` weights the
+        // four control points per axis (offsets -1..+2) by the cubic B-spline
+        // basis (`bspline_weights`), a 4x4 read per layer, which is C^2. Paired
+        // with the `blend_sh` B-spline pre-filter (which supplies the control
+        // coefficients) this is the full two-step scheme; the pre-filter on its
+        // own cannot remove the kink because a pre-filter does not change the
+        // reconstruction.
+        //
+        // The two real probe layers stay: each layer is reconstructed from its
+        // own 4x4 patch and the two are faded by the B-spline-blended layer
+        // heights, exactly as in the trilinear branch. Occlusion is the same
+        // (`probe_visible` when the normal bias is off). This is the expensive
+        // half: 4x the taps of the trilinear read, so it is opt-in and timed.
+        let wx = bspline_weights(ft.x);
+        let wz = bspline_weights(ft.y);
+        var cf_floor: array<vec3<f32>, 9>;
+        var cf_ceil: array<vec3<f32>, 9>;
+        var e_floor = vec3<f32>(0.0);
+        var e_ceil = vec3<f32>(0.0);
+        var w_floor = 0.0;
+        var w_ceil = 0.0;
+        var h_floor = 0.0;
+        var h_ceil = 0.0;
+        for (var j = 0u; j < 4u; j++) {
+            for (var k = 0u; k < 4u; k++) {
+                let q = vec2<u32>(clamp(
+                    cell + vec2<i32>(i32(k) - 1, i32(j) - 1),
+                    vec2<i32>(0),
+                    vec2<i32>(info.size) - 1,
+                ));
+                let w = wx[k] * wz[j];
+                let base_cell = info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL;
+                for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                    let base = (base_cell + layer) * SH_STRIDE;
+                    let center = sh_probes[base + 9u].xyz;
+                    if (layer == 0u) {
+                        h_floor += w * center.y;
+                    } else {
+                        h_ceil += w * center.y;
+                    }
+                    if w > 0.0
+                        && (view_info.normal_bias_enabled != 0u || probe_visible(p, n, center))
+                    {
+                        if SH_MIX_COEFFS {
+                            for (var i = 0u; i < 9u; i++) {
+                                let c = sh_coeff(base, i) * w;
+                                if (layer == 0u) {
+                                    cf_floor[i] += c;
+                                } else {
+                                    cf_ceil[i] += c;
+                                }
+                            }
+                        } else {
+                            let read = sh_irradiance(base, n);
+                            if (layer == 0u) {
+                                e_floor += w * read;
+                            } else {
+                                e_ceil += w * read;
+                            }
+                        }
+                        if (layer == 0u) {
+                            w_floor += w;
+                        } else {
+                            w_ceil += w;
+                        }
+                    }
+                }
+            }
+        }
+        if SH_MIX_COEFFS {
+            e_floor = select(
+                sh_irradiance_v(cf_floor, n),
+                sh_irradiance_v(cf_floor, n) / w_floor,
+                w_floor > 1e-5,
+            );
+            e_ceil = select(
+                sh_irradiance_v(cf_ceil, n),
+                sh_irradiance_v(cf_ceil, n) / w_ceil,
+                w_ceil > 1e-5,
+            );
+        } else {
+            e_floor = select(e_floor, e_floor / w_floor, w_floor > 1e-5);
+            e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > 1e-5);
+        }
+        var tb = saturate((fetch.y - h_floor) / max(h_ceil - h_floor, 1e-4));
+        tb = tb * tb * (3.0 - 2.0 * tb);
+        e = mix(e_floor, e_ceil, tb);
     } else if view_info.trilinear_enabled != 0u {
         // Trilinear over the two real probe layers: each of the 4 XZ
         // neighbours holds a floor-layer probe (a constant distance above its

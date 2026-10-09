@@ -9,6 +9,7 @@ pub struct LightingState {
     pub trilinear_enabled: bool,
     pub bilateral_enabled: bool,
     pub normal_bias_enabled: bool,
+    pub bsp_recon_enabled: bool,
 }
 
 impl Default for LightingState {
@@ -25,6 +26,12 @@ impl Default for LightingState {
             // does the occlusion rejection. The two are alternatives, hence the
             // toggle.
             normal_bias_enabled: true,
+            // Off: the trilinear gather reconstructs with smootherstep-weighted
+            // bilinear (a 2x2 read per layer, C^0 across cell boundaries). On:
+            // reconstruct with the cubic B-spline basis (a 4x4 read per layer),
+            // giving the C^2 field the `blend_sh` B-spline pre-filter's control
+            // coefficients describe. Expensive (4x the shade taps), so opt-in.
+            bsp_recon_enabled: false,
         }
     }
 }
@@ -88,6 +95,7 @@ pub enum Action {
     ToggleBilateral,
     ToggleNormalBias,
     ToggleLowPass,
+    ToggleBspRecon,
 }
 
 impl Plugin for UiPlugin {
@@ -274,6 +282,22 @@ fn setup_ui(mut commands: Commands) {
                     Text::new("Low-Pass Filter (F)"),
                     TextColor(Color::WHITE),
                 ));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                    ActionButton(Action::ToggleBspRecon),
+                ))
+                .with_child((
+                    Text::new("Cubic B-Spline Recon (C)"),
+                    TextColor(Color::WHITE),
+                ));
         });
 }
 
@@ -298,6 +322,7 @@ fn button_system(
     let mut toggle_bi = keys.just_pressed(KeyCode::KeyB);
     let mut toggle_bias = keys.just_pressed(KeyCode::KeyN);
     let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
+    let mut toggle_bsp = keys.just_pressed(KeyCode::KeyC);
 
     for (interaction, mut color, action) in &mut interaction_query {
         match *interaction {
@@ -313,6 +338,7 @@ fn button_system(
                     Action::ToggleBilateral => toggle_bi = true,
                     Action::ToggleNormalBias => toggle_bias = true,
                     Action::ToggleLowPass => toggle_lp = true,
+                    Action::ToggleBspRecon => toggle_bsp = true,
                 }
             }
             Interaction::Hovered => {
@@ -379,6 +405,14 @@ fn button_system(
         bevy::log::info!("Low-pass filter: {}", blend_toggle.lowpass);
     }
 
+    if toggle_bsp {
+        lighting_state.bsp_recon_enabled = !lighting_state.bsp_recon_enabled;
+        bevy::log::info!(
+            "Cubic B-spline reconstruction: {}",
+            lighting_state.bsp_recon_enabled
+        );
+    }
+
     // The button colour is the on-screen indicator: green while the toggle is
     // enabled, dark grey while it is disabled.
     for (_interaction, mut color, action) in &mut interaction_query {
@@ -420,6 +454,13 @@ fn button_system(
             }
             Action::ToggleLowPass => {
                 *color = BackgroundColor(if blend_toggle.lowpass {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                });
+            }
+            Action::ToggleBspRecon => {
+                *color = BackgroundColor(if lighting_state.bsp_recon_enabled {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)
