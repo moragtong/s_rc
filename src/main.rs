@@ -29,7 +29,7 @@ use hi_z_debug::HiZDebugPlugin;
 fn main() {
     let measure_fps = std::env::var("S_RC_FPS").is_ok();
     let mut app = App::new();
-    app.add_systems(Update, (draw_probes_gizmos, camera_readout, animate_sun))
+    app.add_systems(Update, (draw_probes_gizmos, camera_readout, animate_sun, sync_sky_color))
         .insert_resource(DefaultOpaqueRendererMethod::deferred())
         .add_plugins((
             DefaultPlugins,
@@ -47,6 +47,12 @@ fn main() {
             screenshot::ScreenshotPlugin,
             bevy::render::diagnostic::RenderDiagnosticsPlugin,
         ))
+        // Bevy's `LightPlugin` inserts `GlobalAmbientLight` at brightness 80
+        // cd/m^2. This scene lights the room entirely with the baked cascade
+        // probes (plus the sun), so that flat ambient is a second, unrelated
+        // light that washes the room out. `NONE` is the same resource at
+        // brightness 0. Delete this line to get Bevy's default ambient back.
+        .insert_resource(bevy::light::GlobalAmbientLight::NONE)
         .add_systems(Startup, (setup_scene, log_adapter_info));
     if measure_fps {
         app.add_systems(Update, log_fps);
@@ -232,6 +238,31 @@ fn camera_readout(
 /// Marks the `S_RC_CAM` readout in the corner.
 #[derive(Component)]
 struct CameraReadout;
+
+/// Paints the main camera's backdrop with the same sky the cascade probes
+/// record: `cascades2_5d::sky_color` is the radiance a probe ray stores on
+/// a miss, so the sky showing through the doorway should read as that exact
+/// sky rather than Bevy's default grey clear. The irradiance here is the
+/// same `light.color * illuminance * exposure` as `cascades2_5d::update_sun`
+/// (`S_RC_SKY` overrides both, because both go through `sky_color`).
+fn sync_sky_color(
+    mut cameras: Query<(&mut Camera, Option<&bevy::camera::Exposure>), With<HiZ>>,
+    lights: Query<(&DirectionalLight, &GlobalTransform)>,
+) {
+    let (mut camera, exposure) = match cameras.single_mut() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let Ok((light, transform)) = lights.single() else {
+        return;
+    };
+    let exposure = exposure.map(|e| e.exposure()).unwrap_or(1.0);
+    let color = light.color.to_linear();
+    let irradiance =
+        Vec3::new(color.red, color.green, color.blue) * light.illuminance * exposure;
+    let sky = crate::cascades2_5d::sky_color(irradiance);
+    camera.clear_color = ClearColorConfig::Custom(Color::linear_rgb(sky.x, sky.y, sky.z));
+}
 
 /// `S_RC_CAM="ox,oy,oz,tx,ty,tz"` aims the camera somewhere specific, so a
 /// shot can be taken from a known viewpoint instead of the default one. WASD

@@ -46,6 +46,15 @@ struct Uniforms {
     // same either way.
     parallax_endpoint: u32,
     parallax_pad: u32,
+    // 1 to merge each child cascade into the *other* probe layer's parents
+    // instead of its own (floor child -> ceiling parents and vice versa), 0
+    // for the default per-layer merge. The crossing happens once per child:
+    // a child merges into the other layer's parents, and those parents then
+    // merge as their own layer does - the layer never oscillates up the
+    // chain. Read at march time, so toggling it re-runs the ray march along
+    // with `parallax_endpoint`.
+    cross_layer: u32,
+    cross_layer_pad: u32,
 }
 
 // x: ceiling (lowest surface above the split), y: floor (highest below).
@@ -60,8 +69,14 @@ struct Uniforms {
 // and with the same bounds, so `texel` indexes it directly. The horizontal
 // containment signal; see `is_solid`.
 @group(0) @binding(4) var winding: texture_2d<f32>;
-// The one-time result of the expensive disk scan/nudge for every probe.
-// `probe_position` reads this so march/trace/gather do not redo the scan.
+// The one-time result of the expensive disk scan/nudge for every probe, two
+// vec4s per probe-with-layer: the position `probe_position` reads and the
+// normal `probe_normal` reads (both baked by `probe_positions.wgsl` once,
+// so march/trace/gather/shade never redo the scan). Even words are
+// `vec4(xyz, 1.0)` positions, odd words `vec4(normal.xyz, 0.0)`. Normal rule:
+// a probe that was buried and nudged sideways keeps the direction of that
+// nudge (see `probe_normal_baked`); anything else keeps its column's surface
+// normal from the heightmap's normal channels.
 @group(0) @binding(5) var<storage, read> probe_positions: array<vec4<f32>>;
 
 const PI: f32 = 3.14159265;
@@ -69,6 +84,16 @@ const PI: f32 = 3.14159265;
 const MISS: f32 = -1.0;
 // SH probes: 9 coefficients, then (position, parallax radius).
 const SH_STRIDE: u32 = 10u;
+// Two probe layers per XZ cell: the floor layer sits a constant distance
+// above the column's stored floor surface, the ceiling layer the same
+// distance below its stored ceiling. Lives in the shared module so every
+// pass derives the layer layout from the same constants. The layer is the
+// low bit of a probe's index within its cascade (floor = 0, ceiling = 1).
+const PROBES_PER_CELL: u32 = 2u;
+// The constant distance every probe sits off its surface, m. Small enough
+// to stay inside the column's open interval, large enough that the surface
+// it just left does not immediately re-embed it.
+const PROBE_LAYER_GAP: f32 = 0.1;
 // Probes sit midway between floor and ceiling, but at least this far above
 // the floor and at most PROBE_MAX_LIFT (open-sky columns have no ceiling).
 const PROBE_MIN_LIFT: f32 = 0.1;
@@ -105,7 +130,7 @@ const PROBE_NORMAL_MIN_Y: f32 = 0.2;
 // inside a wall whose column floor is the ground floor - must not keep a small
 // nonzero share when the four probes of a footprint renormalise against each
 // other. This is a cutoff, not a falloff; only its width moved.
-const HEIGHT_TOLERANCE_SPACING: f32 = 3.0;
+const HEIGHT_TOLERANCE_SPACING: f32 = 4.0;
 
 // Fraction of the tolerance over which the cutoff fades, to avoid aliasing.
 const HEIGHT_CUTOFF_SHOULDER: f32 = 0.85;
@@ -169,19 +194,30 @@ fn sphere_is_buried(center: vec2<f32>, r: f32) -> bool {
     return false;
 }
 
-fn probe_position(c: u32, probe: vec2<u32>) -> vec3<f32> {
+fn probe_position(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     let info = uniforms.cascades[c];
-    let i = info.probe_base + probe.y * info.size.x + probe.x;
-    return probe_positions[i].xyz;
+    let i = info.probe_base + (probe.y * info.size.x + probe.x) * PROBES_PER_CELL + layer;
+    return probe_positions[2 * i].xyz;
 }
 
-fn probe_position_baked(c: u32, probe: vec2<u32>) -> vec3<f32> {
+// The baked normal for a probe-with-layer (`probe_positions` even-pair word).
+// Assigned once by `probe_position_baked`'s sibling scan (see
+// `probe_normal_baked`): the heightmap surface normal of the probe's column,
+// or the nudge direction when the probe was buried and moved sideways.
+fn probe_normal(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
+    let info = uniforms.cascades[c];
+    let i = info.probe_base + (probe.y * info.size.x + probe.x) * PROBES_PER_CELL + layer;
+    return probe_positions[2 * i + 1u].xyz;
+}
+
+fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     let info = uniforms.cascades[c];
     let s = info.spacing;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
     // Buried probe: move sideways to the nearest open column rather than
-    // tossing its contribution. Height stays on the bake plane - no lift -
-    // so only the XZ changes, and the score is horizontal distance only.
+    // tossing its contribution. Height stays a constant distance off the
+    // destination column's surface - no lift - so only the XZ changes, and the
+    // score is horizontal distance only.
     let origin = texel_at(xz);
     let r = info.interval.y;
     let escape = select(origin, escape_texel_xz(origin), sphere_is_buried(xz, r));
@@ -189,14 +225,60 @@ fn probe_position_baked(c: u32, probe: vec2<u32>) -> vec3<f32> {
     let cell = cell_size();
     let escape_xz = (vec2<f32>(escape) + 0.5) * cell + uniforms.hmap_min;
     let p_xz = select(xz, escape_xz, !all(origin == escape));
-    // Sit exactly halfway between the column's stored floor and ceiling
-    // rather than on the bake plane. Columns with no recorded split region
-    // (open sky, empty floor) fall back to the plane.
+    // One probe per layer (`PROBES_PER_CELL`): the floor layer sits a constant
+    // distance above the column's stored floor, the ceiling layer the same
+    // distance below its stored ceiling. Columns with no recorded interval
+    // (open sky, empty floor) fall back to the bake plane, offset by the same
+    // gap on each side.
     let h = textureLoad(heightmap, vec2<u32>(escape), 0).xy;
-    let mid = 0.5 * (h.x + h.y);
-    let usable = h.x < 5000.0 && h.y > -1000.0 && (h.x - h.y) > 0.0;
-    let y = select(uniforms.split, mid, usable);
+    let usable = h.x < 5000.0 && h.y > -1000.0 && (h.x - h.y) > 2.0 * PROBE_LAYER_GAP;
+    var y = uniforms.split + PROBE_LAYER_GAP;
+    if usable && layer == 0u {
+        y = h.y + PROBE_LAYER_GAP;
+    }
+    if usable && layer == 1u {
+        y = h.x - PROBE_LAYER_GAP;
+    }
     return vec3<f32>(p_xz.x, y, p_xz.y);
+}
+
+// The normal each probe carries into the shading range kernels. Runs the same
+// burial test and the same sideways escape as `probe_position_baked`, so the
+// "was it nudged" decision can never disagree with where the probe ended up:
+// a probe that sat inside a wall and was moved out the nearest open column
+// takes the direction of that move - out of the wall, toward what it can see -
+// and every other probe takes its column's surface normal from the heightmap's
+// normal channels (floor surface for the floor layer, ceiling for the
+// ceiling layer). Open columns that recorded no surface fall back to the
+// layer's own vertical. Written to `probe_positions` by `probe_positions.wgsl`
+// when the positions bake, read later through `probe_normal`.
+fn probe_normal_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
+    let info = uniforms.cascades[c];
+    let s = info.spacing;
+    let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
+    let origin = texel_at(xz);
+    let r = info.interval.y;
+    let escape = select(origin, escape_texel_xz(origin), sphere_is_buried(xz, r));
+
+    if !all(origin == escape) {
+        // Nudged: the direction of the sideways move, in world XZ.
+        let cell = cell_size();
+        let d = vec2<f32>(
+            f32(escape.x - origin.x) * cell.x,
+            f32(escape.y - origin.y) * cell.y,
+        );
+        return normalize(vec3<f32>(d.x, 0.0, d.y));
+    }
+
+    let n = select(
+        textureLoad(floor_normal, vec2<u32>(escape), 0).xyz,
+        textureLoad(ceiling_normal, vec2<u32>(escape), 0).xyz,
+        layer == 1u,
+    );
+    if dot(n, n) < 0.5 {
+        return vec3<f32>(0.0, select(1.0, -1.0, layer == 1u), 0.0);
+    }
+    return normalize(n);
 }
 
 // The open column nearest to `origin` in the horizontal plane. Used as the
@@ -232,6 +314,18 @@ fn escape_texel_xz(origin: vec2<i32>) -> vec2<i32> {
     return best;
 }
 
+// Which layer a cascade merge reads its parents from. Every parent-side term -
+// the parent's probe position, its ray block, and the segment geometry it
+// stored (`stored_segment`, `parent_dir_hits`) - is selected through here.
+// Merges are per-layer by default: a floor-layer probe merges into floor-layer
+// parents, a ceiling-layer one into ceiling-layer parents, and the two layers
+// never touch. `cross_layer` (the L key, `S_RC_CROSS_LAYER=1`) flips each
+// child onto the other layer's parents instead; the crossing applies once per
+// child, so the crossed parents merge as their own layer does.
+fn parent_layer(layer: u32) -> u32 {
+    return select(layer, 1u - layer, uniforms.cross_layer != 0u);
+}
+
 // One of the segments `march_hits.wgsl` stored for a ray: where it started and
 // which way it ran (not necessarily unit - `trace` was given `dir / length(dir)`,
 // so `t` is measured from `start` along the normalised direction).
@@ -251,9 +345,14 @@ struct Segment {
 // radiance `rays` holds for it, which is what lets the merge read the parent
 // back in the direction that was actually intersected - see
 // `parent_dir_hits` in `cascades2_5d.wgsl`.
-fn stored_segment(cc: u32, qi: vec2<u32>, pr: u32, k: u32) -> Segment {
+//
+// `layer` is the probe layer the segment belongs to (0 = floor, 1 = ceiling).
+// The two layers do not cascade: a floor-layer probe merges only with
+// floor-layer parents, a ceiling-layer one only with ceiling-layer parents, so
+// the layer is passed straight through to every cascade above.
+fn stored_segment(cc: u32, qi: vec2<u32>, pr: u32, k: u32, layer: u32) -> Segment {
     let info = uniforms.cascades[cc];
-    let q = probe_position(cc, qi);
+    let q = probe_position(cc, qi, layer);
     let d = cell_direction(pr, info.octa_side);
     var seg: Segment;
     seg.start = q;
@@ -267,7 +366,7 @@ fn stored_segment(cc: u32, qi: vec2<u32>, pr: u32, k: u32) -> Segment {
     let cell = vec2<i32>(floor(u));
     let corner = vec2<i32>(i32(k & 1u), i32(k >> 1u));
     let qi2 = vec2<u32>(clamp(cell + corner, vec2<i32>(0), vec2<i32>(grand.size) - 1));
-    seg.dir = probe_position(cc + 1u, qi2) + d * grand.interval.x - seg.start;
+    seg.dir = probe_position(cc + 1u, qi2, layer) + d * grand.interval.x - seg.start;
     return seg;
 }
 
@@ -327,7 +426,7 @@ const WINDING_SOLID: f32 = 0.5;
 // Measured on `room.glb` with the two channels dumped (`S_RC_DUMP_META_MIN` /
 // `_MAX`, 512^2): the normals are *not* dead here - 2520 ceiling and 2328
 // floor texels read y < -0.5 out of 262144 - so this is a real swap and not a
-// cleanup. It also reaches further than `probe_buried`: `trace` shares this
+// cleanup. It also reaches further: `trace` shares this
 // function, so cascade rays change where they stop as well, and the frame
 // moves as a result (see under `probe_visible`).
 fn is_solid(texel: vec2<i32>) -> bool {
@@ -425,29 +524,10 @@ fn escape_texel(origin: vec2<i32>, y: f32, ring: i32) -> vec2<i32> {
     return best;
 }
 
-// Whether the probe *as it ended up* is inside material, which after a nudge is
-// not a question about the grid cell it was gathered for. Testing that cell
-// instead would reject exactly the probes relocation just rescued, and accept
-// a probe that never moved because its cell looked open while the position it
-// is read at does not.
-//
-// The probe grid and the heightmap are not the same lattice: cascade 0 is one
-// probe per metre, the heightmap one texel per 7.8 cm, so a grid index has to
-// go through `probe_position`'s world-space round trip before it can index a
-// heightmap texture. Handing a grid index straight to `is_solid` silently
-// looks 12.8x/16x too far west and north, which for cascade 0 reaches only the
-// map's far corner - 0 of Sponza's flagged texels, so the test rejected
-// nothing anywhere in the scene while reading as if it were live. `p` is a
-// world position, so that round trip has already happened by the time it gets
-// here.
-fn probe_buried(p: vec3<f32>) -> bool {
-    return is_solid(texel_at(p.xz));
-}
-
 // The buried-in-wall test as the normals used to provide it: one of the two
 // stored bake normals pointing down-ish says the column either ends or starts
 // inside material at the split. `is_solid` stayed winding-only for `trace` /
-// `probe_visible` / `probe_buried`; the probe nudge is the one consumer that
+// `probe_visible`; the probe nudge is the one consumer that
 // still wants the normals.
 fn column_buried(texel: vec2<i32>) -> bool {
     let dims = textureDimensions(ceiling_normal);

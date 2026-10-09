@@ -36,6 +36,7 @@ use bevy::{
 
 use crate::heightmap::Heightmap;
 use crate::heightmap_bake::BakeState;
+use crate::ui::CrossLayerState;
 use crate::ui::ParallaxState;
 
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
@@ -158,6 +159,8 @@ pub struct CascadesUniforms {
     pub cascades: [CascadeInfoUniform; layout::CASCADES as usize],
     pub parallax_endpoint: u32,
     pub parallax_pad: u32,
+    pub cross_layer: u32,
+    pub cross_layer_pad: u32,
 }
 
 #[derive(Resource)]
@@ -181,9 +184,11 @@ struct CascadesPipeline {
 #[derive(Resource)]
 pub struct CascadesRenderData {
     pub rays_buffer: Buffer,
-    /// Every probe's final position, baked once after the heightmap/winding
-    /// maps exist. Marshalled here so `probe_position` in march/trace/gather
-    /// does not rerun the disk scan every frame.
+    /// Every probe's final position and baked normal, two vec4s per
+    /// probe-with-layer (position pair, normal pair), written once by the
+    /// probe_positions pass after the bake and the winding map are final.
+    /// Marshalled here so `probe_position`/`probe_normal` in march/trace/
+    /// gather/shade do not rerun the disk scan every frame.
     pub probe_positions_buffer: Buffer,
     /// Three rotating SH probe buffers. Which holds the freshest relight, which
     /// the last one and which is the next gather target follows [`Relight::phase`]
@@ -453,7 +458,9 @@ fn setup_pipelines(
 /// Radiance a probe ray records when it reaches open sky, in the same units
 /// as the sunlit surface radiance the bake stores (sun irradiance already
 /// scaled by the camera exposure). Override with S_RC_SKY="r,g,b" (linear).
-fn sky_color(sun_irradiance: Vec3) -> Vec4 {
+/// Mirrored by the main camera's clear color too, so the backdrop that
+/// shows through the doorway is the same sky the probes read.
+pub fn sky_color(sun_irradiance: Vec3) -> Vec4 {
     if let Ok(value) = std::env::var("S_RC_SKY") {
         let p: Vec<f32> = value
             .split(',')
@@ -488,6 +495,7 @@ fn prepare_buffers(
     existing: Option<Res<CascadesRenderData>>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     parallax: Res<ParallaxState>,
+    cross_layer: Res<CrossLayerState>,
 ) {
     let Some(heightmap) = heightmap else {
         return;
@@ -545,6 +553,8 @@ fn prepare_buffers(
         cascades,
         parallax_endpoint: parallax.enabled as u32,
         parallax_pad: 0,
+        cross_layer: cross_layer.enabled as u32,
+        cross_layer_pad: 0,
     };
     let mut bytes = encase::UniformBuffer::new(Vec::new());
     bytes.write(&uniforms).unwrap();
@@ -552,7 +562,7 @@ fn prepare_buffers(
     let probes: u64 = layout
         .cascades
         .iter()
-        .map(|c| (c.size.x * c.size.y) as u64)
+        .map(|c| (c.size.x * c.size.y) as u64 * layout::LAYERS as u64)
         .sum();
     let (
         rays_buffer,
@@ -592,7 +602,11 @@ fn prepare_buffers(
                     .collect();
                 (
                     storage("cascades_rays", layout.hit_words, readback),
-                    storage("cascades_probe_positions", probes, BufferUsages::STORAGE | BufferUsages::COPY_DST),
+                    storage(
+                        "cascades_probe_positions",
+                        probes * 2,
+                        BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    ),
                     // Three rotating buffers: the roles (fresh/prev/gather)
                     // follow Relight::phase, so none has a fixed meaning. The
                     // gather overwrites one of them as `read_write`; the blend
@@ -779,8 +793,12 @@ fn dispatch_cascades(
     // toggle silently invalidates that cache, so record the value it saw and
     // invalidate when it differs from the current uniform.
     mut marched_parallax: Local<Option<bool>>,
+    // Same for the cross-layer merge toggle: it changes which layer's parents
+    // the march's segments target, so it is part of `marched`'s cache key.
+    mut marched_cross_layer: Local<Option<bool>>,
     mut probe_positions_baked: Local<bool>,
     parallax: Res<ParallaxState>,
+    cross_layer: Res<CrossLayerState>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
         return;
@@ -830,6 +848,10 @@ fn dispatch_cascades(
         *marched = false;
         *marched_parallax = Some(parallax.enabled);
     }
+    if *marched_cross_layer != Some(cross_layer.enabled) {
+        *marched = false;
+        *marched_cross_layer = Some(cross_layer.enabled);
+    }
     let need_march = !*marched;
     if need_march && !verified {
         return;
@@ -851,7 +873,7 @@ fn dispatch_cascades(
         .layout
         .cascades
         .iter()
-        .map(|c| (c.size.x * c.size.y) as u64)
+        .map(|c| (c.size.x * c.size.y) as u64 * layout::LAYERS as u64)
         .sum::<u64>()
         * SH_STRIDE;
     let mut bytes = encase::UniformBuffer::new(Vec::new());
@@ -877,7 +899,11 @@ fn dispatch_cascades(
         pass.set_bind_group(1, &render_data.probe_positions_bind_group, &[]);
         for (c, pos) in layout.layout.cascades.iter().zip(&probe_positions) {
             pass.set_pipeline(pos);
-            pass.dispatch_workgroups((c.size.x * c.size.y).div_ceil(WORKGROUP), 1, 1);
+            pass.dispatch_workgroups(
+                (c.size.x * c.size.y * layout::LAYERS).div_ceil(WORKGROUP),
+                1,
+                1,
+            );
         }
         *probe_positions_baked = true;
         pass.set_bind_group(0, &render_data.common_bind_group, &[]);
@@ -923,7 +949,11 @@ fn dispatch_cascades(
         pass.set_bind_group(1, &render_data.gather_bind_groups[phase], &[]);
         for (c, gather) in layout.layout.cascades.iter().zip(&gathers) {
             pass.set_pipeline(gather);
-            pass.dispatch_workgroups((c.size.x * c.size.y).div_ceil(WORKGROUP), 1, 1);
+            pass.dispatch_workgroups(
+                (c.size.x * c.size.y * layout::LAYERS).div_ceil(WORKGROUP),
+                1,
+                1,
+            );
         }
 
         // G becomes A, A becomes B, B becomes G.

@@ -29,6 +29,12 @@ startup into textures the cascade probes then trace against.
 > documented behaviour of each measurement, notably how winding-vs-normal-
 > vs-trace tests behave and why the box culling modes fail.
 
+Bevy's default ambient is **off**: `main.rs` inserts
+`GlobalAmbientLight::NONE` (brightness 0) after `DefaultPlugins`, because the
+room is lit by the baked cascade probes plus the sun and the stock brightness-80
+flat ambient washed it out. Removing the line restores Bevy's default. Measured
+at the wall camera (static sun): luminance 70.29 -> 54.71, mean |d| 14.45.
+
 ## Commands
 
 ```sh
@@ -42,6 +48,10 @@ BEVY_ASSET_ROOT=$PWD S_RC_CAM="-10.58,4.86,-3.21,-1.17,8.18,-3.83" \
 #   S_RC_CAM="-9.20,4.88,-6.88,-0.63,6.62,-4.79"
 # S_RC_PROBES=1          show probes
 # S_RC_OVERLAY=1         keep the heightmap debug planes
+# S_RC_CROSS_LAYER=1     cross-layer cascade merge (L key)
+# S_RC_BILATERAL=1       cross-bilateral shade gather (B key)
+# S_RC_NORMAL_BIAS=0     read the probe grid at the shading point + probe_visible
+#                        (default is on: fetch at p + n*0.6 + V*0, trace skipped)
 # S_RC_SCREENSHOT=/tmp/x.png    also exits at frame 240
 # Dump any baked image whole, to poke at it in numpy:
 #   S_RC_DUMP_HEIGHT=/tmp/h.bin     Rg32Float  512x512x2, **x = ceiling, y = floor**
@@ -80,13 +90,139 @@ comes out 0% and every count looks like noise.
 
 ## State
 
-Probes sit exactly mid-way between their column's stored floor and ceiling
-(`probe_position` returns `0.5 * (ceiling + floor)`, using the column it was
-nudged to; only open-sky/empty columns fall back to the bake plane). The escape
-nudge gates on `is_solid`, winding-only. `probe_buried` rejects a probe's
-weight directly; `probe_visible` goes through `trace`, which consults the same
-`is_solid`. `SPLIT = 0.0` is exact mid-room for `room.glb` (its 20×6×20 m
-inner block runs y −3.0..3.0, interior −2.7..2.7).
+Probes sit in **two real layers per XZ cell** (`PROBES_PER_CELL = 2`, low bit of
+the probe index = layer): a floor-layer probe a constant `PROBE_LAYER_GAP`
+(0.1 m) above the column's stored floor surface, a ceiling-layer probe the same
+distance below its stored ceiling. Columns without a usable interval (open sky,
+or ceiling/floor missing) fall back to `split ± GAP`. `probe_position(c, probe,
+layer)` / `probe_position_baked(...)` return these; the cascade index is
+`cell_id * 2 + layer` in every buffer and dispatch (`layout::LAYERS = 2`,
+`rays()`, `probe_base`, `rays_base`, `probe_words`, the `probe_positions` and
+`gather` dispatches all ×2; `march_hits`, `cascades2_5d`, `gather_cascades` all
+derive layer from `id % 2`).
+
+**Both parallax corrections are gone.** The shade is a trilinear read of the two
+layers (4 XZ neighbours × floor + ceiling, each layer gathered bilinearly and
+renormalised, faded by how far the fetch anchor (see the normal-biased fetch
+paragraph below; `p` by default) sits between the interpolated layer heights);
+the SH is evaluated in closed form against the surface normal
+(`sh_irradiance`), replacing the 32-sample Monte-Carlo `probe_irradiance` (still
+commented in `shade_cascades.wgsl`). The cascade march/merge endpoint parallax
+is off by default (`ParallaxState` default `false`), gated behind
+`uniforms.parallax_endpoint != 0u` for A/B. The old single-layer bilinear read
+survives behind `view_info.trilinear_enabled` (T key / `S_RC_TRILINEAR=0`) as a
+reference. Measured at the interior camera: trilinear mean luminance 64.7 vs
+bilinear 62.1, mean |d| 3.88, 31% of pixels past 0.05 digit.
+
+**Cascade merges are per-layer, unless `cross_layer` is on.** Every parent-side
+term (parent probe position, its stored segment geometry, its ray block) goes
+through `parent_layer(layer)` in `heightmap_trace.wgsl`, which is the identity
+by default and flips to `1 - layer` when `uniforms.cross_layer != 0u` — one
+crossing per child, no oscillation up the chain. The L key /
+`S_RC_CROSS_LAYER=1` toggles it; it is a march-time input, so `dispatch_cascades`
+re-runs the one-shot march when it flips (the `marched_cross_layer` Local,
+alongside `marched_parallax`). Measured at the interior camera: mean luminance
+64.50 vs 64.70 separated, mean |d| 1.17, 2.8% of pixels past 0.05 digit.
+
+**The shade's gather can also be a cross-bilateral (B / `S_RC_BILATERAL=1`, off
+by default).** The B key keeps the trilinear footprint — the pixel's 4 corner
+cells x 2 layers = **8 probes** — and replaces the fixed bilinear weights and
+`height_agreement` fade with guide-driven weights, each tap weighted by the
+bilinear tent, a normal kernel `max(0, n_p . n_q)^gamma` with `n_p` the
+deferred G-buffer normal and `n_q` the **probe's own normal, assigned by its
+bake**: the heightmap normal of its column (ceiling layer ->
+`ceiling_normal`, floor layer -> `floor_normal`), or, when the probe sat
+inside a wall and was moved sideways to the nearest open column
+(`escape_texel_xz`), the direction of that move. A third rule went in and
+came back out: probes whose burial sphere touched a wall but whose own
+column was open facing the nearest solid texel — it lit 359/2706 columns
+with horizontal normals but stepped where the rule boundary crossed a probe
+cell and read as **shadow strips along structure edges**, so it is reverted.
+Measured on `room.glb`: the escape branch fires on only **5** of 2706
+cascade-0 probes (the ones standing on the central raised platform, whose own
+column is solid); the perimeter walls almost never nudge because their probe
+columns are interior/open. The normals are baked once
+into `probe_positions`, which now holds **two vec4s per probe-with-layer**
+(even = position, odd = normal; `probe_position`/`probe_normal` read `2*i` /
+`2*i+1`, buffer sized `probes * 2` in `prepare_buffers`). The level and a
+plane kernel `exp(-|n_p . (X_q - X_p)| / 0.5m)` with both positions in world
+space — `X_p` reconstructed from prepass depth and `X_q` the stored probe
+position. A wider footprint went in and came back out: RC is noiseless, so
+the field between the neighbours is already a linear interpolation of them
+and a (2R+1)^2 x 2 block had nothing extra to average — it only made the
+pass 3x slower (50 taps -> 8 FPS). Kernels live as `BI_*` consts in
+`shade_cascades.wgsl` (GAMMA 32, PLANE 0.5 m; there is no radius or spatial
+sigma). The range kernels do most of the work: measured at the interior
+camera with correct baked normals, the bilateral reads ~62.9 mean luminance
+against the trilinear 62.2 with `GAMMA = 0` (the flat floor band unchanged,
+mean|d| ~1.4) and ~54-56 against 62.8 with `GAMMA = 32` (walls and floor
+darkened 5-9 digits, 40-50% of pixels past 0.05 — the orientation gate doing
+its edge-preservation job; it cuts hard with no wide spatial support to
+soften it). Note the per-tap `normalize(textureLoad(...))` read it replaced
+produced **NaNs** on columns that recorded no surface (0/0, so the
+`dot < 0.5` fallback never fired and the tap was silently dropped); the baked
+path checks `dot(n,n) < 0.5` before normalizing, so the fallback works. The
+default (off) build is bit-identical to the pre-bilateral frame.
+
+**Bug 4: the bilateral normal gate collapsed on walls.** A vertical wall's
+G-buffer normal is horizontal while every standard floor/ceiling probe's baked
+normal is vertical, so `dot(n, n_q) = 0` and `pow(max(0, dot), BI_GAMMA)` = 0
+for all 8 taps: the wall's `w_bi` collapsed onto only the nudged probes whose
+horizontal normal happened to align, reading as dark columns. Fix (in the
+bilateral tap loop): on a vertical pixel with a vertical probe normal
+(`abs(n.y) < 0.5 && abs(n_q.y) > 0.8`) the hard gate is replaced by the soft
+wrap `saturate(dot * 0.5 + 0.5)` (`dot = 0` -> 0.5); every other surface keeps
+the `pow` gate that preserves edges. The previous line is kept commented
+directly above. Measured at the wall camera with `S_RC_BILATERAL=1` and the
+normal bias on (static sun): before the fix the bilateral sat at luminance
+67.16 against the trilinear 70.29 (mean |d| 7.74); after, 72.98 (before-vs-after
+mean |d| 5.85, 38.5% of pixels past 0.05, md5 `9e3adaee...` -> `cc85c59d...`).
+The change is confined to the vertical band: the top 150 and bottom 150 rows
+(ceiling/sky and floor) are bit-identical, so the wrap is not touching
+floor/ceiling pixels.
+
+**The shade's fetch can be normal-biased (N / `S_RC_NORMAL_BIAS`, on by
+default).** Instead of reading the probe grid at `p`, `shade_cascades.wgsl`
+reads it at `P_sample = p + n * BIAS_NORMAL + V * BIAS_VIEW` (`n` the G-buffer
+normal, `V` the unit surface->eye direction, `BIAS_NORMAL = 0.6`, `BIAS_VIEW =
+0.0`). Pushing the anchor along the normal moves it into the open half-space the
+surface faces, so the cell selected is the one in front of the surface; that is
+what `probe_visible` did with a trace, so the two are alternatives: the toggle
+ON skips `probe_visible`, OFF (`S_RC_NORMAL_BIAS=0`) keeps it and reads at `p`.
+The anchor drives both the XZ cell lookup (`gu`/`frac`) and the trilinear
+vertical weight `t`. The `BIAS_NORMAL` start was the 0.4 m guard band
+`mytodo.md` section 2 asks for (raised to 0.6 in the tree) and is the knob to
+tune for leakage; note it also shifts `t` on
+near-horizontal surfaces, so a floor pixel picks up a little ceiling-layer
+light (about `BIAS_NORMAL` / room height). `BIAS_VIEW` is a second, off-by-
+default slide toward the eye; `mytodo.md` section 4.3 is the rationale.
+
+Measured at the wall camera (`S_RC_CAM=4.14,-0.96,2.53,0.81,0.03,-6.84`,
+`S_RC_SUN=62,54.7 S_RC_SUN_STILL=1 S_RC_INDIRECT=1 S_RC_OVERLAY=0`), bias on vs
+`S_RC_NORMAL_BIAS=0`: scene mean luminance 70.29 vs 68.98, mean |d| 2.78, 78% of
+pixels past 0.05. `BIAS_NORMAL` 0.6 vs 0.2 changes the frame (md5 `f3bf7b28...`
+vs `0af2202e...`), so the value reaches the shader. Both modes compile with 0
+shader errors. The off-mode frame (`022a2588...`) is the tree's own default with
+`probe_visible` restored — the working tree had it commented out and
+`height_agreement` removed from the trilinear read by hand; those two edits are
+kept (the legacy reference branch still uses both).
+
+**Axes-aligned walls are γ-invariant by construction.** At the wall-face
+camera (`S_RC_CAM=4.14,-0.96,2.53,0.81,0.03,-6.84`, `S_RC_SUN=62,54.7`) the
+wall tile's delta vs the trilinear reference is flat across a γ sweep (71.1,
+71.2, 71.3, 71.3 for γ = 0, 2, 8, 32) while the whole frame keeps moving
+(mean|d| 2.0 -> 3.6 -> 4.4). Reason: a wall pixel's aligned tap has
+`dot(n_p, n_q)` = 1 and its misaligned taps have 0, so `pow(., γ)` returns
+the same value for every γ > 0 — there is no intermediate alignment for γ to
+interpolate. The wall tile's actual knob is the plane kernel, not `BI_GAMMA`.
+Measured against the old vertical-normal bake at γ = 32 (new-vs-old mean|d|
+6.9, 50% of pixels past 0.05; scene mean luminance 67.7 vs 63.7, restoring
+it toward the trilinear 68.5), so the baked normals were reaching the shade —
+the wall's γ-invariance was not a wiring bug.
+
+There is no mid-room probe layer any more; the old "probes mid-way between floor
+and ceiling" state, the `S_RC_*` legacy leak camera and the Sponza numbers all
+predate it.
 
 Uncommitted working tree. The inside-wall test is now **derived from the
 winding slice at `SPLIT`** and routed solely through `is_solid` (winding-only).

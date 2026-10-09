@@ -2,7 +2,7 @@
 // records the probe's parallax radius: the distance of its farthest hit.
 // Shading treats the probe's surroundings as a sphere of that radius.
 
-#import s_rc::heightmap_trace::{uniforms, probe_position, sh_basis, MISS, SH_STRIDE}
+#import s_rc::heightmap_trace::{uniforms, probe_position, sh_basis, MISS, SH_STRIDE, PROBES_PER_CELL}
 
 @group(1) @binding(0) var<storage, read> rays: array<vec4<f32>>;
 @group(1) @binding(1) var<storage, read_write> sh_probes: array<vec4<f32>>;
@@ -11,9 +11,12 @@
 
 fn gather(c: u32, id: u32) {
     let info = uniforms.cascades[c];
-    if id >= info.size.x * info.size.y {
+    if id >= info.size.x * info.size.y * PROBES_PER_CELL {
         return;
     }
+    let layer = id % PROBES_PER_CELL;
+    let cell_id = id / PROBES_PER_CELL;
+    let probe = vec2<u32>(cell_id % info.size.x, cell_id / info.size.x);
     let rays_per_probe = info.octa_side * info.octa_side;
     let per_cell = info.sub * info.sub;
 
@@ -37,8 +40,7 @@ fn gather(c: u32, id: u32) {
     for (var i = 0u; i < 9u; i++) {
         sh_probes[base + i] = vec4<f32>(sh[i], 0.0);
     }
-    let probe = vec2<u32>(id % info.size.x, id / info.size.x);
-    sh_probes[base + 9u] = vec4<f32>(probe_position(c, probe), radius);
+    sh_probes[base + 9u] = vec4<f32>(probe_position(c, probe, layer), radius);
 }
 
 @compute @workgroup_size(64, 1, 1) fn gather_0(@builtin(global_invocation_id) id: vec3<u32>) { gather(0u, id.x); }

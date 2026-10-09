@@ -10,7 +10,7 @@
 // schedule.
 
 #import s_rc::heightmap_trace::{
-    uniforms, probe_position, cell_direction, stored_segment, MISS,
+    uniforms, probe_position, cell_direction, stored_segment, parent_layer, MISS, PROBES_PER_CELL,
 }
 
 @group(1) @binding(0) var radiance_min: texture_2d<f32>;
@@ -77,11 +77,13 @@ fn parent_dir_hits(
     p: vec3<f32>,
     d: vec3<f32>,
     t_start: f32,
+    layer: u32,
 ) -> array<vec4<f32>, 4> {
     let info = uniforms.cascades[cc];
     // The top cascade's slots 1..3 are never written; only slot 0 is a trace.
     let slots = select(4u, 1u, cc + 1u >= uniforms.cascade_count);
-    let ray_base = info.ray_base + (qi.y * info.size.x + qi.x) * info.octa_side * info.octa_side;
+    let ray_base = info.ray_base
+        + ((qi.y * info.size.x + qi.x) * PROBES_PER_CELL + layer) * info.octa_side * info.octa_side;
     var out = array<vec4<f32>, 4>(
         vec4<f32>(-1.0, 0.0, 0.0, 0.0),
         vec4<f32>(-1.0, 0.0, 0.0, 0.0),
@@ -98,7 +100,7 @@ fn parent_dir_hits(
                 if hit_t(e) == MISS {
                     continue;
                 }
-                let s = stored_segment(cc, qi, pr, k);
+                let s = stored_segment(cc, qi, pr, k, layer);
                 let len = length(s.dir);
                 if len <= 1e-5 {
                     continue;
@@ -121,11 +123,14 @@ fn cascade(c: u32, id: u32) {
     let side = info.octa_side;
     let rays_per_probe = side * side;
     let probe_index = id / rays_per_probe;
-    if probe_index >= info.size.x * info.size.y {
+    if probe_index >= info.size.x * info.size.y * PROBES_PER_CELL {
         return;
     }
+    let layer = probe_index % PROBES_PER_CELL;
+    let cell_id = probe_index / PROBES_PER_CELL;
+    let qi_child = vec2<u32>(cell_id % info.size.x, cell_id / info.size.x);
     let ray = id % rays_per_probe;
-    let p = probe_position(c, vec2<u32>(probe_index % info.size.x, probe_index / info.size.x));
+    let p = probe_position(c, qi_child, layer);
     let d = cell_direction(ray, side);
 
     if c + 1u >= uniforms.cascade_count {
@@ -166,26 +171,35 @@ fn cascade(c: u32, id: u32) {
         let wxy = select(1.0 - f, f, corner == vec2<u32>(1u));
         let w = wxy.x * wxy.y;
         let qi = vec2<u32>(clamp(base + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(parent.size) - 1));
-        let q = probe_position(c + 1u, qi);
+        // The parent side of the merge follows `parent_layer`: the parent probe
+        // position, its stored segment geometry and its ray block all read the
+        // same layer - the child's own by default, the other layer's when
+        // `cross_layer` is on.
+        let q = probe_position(c + 1u, qi, parent_layer(layer));
 
         // Same endpoint the march traced: the nearest of the parent's hits
         // projected onto this ray, falling back to the parent's ray start when
         // it has none in this direction - which is the case the march stored a
         // miss for.
-        let dirs = parent_dir_hits(c + 1u, qi, ray_cell, p, d, info.interval.x);
         var end = q + d * parent.interval.x;
+        // Endpoint parallax is off (see `parallax_endpoint`): the old handoff
+        // above stands. Turning the uniform on again computes the parent's hit
+        // candidates and ends the segment where they project onto this ray.
         var n_dirs = 0u;
         var nearest = -1.0;
-        for (var j = 0u; j < 4u; j++) {
-            if dirs[j].x >= 0.0 {
-                n_dirs += 1u;
-                if nearest < 0.0 || dirs[j].x < nearest {
-                    nearest = dirs[j].x;
+        if uniforms.parallax_endpoint != 0u {
+            let dirs = parent_dir_hits(c + 1u, qi, ray_cell, p, d, info.interval.x, parent_layer(layer));
+            for (var j = 0u; j < 4u; j++) {
+                if dirs[j].x >= 0.0 {
+                    n_dirs += 1u;
+                    if nearest < 0.0 || dirs[j].x < nearest {
+                        nearest = dirs[j].x;
+                    }
                 }
             }
-        }
-        if uniforms.parallax_endpoint != 0u && n_dirs > 0u {
-            end = p + d * nearest;
+            if n_dirs > 0u {
+                end = p + d * nearest;
+            }
         }
         let seg = end - a;
         let len = length(seg);
@@ -201,7 +215,10 @@ fn cascade(c: u32, id: u32) {
             continue;
         }
 
-        let parent_rays = parent.ray_base + (qi.y * parent.size.x + qi.x) * parent_side * parent_side;
+        let parent_rays = parent.ray_base
+            + ((qi.y * parent.size.x + qi.x) * PROBES_PER_CELL + parent_layer(layer))
+                * parent_side
+                * parent_side;
         // The inheritance is the full 2x2 parent block, always: the child's
         // direction sits centrally in that block, and pruning the directions
         // that ended in sky or whose projected point is short of the child's

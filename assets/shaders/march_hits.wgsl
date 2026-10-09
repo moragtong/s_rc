@@ -7,7 +7,8 @@
 // hits, which is the part that changes when the lighting does.
 
 #import s_rc::heightmap_trace::{
-    uniforms, trace, Hit, probe_position, cell_direction, stored_segment, MISS,
+    uniforms, trace, Hit, probe_position, cell_direction, stored_segment, parent_layer, MISS,
+    PROBES_PER_CELL,
 }
 
 // Per ray: the top cascade's own trace, or the four bilinear-parent segments
@@ -61,11 +62,13 @@ fn parent_dir_hits(
     p: vec3<f32>,
     d: vec3<f32>,
     t_start: f32,
+    layer: u32,
 ) -> array<vec4<f32>, 4> {
     let info = uniforms.cascades[cc];
     // The top cascade's slots 1..3 are never written; only slot 0 is a trace.
     let slots = select(4u, 1u, cc + 1u >= uniforms.cascade_count);
-    let ray_base = info.ray_base + (qi.y * info.size.x + qi.x) * info.octa_side * info.octa_side;
+    let ray_base = info.ray_base
+        + ((qi.y * info.size.x + qi.x) * PROBES_PER_CELL + layer) * info.octa_side * info.octa_side;
     var out = array<vec4<f32>, 4>(
         vec4<f32>(-1.0, 0.0, 0.0, 0.0),
         vec4<f32>(-1.0, 0.0, 0.0, 0.0),
@@ -82,7 +85,7 @@ fn parent_dir_hits(
                 if t == MISS {
                     continue;
                 }
-                let s = stored_segment(cc, qi, pr, k);
+                let s = stored_segment(cc, qi, pr, k, layer);
                 let len = length(s.dir);
                 if len <= 1e-5 {
                     continue;
@@ -105,11 +108,14 @@ fn march(c: u32, id: u32) {
     let side = info.octa_side;
     let rays_per_probe = side * side;
     let probe_index = id / rays_per_probe;
-    if probe_index >= info.size.x * info.size.y {
+    if probe_index >= info.size.x * info.size.y * PROBES_PER_CELL {
         return;
     }
+    let layer = probe_index % PROBES_PER_CELL;
+    let cell_id = probe_index / PROBES_PER_CELL;
+    let qi_view = vec2<u32>(cell_id % info.size.x, cell_id / info.size.x);
     let ray = id % rays_per_probe;
-    let p = probe_position(c, vec2<u32>(probe_index % info.size.x, probe_index / info.size.x));
+    let p = probe_position(c, qi_view, layer);
     let d = cell_direction(ray, side);
     let base = info.ray_base + id;
 
@@ -136,19 +142,30 @@ fn march(c: u32, id: u32) {
         let qi = vec2<u32>(
             clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(parent.size) - 1),
         );
-        let q = probe_position(c + 1u, qi);
+        let q = probe_position(c + 1u, qi, parent_layer(layer));
         var end = q + d * parent.interval.x;
-        let dirs = parent_dir_hits(c + 1u, qi, ray_cell, p, d, info.interval.x);
+        // Endpoint parallax is off (see `parallax_endpoint`): the old handoff
+        // above stands. Turning the uniform on again computes the parent's hit
+        // candidates and ends the segment where they project onto this ray.
         var nearest = -1.0;
-        for (var j = 0u; j < 4u; j++) {
-            if dirs[j].x >= 0.0 && (nearest < 0.0 || dirs[j].x < nearest) {
-                nearest = dirs[j].x;
+        if uniforms.parallax_endpoint != 0u {
+            let dirs = parent_dir_hits(
+                c + 1u,
+                qi,
+                ray_cell,
+                p,
+                d,
+                info.interval.x,
+                parent_layer(layer),
+            );
+            for (var j = 0u; j < 4u; j++) {
+                if dirs[j].x >= 0.0 && (nearest < 0.0 || dirs[j].x < nearest) {
+                    nearest = dirs[j].x;
+                }
             }
-        }
-        // A/B via the toggle in the UI: with `parallax_endpoint` off this falls
-        // back to the old handoff, `end = q + d * parent.interval.x`.
-        if uniforms.parallax_endpoint != 0u && nearest >= 0.0 {
-            end = p + d * nearest;
+            if nearest >= 0.0 {
+                end = p + d * nearest;
+            }
         }
         let seg = end - a;
         let len = length(seg);

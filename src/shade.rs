@@ -33,6 +33,9 @@ struct ShadeUniforms {
     world_from_view: Mat4,
     probes_enabled: u32,
     indirect_enabled: u32,
+    trilinear_enabled: u32,
+    bilateral_enabled: u32,
+    normal_bias_enabled: u32,
 }
 
 #[derive(Resource)]
@@ -148,6 +151,9 @@ fn draw_shade(
         world_from_view: extracted_view.world_from_view.to_matrix(),
         probes_enabled: lighting_state.probes_enabled as u32,
         indirect_enabled: lighting_state.indirect_enabled as u32,
+        trilinear_enabled: lighting_state.trilinear_enabled as u32,
+        bilateral_enabled: lighting_state.bilateral_enabled as u32,
+        normal_bias_enabled: lighting_state.normal_bias_enabled as u32,
     });
     uniforms.write_buffer(&render_device, &render_queue);
 

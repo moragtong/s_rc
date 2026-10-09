@@ -5,6 +5,13 @@
 use bevy::math::{Vec2, Vec3, Vec4};
 
 pub const CASCADES: u32 = 4;
+/// Probes per XZ cell: a floor layer, a constant distance above the column's
+/// stored floor surface, and a ceiling layer, the same distance below its
+/// stored ceiling surface. The two layers are what make the shade read
+/// trilinear (4 XZ neighbours x 2 layers) instead of bilinear, and they let
+/// the per-tap parallax corrections go: every probe sits where it should
+/// contribute, on the surface it is about.
+pub const LAYERS: u32 = 2;
 /// Cascade-0 probe spacing, m. Doubles per cascade.
 /// Spacing and directions have to grow together: against Mitsuba, indirect
 /// RMSE was 49.5% at 0.5 m and 4x4 directions, 52% with only the spacing
@@ -87,7 +94,9 @@ impl CascadeWindow {
     }
 
     pub fn rays(&self) -> u64 {
-        (self.size.x as u64 * self.size.y as u64) * self.rays_per_probe() as u64
+        (self.size.x as u64 * self.size.y as u64)
+            * LAYERS as u64
+            * self.rays_per_probe() as u64
     }
 }
 
@@ -101,8 +110,10 @@ impl Layout {
             w.tag_base = tag_base as u32;
             w.sh_base = tag_base as u32;
             w.hit_base = hit_base as u32;
-            tag_base += w.size.x as u64 * w.size.y as u64;
-            hit_base += (w.rays_per_probe() as u64) * w.size.x as u64 * w.size.y as u64;
+            // One probe per layer: the XZ cell owns two probes.
+            tag_base += w.size.x as u64 * w.size.y as u64 * LAYERS as u64;
+            hit_base +=
+                (w.rays_per_probe() as u64) * w.size.x as u64 * w.size.y as u64 * LAYERS as u64;
         };
 
         let mut cascades = Vec::new();

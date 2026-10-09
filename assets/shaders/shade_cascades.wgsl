@@ -1,11 +1,28 @@
 // Indirect diffuse from cascade 0's SH probes, added onto the lit HDR
-// image. Each of the 4 bilinear probes is parallax corrected: its
-// surroundings are taken to lie on a sphere of its radius (its farthest
-// hit) around it, so the SH is read in the direction from the probe to
-// where the shading point's ray would meet that sphere.
+// image. Two real probe layers per XZ cell (see `PROBES_PER_CELL`): a floor
+// layer a constant distance above each column's stored floor surface and a
+// ceiling layer the same distance below its stored ceiling. Because the
+// probes sit *on* the surfaces they are about, the shade is a straight
+// trilinear read - 4 XZ neighbours x 2 layers - with no parallax needed:
+// there is no per-probe radius sphere to read against, and no vertical slide
+// to correct for. The SH is evaluated in closed form against the surface
+// normal (`sh_irradiance`), not the 32-sample parallax integral.
+//
+// `view_info.trilinear_enabled` (T) keeps the legacy single-layer bilinear
+// reference - just the floor layer of the same probes, no vertical axis.
+//
+// `view_info.bilateral_enabled` (B) replaces the fixed footprint with a
+// cross-bilateral (joint) filter over the probe field: range weights guided
+// by the deferred G-buffer's pixel normal and depth and the probes' own
+// baked normals and stored world positions. See the branch below.
+//
+// `view_info.normal_bias_enabled` (N) is the fetch mode toggle. Off: the probe
+// grid is read at `p` and `probe_visible` rejects the probes behind the
+// surface. On: the grid is read at `p + n * BIAS_NORMAL + V * BIAS_VIEW`
+// instead - the cell in front of the surface - and `probe_visible` is skipped.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, trace, MISS, PI, SH_STRIDE, height_agreement, probe_buried}
+#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal}
 
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var gbuffer: texture_2d<u32>;
@@ -20,6 +37,9 @@ struct ShadeUniforms {
     world_from_view: mat4x4<f32>,
     probes_enabled: u32,
     indirect_enabled: u32,
+    trilinear_enabled: u32,
+    bilateral_enabled: u32,
+    normal_bias_enabled: u32,
 }
 @group(1) @binding(3) var<uniform> view_info: ShadeUniforms;
 
@@ -31,13 +51,41 @@ const GOLDEN_ANGLE: f32 = 2.39996323;
 // space, so tracing from it unmodified reports a hit at t=0 and occludes every
 // probe at once, including the ones actually in view.
 const PROBE_BIAS: f32 = 0.02;
+// Cross-bilateral filter kernels (see the `bilateral_enabled` branch in
+// `shade`). The footprint is the pixel's 4 corner cells x 2 layers - the same
+// 8 probes the trilinear read uses - because RC is noiseless: the probe
+// field is already smooth, so there is nothing for a wide blur kernel to
+// average and the range kernels only have to *choose among* the immediate
+// neighbours. The normal kernel is a dot-product exponent; the plane kernel
+// falls off over `BI_PLANE_M` metres of world-space separation from the
+// pixel's tangent plane.
+const BI_GAMMA: f32 = 32.0;
+const BI_PLANE_M: f32 = 0.5;
+// Normal-biased fetch (`view_info.normal_bias_enabled`, the N toggle). Instead
+// of reading the probe grid at the shading point `p`, read it at
+//
+//     P_sample = p + n * BIAS_NORMAL + V * BIAS_VIEW,
+//
+// `n` the G-buffer normal and `V` the unit direction from the surface to the
+// eye. Pushing the fetch along the normal moves it into the open half-space
+// the surface faces, so the cell it lands in is the one *in front of* the
+// surface and the probes behind it - through a wall, under a floor - are never
+// selected in the first place. That is the job `probe_visible` does with a
+// trace; with the bias on, the occlusion test is skipped (`shade` runs it only
+// when the toggle is off), so the two are alternatives. BIAS_VIEW slides the
+// fetch toward the eye as a secondary term; it defaults off. Both are metres,
+// against cascade 0's 1 m spacing. BIAS_NORMAL starts at the 0.4 m guard band
+// `mytodo.md` section 2 asks for (a probe closer than that to the surface it
+// lights stops representing a field); it is the knob to tune for leakage.
+const BIAS_NORMAL: f32 = 0.6;
+const BIAS_VIEW: f32 = 0.0;
 // Half-extent of the room's inner faces, from `house_gltf.py`: ROOM is 20x6x20
 // with WALL = 0.3, so the interior runs -9.7..9.7 in both x and z.
 //
 // Tried as a clamp on the probe grid, then taken out in favour of rejecting on
 // the winding signal: three quarters of the grid is the void outside this
-// building, those probes sit in open columns so neither `probe_buried` nor
-// `height_agreement` stops them, and of the weight `probe_visible` would have
+// building, those probes sit in open columns so `height_agreement` does not
+// stop them, and of the weight `probe_visible` would have
 // rejected 90% was probes at |x| or |z| >= 9.7 - on a wall pixel, whose
 // footprint is probes at 9.5 and 10.5, that is half of its footprint.
 //
@@ -50,7 +98,7 @@ const PROBE_BIAS: f32 = 0.02;
 //
 // To restore:
 //   const PROBE_CLAMP_HALF: f32 = 9.7;
-// and in the loop below, before `probe_buried`:
+// and in the loop below:
 //   if abs(slot.x) >= PROBE_CLAMP_HALF || abs(slot.z) >= PROBE_CLAMP_HALF { w = 0.0; }
 const TAU: f32 = 6.28318530718;
 // Per-pixel hash: breaks the 1m probe grid and the 32-sample hemisphere into
@@ -138,42 +186,25 @@ fn tangent_frame(n: vec3<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(t, bt, n);
 }
 
-// ANALYTIC VERSION - no 32-sample integral, no parallax. The SH radiance
-// coefficients are convolved by the clamped-cosine lobe in closed form:
-// each band k scales by the fixed constant below (`sh_irradiance`,
-// `heightmap_trace.wgsl`). The cost drops from a 32-direction loop to one
-// `sh_basis(n)` + 9 MACs per probe per pixel. The tradeoff: entirely loses
-// parallax correction, so the read direction is always the surface normal
-// rather than where the shading ray would meet the probe's farthest-hit
-// sphere. A/B measured on the interior camera (static sun, full res):
-// [fill in after measurement].
-fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>, pixel: vec2<i32>) -> vec3<f32> {
-    return sh_irradiance(probe * SH_STRIDE, n);
-}
-
-// PREVIOUS: 32-sample Monte-Carlo integral with parallax. The integral per se
-// is redundant once the cosine lobe is pre-convolved into the coefficients -
-// it only exists to vary the read direction per sample, which is the parallax
-// correction: `d` is where the shading ray meets the probe's farthest-hit
-// sphere, not the normal. Kept commented for A/B.
-//
-// fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>, pixel: vec2<i32>) -> vec3<f32> {
+// PREVIOUS (dead since the two-layer model): a 32-sample Monte-Carlo integral
+// with parallax. The integral is redundant once the cosine lobe is pre-convolved
+// into the coefficients - it only existed to vary the read direction per sample,
+// which was the parallax correction: `d` was where the shading ray met the
+// probe's farthest-hit sphere, not the normal. The two probe layers removed the
+// need for it: every probe sits on the surface it is about, so the closed-form
+// `sh_irradiance` below (no per-sample loop, no radius sphere) is the read.
+// Kept, commented, for A/B - the measurement that retired it was the two-layer
+// parity check (trilinear 4XZ x 2 layers vs the old virtual-slice trilinear).
+// fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>, pixel: vec2<i32>, center: vec3<f32>) -> vec3<f32> {
 //     let base = probe * SH_STRIDE;
-//     let center = sh_probes[base + 9u];
-//     let oc = p - center.xyz;
-//     let radius = center.w;
+//     let oc = p - center;
+//     let radius = sh_probes[base + 9u].w;
 //     let frame = tangent_frame(n);
 //     var e = vec3<f32>(0.0);
-//     // The 9 coefficients are the same for every sample; load them once so the
-//     // loop below reads registers, not `sh_probes` (see `sh_radiance`).
 //     var coefs: array<vec3<f32>, 9>;
 //     for (var c = 0u; c < 9u; c++) {
 //         coefs[c] = sh_probes[base + c].xyz;
 //     }
-//     // Rotate the whole 32-sample pattern by a hash of the pixel and the probe
-//     // index, so neighbouring pixels integrate slightly different directions
-//     // and the low-frequency probe structure becomes interleaved noise instead
-//     // of contiguous bands.
 //     let rot = hash12(vec2<f32>(pixel) * 0.37 + vec2<f32>(f32(probe & 255u) * 0.17, f32((probe >> 8u) & 255u) * 0.23)) * TAU;
 //     for (var k = 0u; k < HEMISPHERE_SAMPLES; k++) {
 //         let u = (f32(k) + 0.5) / f32(HEMISPHERE_SAMPLES);
@@ -181,10 +212,6 @@ fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>, pixel: vec2<i32>) ->
 //         let phi = f32(k) * GOLDEN_ANGLE + rot;
 //         let w = frame * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(1.0 - u));
 //         var d = w;
-//         // Parallax: reduce the probe's surroundings to the sphere of its
-//         // farthest hit and read the SH toward where this shading ray meets
-//         // that sphere - a coarse stand-in for tracing the geometry. Probes
-//         // that hit nothing have radius 0 and are read uncorrected.
 //         if radius > 0.0 {
 //             let b = dot(oc, w);
 //             let disc = b * b - (dot(oc, oc) - radius * radius);
@@ -199,6 +226,12 @@ fn probe_irradiance(probe: u32, p: vec3<f32>, n: vec3<f32>, pixel: vec2<i32>) ->
 //     }
 //     return e * (PI / f32(HEMISPHERE_SAMPLES));
 // }
+
+// ACTIVE: the closed-form cosine lobe, no integral and no parallax. The SH
+// radiance coefficients are convolved by the clamped-cosine lobe: each band k
+// scales by a fixed constant (`sh_irradiance`). The thread is the surface
+// normal `n`, which is right now that every probe sits on the surface it
+// reports about.
 
 // Probe spheres of every cascade along the view ray, shaded as white
 // diffuse balls from their SH; returns (color, distance) or distance < 0.
@@ -309,60 +342,184 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // It is worth trying again only if it is keyed to something world-relative
     // or animated per frame, so it dithers rather than sticking to the screen.
     let dij = vec2<f32>(0.0);
-    let u = (p.xz - uniforms.hmap_min) / info.spacing - 0.5 + dij;
-    let cell = vec2<i32>(floor(u));
-    var e = vec3<f32>(0.0);
-    var w_sum = 0.0;
-    for (var k = 0u; k < 4u; k++) {
-        let corner = vec2<u32>(k & 1u, k >> 1u);
-        let q = vec2<u32>(clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(info.size) - 1));
-        let probe = info.probe_base + q.y * info.size.x + q.x;
-        let slot = sh_probes[probe * SH_STRIDE + 9u];
-        // The footprint is a tent centred on where the probe actually is, not
-        // on the cell it was sampled from. Relocation moves probes off their
-        // cell - out of the surface they were buried behind - and a probe that
-        // ended up more than a cell away is simply out of this footprint, so
-        // it falls to zero here instead of contributing at a cell it no longer
-        // occupies. On an undisplaced grid this reduces to the usual bilinear
-        // weights, and stays a partition of unity, so w_sum still renormalises.
-        let rel = (p.xz - slot.xz) / info.spacing;
-        let w_loc = max(1.0 - abs(rel.x), 0.0) * max(1.0 - abs(rel.y), 0.0);
-        // Height agreement folds the probe's own height into the bilinear
-        // weight; w_sum below renormalises, so down-weighting a probe
-        // redistributes its share instead of removing light.
-        var w = w_loc * height_agreement(slot.y - p.y, info.spacing);
-        // Drop the probe outright if it is inside solid material where it
-        // actually ended up. The renormalisation below then hands its share to
-        // the probes that survive, so a wall column loses its contribution
-        // rather than subtracting energy - which is what put probes inside
-        // walls and let them collect a share from both storeys.
-        //
-        // `slot.xyz`, not the grid cell: a probe that `probe_position` nudged
-        // out of a wall is read at its new position, and testing the cell it
-        // was gathered for would throw away exactly the probes the nudge just
-        // rescued. What is left here is a probe the nudge could not help.
-        if probe_buried(slot.xyz) {
-            w = 0.0;
-        }
-        // Grid clamp to the room, off - see `PROBE_CLAMP_HALF` above.
-        // if abs(slot.x) >= PROBE_CLAMP_HALF || abs(slot.z) >= PROBE_CLAMP_HALF {
-        //     w = 0.0;
-        // }
-        // A probe at w = 0 contributes nothing whether or not it is visible,
-        // so neither its trace nor its 32-sample integral needs doing: it is
-        // outside this footprint, out of height agreement, or buried. This is
-        // the single most expensive thing per probe, and a large share of them
-        // are at zero on any given pixel.
-        if w > 0.0 && probe_visible(p, n, slot.xyz) {
-            e += w * probe_irradiance(probe, p, n, pixel);
-            w_sum += w;
-        }
+    // The fetch anchor. With the normal bias off it is the shading point
+    // itself; with it on it is `p` pushed along the surface normal (and, if
+    // BIAS_VIEW is set, toward the eye), so the cell selected is the one in
+    // front of the surface. `probe_visible` is the other half of the toggle:
+    // it is only run when the bias is off (see the tap tests below).
+    var fetch = p;
+    if view_info.normal_bias_enabled != 0u {
+        let view_dir = (ro - p) / max(max_t, 1e-4);
+        fetch = p + n * BIAS_NORMAL + view_dir * BIAS_VIEW;
     }
-    // Renormalise over the probes that survived, so an occluded probe hands
-    // its share to the visible ones instead of subtracting light. Without this
-    // the footprint sums to less than 1 and every occlusion reads as a
-    // straight loss of energy rather than a redistribution.
-    e = select(e, e / w_sum, w_sum > 1e-5);
+    // The 4 XZ neighbours of the fetch anchor, shared by both gather shapes.
+    // Trilinear splits each bilinear tap on the vertical axis (see the branch
+    // below); the bilinear gather reads them at their stored height.
+    let gu = (fetch.xz - uniforms.hmap_min) / info.spacing - 0.5 + dij;
+    let cell = vec2<i32>(floor(gu));
+    var frac = gu - vec2<f32>(cell);
+    frac = frac * frac * frac * (frac * (frac * 6.0 - 15.0) + 10.0);
+    var e = vec3<f32>(0.0);
+    if view_info.bilateral_enabled != 0u {
+        // Cross-bilateral (joint) filter over the immediate neighbours, guided
+        // by the deferred G-buffer. RC is noiseless, so the field between a
+        // pixel's 4 corner cells is already a linear interpolation of them:
+        // a wide footprint would only re-smooth what the gather already made
+        // smooth. The filter keeps the trilinear footprint (4 corner cells x
+        // 2 layers = 8 probes) and replaces the fixed bilinear weights and
+        // `height_agreement` fade with guide-driven weights:
+        //
+        //   spatial: the bilinear tent of the pixel's position in its cell,
+        //   normal : max(0, n_p . n_q)^gamma, where n_p is the pixel's
+        //            G-buffer normal and n_q is the *probe's* own normal.
+        //            Every probe's normal is assigned by its bake: the
+        //            heightmap G-buffer normal of its column (ceiling layer
+        //            -> ceiling_normal, floor layer -> floor_normal), or,
+        //            when the probe sat inside a wall and was moved sideways
+        //            out to the nearest open column, the direction of that
+        //            move - the way it faces out of the wall. On a wall the
+        //            hard gate is replaced by a soft wrap (see Bug 4 in the
+        //            loop below), otherwise the vertical floor/ceiling probe
+        //            normals all score 0 and the wall weight collapses.
+        //   plane  : exp(-|n_p . (X_q - X_p)| / BI_PLANE_M), the world-space
+        //            distance from the probe to the pixel's tangent plane.
+        //
+        // Both depths enter in world space: X_p is the pixel's position
+        // reconstructed from the prepass depth above (`p`), X_q is the probe
+        // position the heightmap bake stored alongside its SH. The range
+        // kernels are what keep edges sharp: a probe behind a corner or a
+        // metre off the pixel's plane drops to ~zero weight, so the pixel
+        // never blends across the discontinuity - and the floor and ceiling
+        // layers separate by *normal*, not by a vertical fade. Open-column
+        // fallback probes (no stored surface) already carry their layer's
+        // vertical normal from the bake, and the plane weight sorts them out.
+        var e_bi = vec3<f32>(0.0);
+        var w_bi = 0.0;
+        for (var k = 0u; k < 4u; k++) {
+            let corner = vec2<u32>(k & 1u, k >> 1u);
+            let q = vec2<u32>(clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(info.size) - 1));
+            let wxy = mix(1.0 - frac, frac, vec2<f32>(corner));
+            let w_spatial = wxy.x * wxy.y;
+            let base_cell = info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL;
+            for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                let base = (base_cell + layer) * SH_STRIDE;
+                let center = sh_probes[base + 9u].xyz;
+                // The probe's own normal, as assigned by its bake: the
+                // heightmap normal of its column, or the nudge direction if
+                // the probe sat inside a wall and was moved sideways.
+                let nq = probe_normal(0u, q, layer);
+                let ndot = dot(n, nq);
+                // Bug 4: a vertical wall's normal is orthogonal to the floor
+                // and ceiling probe normals, so the hard orientation gate
+                // `pow(max(0, ndot), BI_GAMMA)` returns 0 for every standard
+                // probe and the wall's weight collapses onto the handful of
+                // nudged probes whose horizontal normal happens to align. On a
+                // wall, wrap the gate instead of clamping: accept vertical
+                // probe normals with a soft ramp (`ndot = 0` -> 0.5). Every
+                // other surface keeps the hard gate that preserves edges.
+                // PREVIOUS (collapsed on walls): normal_weight = pow(max(0.0,
+                // ndot), BI_GAMMA).
+                let normal_weight = select(
+                    pow(max(0.0, ndot), BI_GAMMA),
+                    saturate(ndot * 0.5 + 0.5),
+                    abs(n.y) < 0.5 && abs(nq.y) > 0.8,
+                );
+                let w = w_spatial
+                    * normal_weight
+                    * exp(-abs(dot(n, center - p)) / BI_PLANE_M);
+                // The occlusion trace only runs for taps that survive the
+                // kernels - the ones the guides already agree on - and only in
+                // the `probe_visible` mode: the normal-biased fetch already
+                // selects the cell in front of the surface, so it does not need
+                // the trace.
+                if w > 1e-3
+                    && (view_info.normal_bias_enabled != 0u || probe_visible(p, n, center))
+                {
+                    e_bi += w * sh_irradiance(base, n);
+                    w_bi += w;
+                }
+            }
+        }
+        e = select(e_bi, e_bi / w_bi, w_bi > 1e-5);
+    } else if view_info.trilinear_enabled != 0u {
+        // Trilinear over the two real probe layers: each of the 4 XZ
+        // neighbours holds a floor-layer probe (a constant distance above its
+        // column's stored floor) and a ceiling-layer probe (the same distance
+        // below its stored ceiling). Each layer is gathered bilinearly in XZ,
+        // then the two are faded by where `p` sits between the bilinearly
+        // interpolated floor and ceiling heights. With the probes on the
+        // surfaces they are about, there is nothing left to parallax-correct:
+        // the SH is read in closed form against the surface normal.
+        // Occlusion still tests the stored probe position, because `trace` is
+        // a 3D test and the layers sit centimetres off the actual surfaces.
+        var e_floor = vec3<f32>(0.0);
+        var w_floor = 0.0;
+        var e_ceil = vec3<f32>(0.0);
+        var w_ceil = 0.0;
+        var h_floor = 0.0;
+        var h_ceil = 0.0;
+        for (var k = 0u; k < 4u; k++) {
+            let corner = vec2<u32>(k & 1u, k >> 1u);
+            let q = vec2<u32>(clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(info.size) - 1));
+            let wxy = mix(1.0 - frac, frac, vec2<f32>(corner));
+            let w = wxy.x * wxy.y;
+            let base_cell = info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL;
+            for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                let base = (base_cell + layer) * SH_STRIDE;
+                let center = sh_probes[base + 9u].xyz;
+                // The two layer heights, bilinearly merged, define the
+                // vertical axis of the trilinear read.
+                if (layer == 0u) {
+                    h_floor += w * center.y;
+                } else {
+                    h_ceil += w * center.y;
+                }
+                if w > 0.0
+                    && (view_info.normal_bias_enabled != 0u || probe_visible(p, n, center))
+                {
+                    let read = sh_irradiance(base, n);
+                    if (layer == 0u) {
+                        e_floor += w * read;
+                        w_floor += w;
+                    } else {
+                        e_ceil += w * read;
+                        w_ceil += w;
+                    }
+                }
+            }
+        }
+        // Renormalise each layer over the probes that survived, so an occluded
+        // probe hands its share to the visible ones instead of subtracting
+        // light. Without this the footprint sums to less than 1 and every
+        // occlusion reads as a straight loss of energy rather than a
+        // redistribution.
+        e_floor = select(e_floor, e_floor / w_floor, w_floor > 1e-5);
+        e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > 1e-5);
+        // The trilinear vertical weight: how far the fetch anchor sits from the
+        // floor layer toward the ceiling layer. A pixel on the floor reads the
+        // floor layer (and vice versa).
+        var t = saturate((fetch.y - h_floor) / max(h_ceil - h_floor, 1e-4));
+        t = t * t * (3.0 - 2.0 * t);
+        e = mix(e_floor, e_ceil, t);
+    } else {
+        // Legacy single-layer reference, for A/B: just the floor layer of the
+        // same probes, bilinear in XZ, no vertical axis. Selected by
+        // `S_RC_TRILINEAR=0` / the T key.
+        var w_sum = 0.0;
+        for (var k = 0u; k < 4u; k++) {
+            let corner = vec2<u32>(k & 1u, k >> 1u);
+            let q = vec2<u32>(clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(info.size) - 1));
+            let wxy = mix(1.0 - frac, frac, vec2<f32>(corner));
+            let w = wxy.x * wxy.y;
+            let base = (info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL) * SH_STRIDE;
+            let center = sh_probes[base + 9u].xyz;
+            if w > 0.0 && probe_visible(p, n, center) {
+                e += w * sh_irradiance(base, n) * height_agreement(center.y - p.y, info.spacing);
+                w_sum += w;
+            }
+        }
+        e = select(e, e / w_sum, w_sum > 1e-5);
+    }
     // The material's metallic from the deferred G-buffer reads ~1 for this
     // asset even though the room GLB has no material (Bevy's default is 0),
     // so `(1.0 - metallic)` silently killed the whole pass. The bake is
