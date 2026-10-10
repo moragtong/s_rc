@@ -215,26 +215,34 @@ fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     let s = info.spacing;
     // TEMPORARY test (review point 4): force the baked probe centers onto the
     // unmodified regular grid, XZ = hmap_min + (probe + 0.5) * spacing over the
-    // *origin* column, to test whether the sideways escape is what breaks the
-    // bilinear metric. Guarding `sphere_is_buried` here means the escape never
+    // *origin* column, to test whether the sideways nudge is what breaks the
+    // bilinear metric. Zeroing the nudge radius here means the nudge never
     // fires, so `probe_position_baked`/`probe_normal_baked` (and therefore the
     // probe_positions buffer every pass reads) come out on the grid with the
     // origin column's surface normal. Flip to `true`, run, flip back.
     const FLAT_GRID_XZ_TEST: bool = false;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
-    // The origin column's taps, and where the escape would move a buried probe
-    // to - the position and the normal must agree on which of the two won.
-    let origin = texel_at(xz);
-    // Burial-test radius. `info.interval.y` is the cascade's *far* distance
-    // (2/4/8/16 m), which made `sphere_is_buried` true for essentially every
-    // probe and walked a 16 m square per probe. A probe only needs testing
-    // against the gap it sits off its own surface.
-    let r = PROBE_LAYER_GAP;
-    let escape = select(origin, escape_texel_xz(origin), !FLAT_GRID_XZ_TEST && sphere_is_buried(xz, r));
+    // Nudge the probe out of any wall its gather sphere reaches into, by the
+    // cascade interval's *start* radius - the near end of what its rays
+    // actually sample. `nudge_out_of_solid` moves it only as far as the overlap
+    // needs and reports the XZ direction, which `probe_normal_baked` reuses.
+    //
+    // The previous nudge is kept commented: it relocated a probe whose *own*
+    // column was solid to the nearest open column, reading that column's whole
+    // surface height - a full cell away instead of the few centimetres an
+    // overlap needs - and its burial test (`sphere_is_buried` on a sphere of
+    // `r`, at one point the far interval end) disagreed with its escape
+    // (`escape_texel_xz` on the centre column), so a probe whose sphere clipped
+    // a wall never moved.
+    // let origin = texel_at(xz);
+    // let r = PROBE_LAYER_GAP;
+    // let escape = select(origin, escape_texel_xz(origin), !FLAT_GRID_XZ_TEST && sphere_is_buried(xz, r));
+    // let escape_xz = (vec2<f32>(escape) + 0.5) * cell_size() + uniforms.hmap_min;
+    // let p_xz = select(xz, escape_xz, !all(origin == escape));
+    let r = select(info.interval.x, 0.0, FLAT_GRID_XZ_TEST);
+    let p_xz = nudge_out_of_solid(xz, r).xz;
 
-    let cell = cell_size();
-    let escape_xz = (vec2<f32>(escape) + 0.5) * cell + uniforms.hmap_min;
-    let p_xz = select(xz, escape_xz, !all(origin == escape));
+    let escape = texel_at(p_xz);
     // One probe per layer (`PROBES_PER_CELL`): the floor layer sits a constant
     // distance above the column's stored floor, the ceiling layer the same
     // distance below its stored ceiling. Columns with no recorded interval
@@ -258,36 +266,32 @@ fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
 }
 
 // The normal each probe carries into the shading range kernels. Runs the same
-// burial test and the same sideways escape as `probe_position_baked`, so the
+// nudge and the same interval-start radius as `probe_position_baked`, so the
 // "was it nudged" decision can never disagree with where the probe ended up:
-// a probe that sat inside a wall and was moved out the nearest open column
-// takes the direction of that move - out of the wall, toward what it can see -
-// and every other probe takes its column's surface normal from the heightmap's
-// normal channels (floor surface for the floor layer, ceiling for the
-// ceiling layer). Open columns that recorded no surface fall back to the
-// layer's own vertical. Written to `probe_positions` by `probe_positions.wgsl`
-// when the positions bake, read later through `probe_normal`.
+// a probe pushed out of a wall takes the direction of that push - out of the
+// wall, toward what it can see - and every other probe takes its column's
+// surface normal from the heightmap's normal channels (floor surface for the
+// floor layer, ceiling for the ceiling layer). Open columns that recorded no
+// surface fall back to the layer's own vertical. Written to `probe_positions`
+// by `probe_positions.wgsl` when the positions bake, read later through
+// `probe_normal`.
 fn probe_normal_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     let info = uniforms.cascades[c];
     let s = info.spacing;
-    // Same flat-grid escape guard as `probe_position_baked` (test point 4).
+    // Same flat-grid guard as `probe_position_baked` (test point 4).
     const FLAT_GRID_XZ_TEST: bool = false;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
-    let origin = texel_at(xz);
-    // Same burial-test radius as `probe_position_baked` (see there).
-    let r = PROBE_LAYER_GAP;
-    let escape = select(origin, escape_texel_xz(origin), !FLAT_GRID_XZ_TEST && sphere_is_buried(xz, r));
-
-    if !all(origin == escape) {
+    // Same nudge as `probe_position_baked` (see there), by the interval's start
+    // radius. When it moved the probe, the direction it moved is the normal -
+    // out of the wall, toward what the probe can see.
+    let r = select(info.interval.x, 0.0, FLAT_GRID_XZ_TEST);
+    let nudge = nudge_out_of_solid(xz, r);
+    if any(nudge.dir != vec2<f32>(0.0)) {
         // Nudged: the direction of the sideways move, in world XZ.
-        let cell = cell_size();
-        let d = vec2<f32>(
-            f32(escape.x - origin.x) * cell.x,
-            f32(escape.y - origin.y) * cell.y,
-        );
-        return normalize(vec3<f32>(d.x, 0.0, d.y));
+        return normalize(vec3<f32>(nudge.dir.x, 0.0, nudge.dir.y));
     }
 
+    let escape = texel_at(nudge.xz);
     let n = select(
         textureLoad(floor_normal, vec2<u32>(escape), 0).xyz,
         textureLoad(ceiling_normal, vec2<u32>(escape), 0).xyz,
@@ -330,6 +334,95 @@ fn escape_texel_xz(origin: vec2<i32>) -> vec2<i32> {
         }
     }
     return best;
+}
+
+struct Nudge {
+    xz: vec2<f32>,
+    // The world XZ direction the probe was moved in; zero when it was not moved.
+    dir: vec2<f32>,
+}
+
+// Move `center` the least it takes for a sphere of radius `r` around it to stop
+// overlapping any solid column, and report the direction moved.
+//
+// "The least" is per overlap: each pass finds the nearest point of the nearest
+// overlapping solid texel and pushes straight off it by exactly the overlap
+// (`r - dist + PROBE_SURFACE_EPS`), so a probe grazing a wall shifts by
+// centimetres instead of a whole cell. A solid can overlap the sphere in more
+// than one place (a corner, a wall several texels thick), so the passes relax
+// them; three is enough that a fourth moved nothing on the room.
+//
+// `r` is the cascade interval's *start* (0/2/4/8 m): the near end of what the
+// probe's rays reach, so the probe only moves when geometry comes inside the
+// region it actually samples. `r <= 0` (cascade 0's interval starts at 0) means
+// no sphere, no move.
+//
+// This replaces the old nudge, which relocated a probe only when its *own*
+// column was solid (`escape_texel_xz` returns the origin for an open column),
+// so a probe whose gather sphere clipped a neighbouring wall never moved - the
+// burial test and the escape disagreed. See the callers for the old body.
+fn nudge_out_of_solid(center: vec2<f32>, r: f32) -> Nudge {
+    var out: Nudge;
+    out.xz = center;
+    out.dir = vec2<f32>(0.0);
+    if (r <= 0.0) {
+        return out;
+    }
+    let cell = cell_size();
+    let dims = vec2<i32>(uniforms.hmap_res);
+    // A centre inside a solid column has no direction to push in, so hop to the
+    // nearest open column first; the passes then relax it clear.
+    if (is_solid(texel_at(center))) {
+        let e = escape_texel_xz(texel_at(center));
+        let e_xz = (vec2<f32>(e) + 0.5) * cell + uniforms.hmap_min;
+        let d = e_xz - out.xz;
+        if (dot(d, d) > 1e-12) {
+            out.dir = normalize(d);
+        }
+        out.xz = e_xz;
+    }
+    for (var iteration = 0u; iteration < 3u; iteration = iteration + 1u) {
+        let lo = clamp(
+            vec2<i32>(floor((out.xz - vec2<f32>(r) - uniforms.hmap_min) / cell)),
+            vec2<i32>(0),
+            dims - 1,
+        );
+        let hi = clamp(
+            vec2<i32>(floor((out.xz + vec2<f32>(r) - uniforms.hmap_min) / cell)),
+            vec2<i32>(0),
+            dims - 1,
+        );
+        var best_d2 = 1e30;
+        var best_d = vec2<f32>(0.0);
+        var found = false;
+        for (var ty = lo.y; ty <= hi.y; ty = ty + 1) {
+            for (var tx = lo.x; tx <= hi.x; tx = tx + 1) {
+                if (!is_solid(vec2<i32>(tx, ty))) {
+                    continue;
+                }
+                let a = uniforms.hmap_min + vec2<f32>(vec2<i32>(tx, ty)) * cell;
+                let b = a + cell;
+                let d = out.xz - clamp(out.xz, a, b);
+                let d2 = dot(d, d);
+                if (d2 <= r * r && d2 < best_d2) {
+                    best_d2 = d2;
+                    best_d = d;
+                    found = true;
+                }
+            }
+        }
+        if (!found) {
+            break;
+        }
+        let dist = sqrt(best_d2);
+        var dir = out.dir;
+        if (dist > 1e-5) {
+            dir = best_d / dist;
+        }
+        out.xz = out.xz + dir * (r - dist + PROBE_SURFACE_EPS);
+        out.dir = dir;
+    }
+    return out;
 }
 
 // Which layer a cascade merge reads its parents from. Every parent-side term -

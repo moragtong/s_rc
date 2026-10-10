@@ -366,12 +366,30 @@ removed branch was already unreachable, and the surviving `depth <= 0 ||
 !indirect` guard is unchanged), so a probes-off frame is identical to the
 pre-change one.
 
-Uncommitted working tree. The inside-wall test is now **derived from the
-winding slice at `SPLIT`** and routed solely through `is_solid` (winding-only).
-The `column_buried`/`column_open`/`lifted_height`/`escape_texel` normal-buffer
-machinery stays in `heightmap_trace.wgsl`, unreferenced. `Heightmap::solid`,
-its bind-group slot and its bind-group entry are deleted; `src/bake_caps.rs`
-is deleted with them. `probe_visible` is an occlusion trace again.
+**The probe nudge is a minimal push out of the solid, not a relocation.**
+`probe_position_baked` and `probe_normal_baked` test a sphere of the cascade's
+ray-interval **start** (0/2/4/8 m) against the winding solid
+(`nudge_out_of_solid`) and push the probe off the nearest overlapping texel by
+exactly the overlap (`r - dist + PROBE_SURFACE_EPS`), relaxed over 3 passes;
+`probe_normal_baked` takes the push direction as the normal. Cascade 0's
+interval starts at 0, so it never nudges. This replaced the old
+`sphere_is_buried(xz, r)` + `escape_texel_xz(origin)`: the escape returns the
+origin column when it is not solid, so a probe whose gather sphere clipped a
+neighbouring wall never moved - the burial test and the escape disagreed - and
+it relocated a buried probe a whole cell to the nearest open column instead of
+moving it the centimetres an overlap needs. `escape_texel_xz` survives as the
+inside-solid hop; the old body is kept commented at the call site. Measured at
+the interior camera, probes off, new vs old (`r = PROBE_LAYER_GAP`): **74.3%**
+of pixels change, mean |d| 8.43, scene mean luminance 52.55 -> 50.61, and the
+user accepts the result. The display radius is back to `spacing *
+PROBE_RADIUS_SCALE` (0.12): sizing it by the interval's end (2/4/8/16 m) drew
+spheres that occluded the room (82.7% of pixels, mean luminance 50.6 -> 128).
+0 shader errors, bake verified (`79938 ceiling hits`).
+
+The earlier winding-only `is_solid` swap, the `Heightmap::solid` /
+`bake_caps.rs` deletion and the `EMPTY_FLOOR` sentinel fix (the `usable` test's
+`h.y > uniforms.split - 9.0`) are committed. `probe_visible` is an occlusion
+trace again.
 
 ## March-once, relight every 4, and the blend pass that made it not cost anything
 
