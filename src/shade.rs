@@ -31,7 +31,6 @@ pub struct ShadePlugin;
 struct ShadeUniforms {
     view_from_clip: Mat4,
     world_from_view: Mat4,
-    probes_enabled: u32,
     indirect_enabled: u32,
     trilinear_enabled: u32,
     bilateral_enabled: u32,
@@ -133,7 +132,10 @@ fn draw_shade(
     render_data: Option<Res<CascadesRenderData>>,
     mut ctx: RenderContext,
 ) {
-    if !lighting_state.indirect_enabled && !lighting_state.probes_enabled {
+    // Probe display moved out to `probe_overlay` (instanced spheres); this
+    // pass is only the indirect diffuse add, so the probes toggle no longer
+    // keeps it alive.
+    if !lighting_state.indirect_enabled {
         return;
     }
     let Some(render_data) = render_data else {
@@ -150,7 +152,6 @@ fn draw_shade(
     let mut uniforms = UniformBuffer::from(ShadeUniforms {
         view_from_clip: extracted_view.clip_from_view.inverse(),
         world_from_view: extracted_view.world_from_view.to_matrix(),
-        probes_enabled: lighting_state.probes_enabled as u32,
         indirect_enabled: lighting_state.indirect_enabled as u32,
         trilinear_enabled: lighting_state.trilinear_enabled as u32,
         bilateral_enabled: lighting_state.bilateral_enabled as u32,

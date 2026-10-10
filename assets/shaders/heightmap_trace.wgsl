@@ -225,7 +225,11 @@ fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     // The origin column's taps, and where the escape would move a buried probe
     // to - the position and the normal must agree on which of the two won.
     let origin = texel_at(xz);
-    let r = info.interval.y;
+    // Burial-test radius. `info.interval.y` is the cascade's *far* distance
+    // (2/4/8/16 m), which made `sphere_is_buried` true for essentially every
+    // probe and walked a 16 m square per probe. A probe only needs testing
+    // against the gap it sits off its own surface.
+    let r = PROBE_LAYER_GAP;
     let escape = select(origin, escape_texel_xz(origin), !FLAT_GRID_XZ_TEST && sphere_is_buried(xz, r));
 
     let cell = cell_size();
@@ -237,7 +241,12 @@ fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     // (open sky, empty floor) fall back to the bake plane, offset by the same
     // gap on each side.
     let h = textureLoad(heightmap, vec2<u32>(escape), 0).xy;
-    let usable = h.x < 5000.0 && h.y > -1000.0 && (h.x - h.y) > 2.0 * PROBE_LAYER_GAP;
+    // `EMPTY_FLOOR` (= split - 10) is the "no floor recorded" sentinel and sits
+    // *below* every real floor, so the old `h.y > -1000.0` never filtered it: a
+    // column with a ceiling but no floor still passed `usable` and placed its
+    // floor-layer probe at `split - 10 + gap` (-10.9 m), deep underground. Any
+    // real floor is well above `split - 9`, so that excludes the sentinel.
+    let usable = h.x < 5000.0 && h.y > uniforms.split - 9.0 && (h.x - h.y) > 2.0 * PROBE_LAYER_GAP;
     var y = uniforms.split + PROBE_LAYER_GAP;
     if usable && layer == 0u {
         y = h.y + PROBE_LAYER_GAP;
@@ -265,7 +274,8 @@ fn probe_normal_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     const FLAT_GRID_XZ_TEST: bool = false;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
     let origin = texel_at(xz);
-    let r = info.interval.y;
+    // Same burial-test radius as `probe_position_baked` (see there).
+    let r = PROBE_LAYER_GAP;
     let escape = select(origin, escape_texel_xz(origin), !FLAT_GRID_XZ_TEST && sphere_is_buried(xz, r));
 
     if !all(origin == escape) {

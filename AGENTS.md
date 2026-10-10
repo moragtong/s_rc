@@ -46,7 +46,7 @@ BEVY_ASSET_ROOT=$PWD S_RC_CAM="-10.58,4.86,-3.21,-1.17,8.18,-3.83" \
   S_RC_INDIRECT=1 S_RC_OVERLAY=0 ./target/debug/s_rc
 # Second storey:
 #   S_RC_CAM="-9.20,4.88,-6.88,-0.63,6.62,-4.79"
-# S_RC_PROBES=1          show probes
+# S_RC_PROBES=1          show the probe grid (instanced spheres, see State)
 # S_RC_OVERLAY=1         keep the heightmap debug planes
 # S_RC_CROSS_LAYER=1     cross-layer cascade merge (L key)
 # S_RC_BILATERAL=1       cross-bilateral shade gather (B key)
@@ -89,7 +89,8 @@ comes out 0% and every count looks like noise.
   shots are comparable only when the bake is verified in both logs
   (`heightmap bake verified`), because the first bake can land before its
   pipeline exists — it logs `attempt 1 was empty; retrying` and then passes.
-  `S_RC_PROBES=1` also changes pixels, so keep it off for A/B shots.
+  `S_RC_PROBES=1` also changes pixels (it draws the instanced probe overlay),
+  so keep it off for A/B shots.
 
 ## State
 
@@ -301,6 +302,69 @@ bleed is the visible failing.
 There is no mid-room probe layer any more; the old "probes mid-way between floor
 and ceiling" state, the `S_RC_*` legacy leak camera and the Sponza numbers all
 predate it.
+
+**The probe display is instanced geometry now, not a fragment-shader trace.**
+The old `probe_spheres` (a 2D DDA per cascade walking the probe grid along each
+view ray in `shade_cascades.wgsl`) is deleted, along with the `probes_enabled`
+field of `ShadeUniforms`; `shade` is indirect-only and no longer stays alive for
+the P toggle. In its place `src/probe_overlay.rs` + `assets/shaders/
+probe_overlay.wgsl` rasterize a unit icosphere (subdivision 2, 320 tris) once per
+probe-with-layer - one `draw_indexed` instance each, 3678 instances total - in a
+custom **opaque** pass that draws into the **window camera's own framebuffer**
+and tests against **that view's prepass depth** (reverse-Z, `GreaterEqual`,
+depth **write on**), so geometry occludes the spheres *and the spheres occlude
+one another*. Depth write was off at first: every sphere fragment then passed
+the scene-depth test and overlapping spheres overwrote each other in instance
+order, which read as "weird blending" - the four cascades stack on the same
+surface, so there is a lot of overlap. The per-instance world
+position is `probe_positions[2*i].xyz`, the same buffer trace/gather/shade read,
+so the spheres sit exactly on the baked two layers (floor + ceiling at their real
+surface heights, `escape_texel` nudges included) with nothing re-derived on the
+CPU. The buffer is already concatenated cascade-major in `sh_base` units, so an
+instance's cascade - and its radius, `spacing * PROBE_RADIUS_SCALE` (0.12,
+Rust-side) - is found by walking the per-cascade `(first, count, radius)` entries
+in the uniform, packed from the CPU-side `CascadesLayout`. Each sphere is
+**shaded by the SH probe it stands for**: instance `i` reads its 9 coefficients
+at word `i * SH_STRIDE` of `sh_probes_blend_buffer` (the same cross-faded buffer
+the shade pass samples) and evaluates the clamped-cosine `probe_irradiance`
+along the sphere's own world normal (`= local_pos`, since the unit icosphere is
+placed with a positive uniform scale and no rotation). `PROBE_BRIGHTNESS` (1.0,
+in the shader) scales the pre-tonemap write. The old per-cascade palette
+(green/blue/purple/yellow) and additive blend went in and came back out: with a
+flat per-cascade tint and `BlendFactor::One/One`, a cell's two coincident-or-
+stacked layers of the same cascade composited to the *same* bright colour, so
+the grid read as a **single layer**; the per-probe SH shading makes the layers
+distinct (floor-layer probes light toward the ceiling and usually read
+blue/sky-lit, ceiling-layer probes read dark under the ceiling). The pass is
+**gated three ways**: `P` /
+`S_RC_PROBES=1` (`LightingState.probes_enabled`), `BakeState::is_done()` (nothing
+to draw until `probe_positions` is written), and the window target
+(`ExtractedCamera.target` must be `NormalizedRenderTarget::Window`) - the two
+startup bake cameras are live 512x512 `RenderTarget::Image` views of their own,
+and without that last guard the overlay also splatted spheres into their targets.
+`draw_probes_gizmos` in `main.rs` is still dead behind its original `return;`
+(it sat spheres at a fixed y = 1.5, never the real layers) and is superseded by
+this pass; kept only because the workstyle forbids deleting machinery to turn it
+off. The world->clip matrix is `clip_from_view * world_from_view.inverse()`:
+`ExtractedView.world_from_view` is the camera's **world** matrix (`world <-
+view`), so world->view needs the inverse - using `world_from_view` directly (as
+an earlier cut did) made the spheres track an arbitrary camera-derived transform
+that read as them "following the camera". The icosphere is drawn with **all** its
+indices (`indices.len()`); an earlier cut passed `indices.len() / 4`, which drew
+only the icosahedron's first **5 of 20 faces** - one contiguous pentagonal cap -
+and that is what rendered as the "weird hemispheres", not the probes being
+buried. Measured at the interior camera
+(`S_RC_CAM=3.50,0.73,3.47,1.84,-1.13,-6.22`, sun pinned 45,54.7, ambient off):
+with the cap and radius scale 0.3, probes on vs off changed 31.75% of pixels;
+fixing the index count alone (full spheres, 0.3, depth write still off) jumped to
+**79.5%** - the four cascades stack on the same surface and every fragment
+overwrote in instance order, so the grid became a solid mass. With depth write on
+and radius scale 0.12 it is **21.2%** and the spheres read individually. The
+overlay luminance spans ~40 to ~240, so the SH read reaches the spheres. 0
+shader errors; the indirect path is otherwise untouched (with probes off the
+removed branch was already unreachable, and the surviving `depth <= 0 ||
+!indirect` guard is unchanged), so a probes-off frame is identical to the
+pre-change one.
 
 Uncommitted working tree. The inside-wall test is now **derived from the
 winding slice at `SPLIT`** and routed solely through `is_solid` (winding-only).

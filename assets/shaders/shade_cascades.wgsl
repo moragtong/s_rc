@@ -22,7 +22,7 @@
 // instead - the cell in front of the surface - and `probe_visible` is skipped.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, nonzero, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal}
+#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal}
 
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var gbuffer: texture_2d<u32>;
@@ -35,7 +35,6 @@
 struct ShadeUniforms {
     view_from_clip: mat4x4<f32>,
     world_from_view: mat4x4<f32>,
-    probes_enabled: u32,
     indirect_enabled: u32,
     trilinear_enabled: u32,
     bilateral_enabled: u32,
@@ -280,54 +279,6 @@ fn tangent_frame(n: vec3<f32>) -> mat3x3<f32> {
 // normal `n`, which is right now that every probe sits on the surface it
 // reports about.
 
-// Probe spheres of every cascade along the view ray, shaded as white
-// diffuse balls from their SH; returns (color, distance) or distance < 0.
-fn probe_spheres(ro: vec3<f32>, rd: vec3<f32>, max_t: f32) -> vec4<f32> {
-    var best = vec4<f32>(0.0, 0.0, 0.0, -1.0);
-    for (var c = 0u; c < uniforms.cascade_count; c++) {
-        let info = uniforms.cascades[c];
-        let s = info.spacing;
-        let radius = 0.15 * s;
-        // 2D DDA over the probe grid, testing each column's probe.
-        let g = (ro.xz - uniforms.hmap_min) / s;
-        var cell = vec2<i32>(floor(g));
-        let dir_step = select(vec2<i32>(-1), vec2<i32>(1), rd.xz >= vec2<f32>(0.0));
-        let inv = 1.0 / nonzero(rd.xz);
-        let edge = (vec2<f32>(cell) + select(vec2<f32>(0.0), vec2<f32>(1.0), dir_step > vec2<i32>(0))) * s
-            + uniforms.hmap_min;
-        var t_max = (edge - ro.xz) * inv;
-        let t_delta = abs(s * inv);
-        for (var i = 0u; i < 256u; i++) {
-            if all(cell >= vec2<i32>(0)) && all(cell < vec2<i32>(info.size)) {
-                let probe = info.probe_base + u32(cell.y) * info.size.x + u32(cell.x);
-                let base = probe * SH_STRIDE;
-                let center = sh_probes[base + 9u].xyz;
-                let oc = ro - center;
-                let b = dot(oc, rd);
-                let disc = b * b - (dot(oc, oc) - radius * radius);
-                if disc >= 0.0 {
-                    let t = -b - sqrt(disc);
-                    if t > 0.0 && t < max_t && (best.w < 0.0 || t < best.w) {
-                        let n = normalize(ro + rd * t - center);
-                        best = vec4<f32>(sh_irradiance(base, n) / PI, t);
-                    }
-                }
-            }
-            if min(t_max.x, t_max.y) > max_t {
-                break;
-            }
-            if t_max.x < t_max.y {
-                t_max.x += t_delta.x;
-                cell.x += dir_step.x;
-            } else {
-                t_max.y += t_delta.y;
-                cell.y += dir_step.y;
-            }
-        }
-    }
-    return best;
-}
-
 @fragment
 fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(in.position.xy);
@@ -344,20 +295,6 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         max_t = distance(p, ro);
     }
 
-    if view_info.probes_enabled != 0u {
-        var rd: vec3<f32>;
-        if depth > 0.0 {
-            rd = (p - ro) / max_t;
-        } else {
-            let clip = vec4<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0, 1.0, 1.0);
-            let view = view_info.view_from_clip * clip;
-            rd = normalize((view_info.world_from_view * vec4<f32>(view.xyz / view.w, 1.0)).xyz - ro);
-        }
-        let sphere = probe_spheres(ro, rd, max_t);
-        if sphere.w >= 0.0 {
-            return vec4<f32>(sphere.rgb, 0.0);
-        }
-    }
     if depth <= 0.0 || view_info.indirect_enabled == 0u {
         return vec4<f32>(0.0);
     }

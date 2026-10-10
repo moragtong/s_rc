@@ -6,6 +6,7 @@ mod heightmap_verify;
 mod heightmap_view;
 mod hi_z;
 mod hi_z_debug;
+mod probe_overlay;
 mod scene3d;
 mod screenshot;
 mod shade;
@@ -44,6 +45,7 @@ fn main() {
             ui::UiPlugin,
             Cascades2_5dPlugin,
             shade::ShadePlugin,
+            probe_overlay::ProbeOverlayPlugin,
             screenshot::ScreenshotPlugin,
             bevy::render::diagnostic::RenderDiagnosticsPlugin,
         ))
