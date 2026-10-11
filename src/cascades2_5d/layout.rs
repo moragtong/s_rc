@@ -22,8 +22,10 @@ pub const SPACING0: f32 = 1.0;
 /// per cascade (4x directions).
 pub const OCTA_SIDE0: u32 = 4;
 /// End of cascade 0's interval, m; cascade n covers
-/// [INTERVAL0 * 2^(n-1), INTERVAL0 * 2^n] (cascade 0 from 0).
+/// [INTERVAL0 * 2^(n-1) + BIAS, INTERVAL0 * 2^n] (cascade 0 from BIAS).
 pub const INTERVAL0: f32 = 2.0;
+/// Bias added to interval start to avoid self-intersection at probe surface.
+pub const INTERVAL_BIAS: f32 = 0.02;
 /// Cascade-0 probes exist within this distance of the camera: 10.5 m holds
 /// the room from inside it, and is what fits in memory at this density
 /// (1.9 GB of cached hits, 1.2 GB of radiance).
@@ -74,7 +76,7 @@ pub fn octa_side(n: u32) -> u32 {
 
 pub fn interval(n: u32) -> [f32; 2] {
     let end = INTERVAL0 * (1 << n) as f32;
-    [if n == 0 { 0.0 } else { end / 2.0 }, end]
+    [if n == 0 { INTERVAL_BIAS } else { end / 2.0 + INTERVAL_BIAS }, end]
 }
 
 impl CascadeWindow {
