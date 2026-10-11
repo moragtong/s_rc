@@ -431,6 +431,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             }
         }
         e = select(e_bi, e_bi / w_bi, w_bi > WEIGHT_EPS);
+        return vec4<f32>(base_color / PI * e, 0.0);
     } else if view_info.bsp_recon_enabled != 0u {
         // Cubic B-spline reconstruction (`C` key / `S_RC_BSPLINE_RECON=1`).
         // The bilinear/trilinear read reconstructs with a 2x2 tent per layer,
@@ -542,6 +543,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         var t_ceil = saturate((fetch.y - h_mid) / max(h_ceil - h_mid, 1e-4));
         t_ceil = t_ceil * t_ceil * (3.0 - 2.0 * t_ceil);
         e = mix(mix(e_floor, e_mid, t_floor), mix(e_mid, e_ceil, t_ceil), 0.5);
+        return vec4<f32>(base_color / PI * e, 0.0);
     } else if view_info.trilinear_enabled != 0u {
         // Trilinear over three real probe layers: floor (0), mid-air (1), ceiling (2).
         // Each of the 4 XZ neighbours holds probes at three heights. Each layer
@@ -654,6 +656,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // Use mid as pivot: below mid blends floor+mid, above mid blends mid+ceiling
         var t_pivot = saturate((fetch.y - h_mid) / max(h_ceil - h_floor, 1e-4));
         e = mix(e_floor_mid, e_mid_ceil, t_pivot);
+        return vec4<f32>(base_color / PI * e, 0.0);
     } else {
         // Legacy single-layer reference, for A/B: just the floor layer of the
         // same probes, bilinear in XZ, no vertical axis. Selected by
