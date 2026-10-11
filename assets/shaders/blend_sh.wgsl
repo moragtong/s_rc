@@ -94,6 +94,8 @@ const FILTER_NEIGHBOUR: f32 = 0.125;
 // through the room's surfaces; the low-pass uses this tighter value so a
 // platform edge (~1.5 m) really cuts. Tune this to the discontinuity.
 const LOWPASS_HEIGHT_TOL_SPACING: f32 = 1.5;
+// Weight normalization epsilon - raised to prevent dark bands
+const WEIGHT_EPS: f32 = 1e-3;
 
 fn mixed_word(word: u32) -> vec4<f32> {
     return mix(sh_probes_prev[word], sh_probes[word], blend.alpha);
@@ -194,7 +196,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
             wsum += wn;
         }
     }
-    sh_probes_blend[i] = vec4<f32>(acc / max(wsum, 1e-5), 0.0);
+    sh_probes_blend[i] = vec4<f32>(acc / max(wsum, WEIGHT_EPS), 0.0);
 }
 
 // Reference (no low-pass), the A/B baseline. Swap it in for the body above:

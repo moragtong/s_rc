@@ -61,6 +61,9 @@ const PROBE_BIAS: f32 = 0.02;
 // pixel's tangent plane.
 const BI_GAMMA: f32 = 32.0;
 const BI_PLANE_M: f32 = 0.5;
+// Weight normalization epsilon - raised to prevent dark bands at cell
+// boundaries where probe taps get rejected (occlusion, normal rejection, etc.)
+const WEIGHT_EPS: f32 = 1e-3;
 // Normal-biased fetch (`view_info.normal_bias_enabled`, the N toggle). Instead
 // of reading the probe grid at the shading point `p`, read it at
 //
@@ -419,7 +422,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 // the `probe_visible` mode: the normal-biased fetch already
                 // selects the cell in front of the surface, so it does not need
                 // the trace.
-                if w > 1e-3
+                if w > WEIGHT_EPS
                     && (view_info.normal_bias_enabled != 0u || probe_visible(p, n, center))
                 {
                     e_bi += w * sh_irradiance(base, n);
@@ -427,7 +430,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 }
             }
         }
-        e = select(e_bi, e_bi / w_bi, w_bi > 1e-5);
+        e = select(e_bi, e_bi / w_bi, w_bi > WEIGHT_EPS);
     } else if view_info.bsp_recon_enabled != 0u {
         // Cubic B-spline reconstruction (`C` key / `S_RC_BSPLINE_RECON=1`).
         // The bilinear/trilinear read reconstructs with a 2x2 tent per layer,
@@ -516,22 +519,22 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             e_floor = select(
                 sh_irradiance_v(cf_floor, n),
                 sh_irradiance_v(cf_floor, n) / w_floor,
-                w_floor > 1e-5,
+                w_floor > WEIGHT_EPS,
             );
             e_mid = select(
                 sh_irradiance_v(cf_mid, n),
                 sh_irradiance_v(cf_mid, n) / w_mid,
-                w_mid > 1e-5,
+                w_mid > WEIGHT_EPS,
             );
             e_ceil = select(
                 sh_irradiance_v(cf_ceil, n),
                 sh_irradiance_v(cf_ceil, n) / w_ceil,
-                w_ceil > 1e-5,
+                w_ceil > WEIGHT_EPS,
             );
         } else {
-            e_floor = select(e_floor, e_floor / w_floor, w_floor > 1e-5);
-            e_mid = select(e_mid, e_mid / w_mid, w_mid > 1e-5);
-            e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > 1e-5);
+            e_floor = select(e_floor, e_floor / w_floor, w_floor > WEIGHT_EPS);
+            e_mid = select(e_mid, e_mid / w_mid, w_mid > WEIGHT_EPS);
+            e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > WEIGHT_EPS);
         }
         // Trilinear vertical blend: floor -> mid -> ceiling
         var t_floor = saturate((fetch.y - h_floor) / max(h_mid - h_floor, 1e-4));
@@ -627,22 +630,22 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             e_floor = select(
                 sh_irradiance_v(cf_floor, n),
                 sh_irradiance_v(cf_floor, n) / w_floor,
-                w_floor > 1e-5,
+                w_floor > WEIGHT_EPS,
             );
             e_mid = select(
                 sh_irradiance_v(cf_mid, n),
                 sh_irradiance_v(cf_mid, n) / w_mid,
-                w_mid > 1e-5,
+                w_mid > WEIGHT_EPS,
             );
             e_ceil = select(
                 sh_irradiance_v(cf_ceil, n),
                 sh_irradiance_v(cf_ceil, n) / w_ceil,
-                w_ceil > 1e-5,
+                w_ceil > WEIGHT_EPS,
             );
         } else {
-            e_floor = select(e_floor, e_floor / w_floor, w_floor > 1e-5);
-            e_mid = select(e_mid, e_mid / w_mid, w_mid > 1e-5);
-            e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > 1e-5);
+            e_floor = select(e_floor, e_floor / w_floor, w_floor > WEIGHT_EPS);
+            e_mid = select(e_mid, e_mid / w_mid, w_mid > WEIGHT_EPS);
+            e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > WEIGHT_EPS);
         }
         // Blend only the nearest 2 layers: floor+mid or mid+ceiling
         var t_mid = saturate((fetch.y - h_floor) / max(h_ceil - h_floor, 1e-4));
@@ -672,7 +675,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 }
             }
         }
-        e = select(e, e / w_sum, w_sum > 1e-5);
+        e = select(e, e / w_sum, w_sum > WEIGHT_EPS);
     }
     // The material's metallic from the deferred G-buffer reads ~1 for this
     // asset even though the room GLB has no material (Bevy's default is 0),
