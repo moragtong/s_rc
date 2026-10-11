@@ -47,9 +47,10 @@ pub const NO_CEILING: f32 = 1.0e4;
 pub const SPLIT: f32 = -1.0;
 /// Floor height of columns with nothing below the split.
 pub const EMPTY_FLOOR: f32 = SPLIT - 10.0;
-/// Near plane offset of both bake cameras from `SPLIT`, along the direction
-/// they face. Everything within this distance of the plane is clipped away.
-pub const BAKE_NEAR: f32 = 0.05;
+/// Near plane offset of both bake cameras from the interior surfaces, along the
+/// direction they face. Everything within this distance of the surface is clipped
+/// away.
+pub const BAKE_NEAR: f32 = 0.3;
 /// Resolution along each axis. The map need not be square; it covers
 /// `MIN_BOUNDS`..`MAX_BOUNDS`, so its texels need not be either.
 pub const RESOLUTION: UVec2 = UVec2::new(512, 512);

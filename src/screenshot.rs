@@ -6,6 +6,12 @@
 //! asked for, so they also work for plain runs and for timing: they used to
 //! live behind the `S_RC_SCREENSHOT` check, which meant `S_RC_INDIRECT=0` and
 //! `S_RC_OVERLAY=0` were silently ignored by every run that was not a shot.
+//!
+//! `S_RC_DIRECT_ONLY=1` disables indirect lighting (useful for bake camera views).
+//!
+//! Bake camera positions (interior):
+//!   Down (floor): eye 0,2.7,0  target 0,2.4,0  (looking down)
+//!   Up   (ceiling): eye 0,-2.7,0 target 0,-2.4,0 (looking up)
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
@@ -41,6 +47,10 @@ fn take_screenshot(
         cross_layer.enabled = std::env::var("S_RC_CROSS_LAYER").as_deref() == Ok("1");
         blend_toggle.lowpass = std::env::var("S_RC_LOWPASS").as_deref() != Ok("0");
         lighting.bsp_recon_enabled = std::env::var("S_RC_BSPLINE_RECON").as_deref() == Ok("1");
+        // S_RC_DIRECT_ONLY=1 disables indirect lighting
+        if std::env::var("S_RC_DIRECT_ONLY").as_deref() == Ok("1") {
+            lighting.indirect_enabled = false;
+        }
         // S_RC_OVERLAY=1 keeps the heightmap debug planes visible, which is
         // how you check what the GPU bake actually produced. They are visible
         // by default, so a plain run has to hide them itself.

@@ -1,4 +1,6 @@
+use crate::bake_camera_readback::BakeCameraReadbackPlugin;
 use crate::cascades2_5d::Cascades2_5dPlugin;
+mod bake_camera_readback;
 mod cascades2_5d;
 mod heightmap;
 mod heightmap_bake;
@@ -32,10 +34,9 @@ fn main() {
     let mut app = App::new();
     app.add_systems(Update, (draw_probes_gizmos, camera_readout, animate_sun, sync_sky_color))
         .insert_resource(DefaultOpaqueRendererMethod::deferred())
-        .add_plugins((
+.add_plugins((
             DefaultPlugins,
             HiZPlugin,
-            HiZDebugPlugin,
             FreeCameraPlugin,
             HeightmapPlugin,
             HeightmapBakePlugin,
@@ -48,6 +49,7 @@ fn main() {
             probe_overlay::ProbeOverlayPlugin,
             screenshot::ScreenshotPlugin,
             bevy::render::diagnostic::RenderDiagnosticsPlugin,
+            bake_camera_readback::BakeCameraReadbackPlugin,
         ))
         // Bevy's `LightPlugin` inserts `GlobalAmbientLight` at brightness 80
         // cd/m^2. This scene lights the room entirely with the baked cascade

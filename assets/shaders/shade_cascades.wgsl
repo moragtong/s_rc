@@ -441,20 +441,22 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         // own cannot remove the kink because a pre-filter does not change the
         // reconstruction.
         //
-        // The two real probe layers stay: each layer is reconstructed from its
-        // own 4x4 patch and the two are faded by the B-spline-blended layer
-        // heights, exactly as in the trilinear branch. Occlusion is the same
-        // (`probe_visible` when the normal bias is off). This is the expensive
-        // half: 4x the taps of the trilinear read, so it is opt-in and timed.
+        // Three real probe layers: floor (0), mid-air (1), ceiling (2).
+        // Each layer is reconstructed from its own 4x4 patch and the three are
+        // faded by the B-spline-blended layer heights.
         let wx = bspline_weights(ft.x);
         let wz = bspline_weights(ft.y);
         var cf_floor: array<vec3<f32>, 9>;
+        var cf_mid: array<vec3<f32>, 9>;
         var cf_ceil: array<vec3<f32>, 9>;
         var e_floor = vec3<f32>(0.0);
+        var e_mid = vec3<f32>(0.0);
         var e_ceil = vec3<f32>(0.0);
         var w_floor = 0.0;
+        var w_mid = 0.0;
         var w_ceil = 0.0;
         var h_floor = 0.0;
+        var h_mid = 0.0;
         var h_ceil = 0.0;
         for (var j = 0u; j < 4u; j++) {
             for (var k = 0u; k < 4u; k++) {
@@ -470,6 +472,8 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                     let center = sh_probes[base + 9u].xyz;
                     if (layer == 0u) {
                         h_floor += w * center.y;
+                    } else if (layer == 1u) {
+                        h_mid += w * center.y;
                     } else {
                         h_ceil += w * center.y;
                     }
@@ -481,6 +485,8 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                                 let c = sh_coeff(base, i) * w;
                                 if (layer == 0u) {
                                     cf_floor[i] += c;
+                                } else if (layer == 1u) {
+                                    cf_mid[i] += c;
                                 } else {
                                     cf_ceil[i] += c;
                                 }
@@ -489,12 +495,16 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                             let read = sh_irradiance(base, n);
                             if (layer == 0u) {
                                 e_floor += w * read;
+                            } else if (layer == 1u) {
+                                e_mid += w * read;
                             } else {
                                 e_ceil += w * read;
                             }
                         }
                         if (layer == 0u) {
                             w_floor += w;
+                        } else if (layer == 1u) {
+                            w_mid += w;
                         } else {
                             w_ceil += w;
                         }
@@ -508,6 +518,11 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 sh_irradiance_v(cf_floor, n) / w_floor,
                 w_floor > 1e-5,
             );
+            e_mid = select(
+                sh_irradiance_v(cf_mid, n),
+                sh_irradiance_v(cf_mid, n) / w_mid,
+                w_mid > 1e-5,
+            );
             e_ceil = select(
                 sh_irradiance_v(cf_ceil, n),
                 sh_irradiance_v(cf_ceil, n) / w_ceil,
@@ -515,29 +530,31 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             );
         } else {
             e_floor = select(e_floor, e_floor / w_floor, w_floor > 1e-5);
+            e_mid = select(e_mid, e_mid / w_mid, w_mid > 1e-5);
             e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > 1e-5);
         }
-        var tb = saturate((fetch.y - h_floor) / max(h_ceil - h_floor, 1e-4));
-        tb = tb * tb * (3.0 - 2.0 * tb);
-        e = mix(e_floor, e_ceil, tb);
+        // Trilinear vertical blend: floor -> mid -> ceiling
+        var t_floor = saturate((fetch.y - h_floor) / max(h_mid - h_floor, 1e-4));
+        t_floor = t_floor * t_floor * (3.0 - 2.0 * t_floor);
+        var t_ceil = saturate((fetch.y - h_mid) / max(h_ceil - h_mid, 1e-4));
+        t_ceil = t_ceil * t_ceil * (3.0 - 2.0 * t_ceil);
+        e = mix(mix(e_floor, e_mid, t_floor), mix(e_mid, e_ceil, t_ceil), 0.5);
     } else if view_info.trilinear_enabled != 0u {
-        // Trilinear over the two real probe layers: each of the 4 XZ
-        // neighbours holds a floor-layer probe (a constant distance above its
-        // column's stored floor) and a ceiling-layer probe (the same distance
-        // below its stored ceiling). Each layer is gathered bilinearly in XZ,
-        // then the two are faded by where `p` sits between the bilinearly
-        // interpolated floor and ceiling heights. With the probes on the
-        // surfaces they are about, there is nothing left to parallax-correct:
-        // the SH is read in closed form against the surface normal.
-        // Occlusion still tests the stored probe position, because `trace` is
-        // a 3D test and the layers sit centimetres off the actual surfaces.
+        // Trilinear over three real probe layers: floor (0), mid-air (1), ceiling (2).
+        // Each of the 4 XZ neighbours holds probes at three heights. Each layer
+        // is gathered bilinearly in XZ, then the three are faded by where `p`
+        // sits between the bilinearly interpolated heights.
         var cf_floor: array<vec3<f32>, 9>;
+        var cf_mid: array<vec3<f32>, 9>;
         var cf_ceil: array<vec3<f32>, 9>;
         var e_floor = vec3<f32>(0.0);
+        var e_mid = vec3<f32>(0.0);
         var e_ceil = vec3<f32>(0.0);
         var w_floor = 0.0;
+        var w_mid = 0.0;
         var w_ceil = 0.0;
         var h_floor = 0.0;
+        var h_mid = 0.0;
         var h_ceil = 0.0;
         for (var k = 0u; k < 4u; k++) {
             let corner = vec2<u32>(k & 1u, k >> 1u);
@@ -548,10 +565,12 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
                 let base = (base_cell + layer) * SH_STRIDE;
                 let center = sh_probes[base + 9u].xyz;
-                // The two layer heights, bilinearly merged, define the
+                // The three layer heights, bilinearly merged, define the
                 // vertical axis of the trilinear read.
                 if (layer == 0u) {
                     h_floor += w * center.y;
+                } else if (layer == 1u) {
+                    h_mid += w * center.y;
                 } else {
                     h_ceil += w * center.y;
                 }
@@ -566,6 +585,8 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                         let read = sh_irradiance(base, n);
                         if (layer == 0u) {
                             e_floor += w * read;
+                        } else if (layer == 1u) {
+                            e_mid += w * read;
                         } else {
                             e_ceil += w * read;
                         }
@@ -578,6 +599,8 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                             let c = sh_coeff(base, i) * w;
                             if (layer == 0u) {
                                 cf_floor[i] += c;
+                            } else if (layer == 1u) {
+                                cf_mid[i] += c;
                             } else {
                                 cf_ceil[i] += c;
                             }
@@ -585,6 +608,8 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                     }
                     if (layer == 0u) {
                         w_floor += w;
+                    } else if (layer == 1u) {
+                        w_mid += w;
                     } else {
                         w_ceil += w;
                     }
@@ -604,6 +629,11 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 sh_irradiance_v(cf_floor, n) / w_floor,
                 w_floor > 1e-5,
             );
+            e_mid = select(
+                sh_irradiance_v(cf_mid, n),
+                sh_irradiance_v(cf_mid, n) / w_mid,
+                w_mid > 1e-5,
+            );
             e_ceil = select(
                 sh_irradiance_v(cf_ceil, n),
                 sh_irradiance_v(cf_ceil, n) / w_ceil,
@@ -611,29 +641,35 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             );
         } else {
             e_floor = select(e_floor, e_floor / w_floor, w_floor > 1e-5);
+            e_mid = select(e_mid, e_mid / w_mid, w_mid > 1e-5);
             e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > 1e-5);
         }
-        // The trilinear vertical weight: how far the fetch anchor sits from the
-        // floor layer toward the ceiling layer. A pixel on the floor reads the
-        // floor layer (and vice versa).
-        var t = saturate((fetch.y - h_floor) / max(h_ceil - h_floor, 1e-4));
-        t = t * t * (3.0 - 2.0 * t);
-        e = mix(e_floor, e_ceil, t);
+        // Blend only the nearest 2 layers: floor+mid or mid+ceiling
+        var t_mid = saturate((fetch.y - h_floor) / max(h_ceil - h_floor, 1e-4));
+        var e_mid_ceil = mix(e_mid, e_ceil, t_mid);
+        var e_floor_mid = mix(e_floor, e_mid, t_mid);
+        // Use mid as pivot: below mid blends floor+mid, above mid blends mid+ceiling
+        var t_pivot = saturate((fetch.y - h_mid) / max(h_ceil - h_floor, 1e-4));
+        e = mix(e_floor_mid, e_mid_ceil, t_pivot);
     } else {
         // Legacy single-layer reference, for A/B: just the floor layer of the
         // same probes, bilinear in XZ, no vertical axis. Selected by
         // `S_RC_TRILINEAR=0` / the T key.
         var w_sum = 0.0;
+        var e = vec3<f32>(0.0);
         for (var k = 0u; k < 4u; k++) {
             let corner = vec2<u32>(k & 1u, k >> 1u);
             let q = vec2<u32>(clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(info.size) - 1));
             let wxy = mix(1.0 - frac, frac, vec2<f32>(corner));
             let w = wxy.x * wxy.y;
-            let base = (info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL) * SH_STRIDE;
-            let center = sh_probes[base + 9u].xyz;
-            if w > 0.0 && probe_visible(p, n, center) {
-                e += w * sh_irradiance(base, n) * height_agreement(center.y - p.y, info.spacing);
-                w_sum += w;
+            // Read all 3 layers and sum them
+            for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                let base = (info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL + layer) * SH_STRIDE;
+                let center = sh_probes[base + 9u].xyz;
+                if w > 0.0 && probe_visible(p, n, center) {
+                    e += w * sh_irradiance(base, n) * height_agreement(center.y - p.y, info.spacing);
+                    w_sum += w;
+                }
             }
         }
         e = select(e, e / w_sum, w_sum > 1e-5);

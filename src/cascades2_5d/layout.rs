@@ -11,7 +11,7 @@ pub const CASCADES: u32 = 4;
 /// trilinear (4 XZ neighbours x 2 layers) instead of bilinear, and they let
 /// the per-tap parallax corrections go: every probe sits where it should
 /// contribute, on the surface it is about.
-pub const LAYERS: u32 = 2;
+pub const LAYERS: u32 = 3;
 /// Cascade-0 probe spacing, m. Doubles per cascade.
 /// Spacing and directions have to grow together: against Mitsuba, indirect
 /// RMSE was 49.5% at 0.5 m and 4x4 directions, 52% with only the spacing

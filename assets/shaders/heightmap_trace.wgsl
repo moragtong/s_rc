@@ -89,7 +89,7 @@ const SH_STRIDE: u32 = 10u;
 // distance below its stored ceiling. Lives in the shared module so every
 // pass derives the layer layout from the same constants. The layer is the
 // low bit of a probe's index within its cascade (floor = 0, ceiling = 1).
-const PROBES_PER_CELL: u32 = 2u;
+const PROBES_PER_CELL: u32 = 3u;
 // The constant distance every probe sits off its surface, m. Small enough
 // to stay inside the column's open interval, large enough that the surface
 // it just left does not immediately re-embed it.
@@ -262,6 +262,9 @@ fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     if usable && layer == 1u {
         y = h.x - PROBE_LAYER_GAP;
     }
+    if usable && layer == 2u {
+        y = (h.x + h.y) * 0.5;
+    }
     return vec3<f32>(p_xz.x, y, p_xz.y);
 }
 
@@ -298,7 +301,8 @@ fn probe_normal_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
         layer == 1u,
     );
     if dot(n, n) < 0.5 {
-        return vec3<f32>(0.0, select(1.0, -1.0, layer == 1u), 0.0);
+        // layer 0 = floor (up), layer 1 = ceiling (down), layer 2 = mid-air (up)
+        return vec3<f32>(0.0, select(1.0, select(-1.0, 1.0, layer == 2u), layer == 1u), 0.0);
     }
     return normalize(n);
 }

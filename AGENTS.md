@@ -8,6 +8,12 @@ still true?".
 
 ## Workstyle
 
+**Ask when an instruction is unclear; do not mull it over.** A short, direct
+clarifying question ("did you mean X or Y?") costs one round-trip. Guessing at
+an ambiguous term and building the wrong thing costs a build, a run, a
+measurement, and the user's patience. "C0" meant cascade 0, not the l=0 SH
+coefficient; a minute of asking would have saved a whole wrong implementation.
+
 **Never delete machinery to turn it off.** When the user asks to disable
 something, comment it out and write a comment explaining why it is off and
 what would put it back. The git history is a one-way rescue: a committed diff
@@ -20,14 +26,28 @@ it, and delete freely once it is committed.
 ## What this is
 
 Bevy 0.19 indirect lighting over a dual-channel heightmap (floor + ceiling per
-column, `SPLIT = 0.0`). Currently baking `assets/models/room.glb` once at
-startup into textures the cascade probes then trace against.
+column). Currently baking `assets/models/room.glb` once at startup into textures
+the cascade probes then trace against.
 
 > **Scene note:** most of the historic notes below (leaks, counts, thresholds)
 > predate the `room.glb` swap and referenced Sponza + `SPLIT = 5.0`. The
 > numbers in them are stale; prefers `room.glb`. What still stands is the
 > documented behaviour of each measurement, notably how winding-vs-normal-
 > vs-trace tests behave and why the box culling modes fail.
+
+**Room geometry (verified from `room.glb`):** interior floor y = -2.70, interior
+ceiling y = +2.70, interior walls at x/z = ±9.7 (outer shell ±10.0, outer y =
+±3.0). The room is 19.4 × 19.4 × 5.4 m inside. The old note about a "central
+raised platform at y = -1.6" was a Sponza artifact; `room.glb` has only window
+sills at y = -1.6 on the walls.
+
+**Heightmap bake (new):** the two bake cameras no longer share a `SPLIT` plane.
+The down camera sits at the scene's top (max_y) with its near plane ε beneath
+the ceiling; the up camera sits at the scene's bottom (min_y) with its near
+plane ε above the floor. `BAKE_CULL_MODE = Some(Face::Back)` is enabled so the
+exterior shell faces are culled, ensuring the cameras capture the interior
+floor/ceiling rather than the outer shell. The `SPLIT` constant remains only
+for the winding-map cut plane (y = -1.0).
 
 Bevy's default ambient is **off**: `main.rs` inserts
 `GlobalAmbientLight::NONE` (brightness 0) after `DefaultPlugins`, because the
@@ -143,9 +163,8 @@ column was open facing the nearest solid texel — it lit 359/2706 columns
 with horizontal normals but stepped where the rule boundary crossed a probe
 cell and read as **shadow strips along structure edges**, so it is reverted.
 Measured on `room.glb`: the escape branch fires on only **5** of 2706
-cascade-0 probes (the ones standing on the central raised platform, whose own
-column is solid); the perimeter walls almost never nudge because their probe
-columns are interior/open. The normals are baked once
+cascade-0 probes (the ones whose own column is solid); the perimeter walls
+almost never nudge because their probe columns are interior/open. The normals are baked once
 into `probe_positions`, which now holds **two vec4s per probe-with-layer**
 (even = position, odd = normal; `probe_position`/`probe_normal` read `2*i` /
 `2*i+1`, buffer sized `probes * 2` in `prepare_buffers`). The level and a
@@ -248,7 +267,7 @@ The **height gate is unconditional**: every neighbour tap is scaled by
 `height_agreement_tol(q_y - c_y, spacing * LOWPASS_HEIGHT_TOL_SPACING)` (1.5)
 and the surviving weights renormalise, so a height step sharpens the filter
 back towards the center probe instead of dimming it — `height_agreement` itself
-is 4 spacings (too loose to see the room's ~1.5 m platform step), hence the
+is 4 spacings (too loose to see the room's step features), hence the
 tolerance-aware variant added alongside it in `heightmap_trace.wgsl`. The gate
 was briefly a G-key toggle and is reverted: the current default is bit-identical
 to the old `S_RC_LOWPASS_GATE=1` frame.

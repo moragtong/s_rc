@@ -1,10 +1,11 @@
 //! Bakes the heightmap on the GPU from two orthographic cameras.
 //!
-//! Both sit at the same XZ origin on the `SPLIT` plane, facing opposite ways,
-//! so their near planes *are* the split: the down camera's depth test keeps
-//! the highest surface below it (the floor) and the up camera's the lowest
-//! surface above it (the ceiling). That is what replaces the per-triangle
-//! split classification the old CPU rasteriser had to do.
+//! The down camera sits at the scene's top (max_y) looking down with its near
+//! plane ε beneath the ceiling, and the up camera sits at the scene's bottom
+//! (min_y) looking up with its near plane ε above the floor. Back-face culling
+//! on the bake cameras ensures the exterior shell faces are skipped, so the
+//! cameras capture the interior floor and ceiling from the extremes. This
+//! replaces the old SPLIT-anchored placement and per-triangle classification.
 //!
 //! The cameras render nothing but prepasses (`RenderTarget::None`), so the
 //! only cost is a depth and a deferred G-buffer. One compute pass then reduces
@@ -45,7 +46,7 @@ use bevy::{
 };
 
 use crate::heightmap::{
-    BAKE_LAYER, BAKE_NEAR, EMPTY_FLOOR, Heightmap, NO_CEILING, RESOLUTION, SCENE_LAYER, SPLIT,
+    BAKE_LAYER, BAKE_NEAR, EMPTY_FLOOR, Heightmap, NO_CEILING, RESOLUTION, SCENE_LAYER,
 };
 use crate::heightmap_view::HeightmapViewMesh;
 
@@ -69,7 +70,7 @@ const MIN_CEILING_HITS: u32 = 10_000;
 
 /// Which half of the split a bake camera looks at. Extracted so the render
 /// world can tell the two bake views apart from the main camera.
-#[derive(Component, Clone, Copy, PartialEq, Eq, ExtractComponent)]
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug, ExtractComponent)]
 pub enum BakeView {
     Up,
     Down,
@@ -274,7 +275,7 @@ struct OriginalCullModes {
 
 /// Cull mode the bake cameras run with, so the experiment can be flipped by
 /// changing one line.
-const BAKE_CULL_MODE: Option<Face> = None;
+const BAKE_CULL_MODE: Option<Face> = Some(Face::Back);
 
 /// Set the face culling the bake cameras need, then put it back.
 ///
@@ -361,8 +362,10 @@ fn spawn_bake_cameras(
             BakeView::Down => "bake_down_target",
         };
         // Both cameras share the same XZ origin (0, *, 0) and the same
-        // near plane; only the facing differs, which is what splits the scene
-        // into ceiling and floor without any per-triangle classification.
+        // near plane. Their Y position and facing direction will be patched
+        // by `measure_scene_extent` once the scene meshes have resolved; the
+        // initial placeholder (0.0) lets the spawn proceed before the scene
+        // is fully loaded.
         commands.spawn((
             Camera3d::default(),
             Camera {
@@ -375,8 +378,8 @@ fn spawn_bake_cameras(
                 ..default()
             },
             Projection::Orthographic(OrthographicProjection {
-                // The near plane sits just off the split, so anything on the
-                // far side of it is clipped away.
+                // The near plane is a small offset from the camera; the exact
+                // far plane and camera position are patched in measure_scene_extent.
                 near: BAKE_NEAR,
                 // Patched by measure_scene_extent once the scene has loaded.
                 far: 1.0,
@@ -398,8 +401,8 @@ fn spawn_bake_cameras(
             Msaa::Off,
             DepthPrepass,
             DeferredPrepass,
-            Transform::from_xyz(0.0, SPLIT, 0.0)
-                .looking_at(Vec3::new(0.0, SPLIT + direction, 0.0), Vec3::NEG_Z),
+            Transform::from_xyz(0.0, 0.0, 0.0)
+                .looking_at(Vec3::new(0.0, 0.0 + direction, 0.0), Vec3::NEG_Z),
             view,
         ));
     };
@@ -429,7 +432,7 @@ pub(crate) fn measure_scene_extent(
     asset_server: Res<AssetServer>,
     meshes: Res<Assets<Mesh>>,
     query: Query<(&Mesh3d, &GlobalTransform), Without<HeightmapViewMesh>>,
-    mut cameras: Query<(&mut Projection, &BakeView)>,
+    mut cameras: Query<(&mut Projection, &BakeView, &mut Transform)>,
     mut heightmap: ResMut<Heightmap>,
 ) {
     if bake.is_ready() {
@@ -491,16 +494,27 @@ pub(crate) fn measure_scene_extent(
         (heightmap.max_bounds.x - heightmap.min_bounds.x) / heightmap.resolution.x as f32,
     );
 
-    for (mut projection, view) in &mut cameras {
-        let span = match view {
-            BakeView::Up => max_y - SPLIT,
-            BakeView::Down => SPLIT - min_y,
+    // Interior floor/ceiling are 0.3 m inside the AABB (wall/floor/ceiling thickness).
+    let interior_floor = min_y + 0.3;
+    let interior_ceiling = max_y - 0.3;
+
+    for (mut projection, view, mut transform) in &mut cameras {
+        // Down camera at interior ceiling, Up camera at interior floor.
+        // Near plane is ε (BAKE_NEAR) offset from these surfaces.
+        transform.translation.y = match view {
+            BakeView::Up => interior_floor,
+            BakeView::Down => interior_ceiling,
         };
+        // Cameras at interior surfaces need to see the exterior shell:
+        // Down at 2.7 must reach ground at -3.0 (5.7m)
+        // Up at -2.7 must reach roof at 3.0 (5.7m)
+        // Use full AABB span + margin to ensure roof/ground aren't clipped.
+        let span = max_y - min_y + 0.2; // 6.0 + 0.2 = 6.2
         if let Projection::Orthographic(o) = &mut *projection {
             o.far = span.max(0.1);
         }
     }
-    heightmap.top = max_y;
+    heightmap.top = interior_ceiling;
     bake.ready.store(true, Ordering::Relaxed);
     info!(
         "heightmap bake: {} meshes, y in [{:.2}, {:.2}]",
