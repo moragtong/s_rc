@@ -112,6 +112,27 @@ const RELOCATE_MIN_RADIUS: f32 = 0.75;
 // turn a few centimetres of overshoot into a huge sideways leap.
 const PROBE_NORMAL_MIN_Y: f32 = 0.2;
 
+// If dot(normal, -ray_dir) < this, the surface is too oblique.
+// Step back one texel along the ray instead.
+const NORMAL_DOT_THRESHOLD: f32 = 0.5;
+
+// Check if the surface normal at texel is too oblique to the ray.
+// If so, step back one texel along the ray and return that hit.
+fn check_normal_and_step_back(texel: vec2<i32>, ceiling_hit: bool, d: vec3<f32>) -> vec2<i32> {
+    let normal = select(
+        textureLoad(floor_normal, vec2<u32>(texel), 0).xyz,
+        textureLoad(ceiling_normal, vec2<u32>(texel), 0).xyz,
+        ceiling_hit,
+    );
+    // If normal is too oblique to ray (dot(normal, -d) too small), step back
+    if dot(normal, -d) < NORMAL_DOT_THRESHOLD {
+        // Step back one texel along the ray in XZ
+        let dir_step = select(vec2<i32>(-1), vec2<i32>(1), d.xz >= vec2<f32>(0.0));
+        return texel - dir_step;
+    }
+    return texel;
+}
+
 // Height tolerance between a probe's own height and the shaded pixel's, as a
 // multiple of the cascade's spacing. Cascade-0 spacing is 1.0 m, so this is a
 // 3.0 m tolerance - wider than the 2.7 m from the probe plane to the floor or
@@ -721,11 +742,13 @@ fn trace(o: vec3<f32>, d: vec3<f32>, t_start: f32, t_end: f32) -> Hit {
         // Entering a column below its floor or above its ceiling: the side
         // of a step or a beam.
         if y_in <= h.y {
+            hit.texel = check_normal_and_step_back(texel, false, d);
             hit.t = t;
             hit.ceiling = false;
             return hit;
         }
         if y_in >= h.x {
+            hit.texel = check_normal_and_step_back(texel, true, d);
             hit.t = t;
             hit.ceiling = true;
             return hit;
@@ -734,6 +757,7 @@ fn trace(o: vec3<f32>, d: vec3<f32>, t_start: f32, t_end: f32) -> Hit {
         // open air a wall's [top, bottom] interval reads as. Block rays that
         // cross the band, at the face they entered through.
         if is_solid(texel) {
+            hit.texel = check_normal_and_step_back(texel, false, d);
             hit.t = t;
             hit.ceiling = false;
             return hit;
@@ -741,6 +765,7 @@ fn trace(o: vec3<f32>, d: vec3<f32>, t_start: f32, t_end: f32) -> Hit {
         if d.y < 0.0 {
             let t_hit = (h.y - o.y) / d.y;
             if t_hit <= t_out {
+                hit.texel = check_normal_and_step_back(texel, false, d);
                 hit.t = t_hit;
                 hit.ceiling = false;
                 return hit;
@@ -751,6 +776,7 @@ fn trace(o: vec3<f32>, d: vec3<f32>, t_start: f32, t_end: f32) -> Hit {
             }
             let t_hit = (h.x - o.y) / d.y;
             if t_hit <= t_out {
+                hit.texel = check_normal_and_step_back(texel, true, d);
                 hit.t = t_hit;
                 hit.ceiling = true;
                 return hit;
