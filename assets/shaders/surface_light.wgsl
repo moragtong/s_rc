@@ -12,7 +12,8 @@
 @group(1) @binding(5) var radiance_max: texture_storage_2d<rgba32float, write>;
 
 // Shadow rays start this far off the surface, m.
-const SHADOW_BIAS: f32 = 0.05;
+// Matches SHADOW_RAY_BIAS in heightmap_trace.wgsl.
+const SHADOW_BIAS: f32 = 0.02;
 
 fn sunlit(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>) -> vec3<f32> {
     let cos_l = dot(n, uniforms.sun_toward);
