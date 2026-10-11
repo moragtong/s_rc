@@ -38,6 +38,9 @@ const SLICES: u32 = 6;
 const STEPS: u32 = 8;
 /// World radius each slice reaches, m.
 const RADIUS_M: f32 = 1.5;
+/// Maximum screen-space search radius in pixels. Prevents far-plane
+/// samples from projecting to huge screen radii and hitting foreground.
+const MAX_SCREEN_RADIUS_PX: u32 = 32;
 /// Fixed pixel-row stride of the output buffer and its height cap. A window
 /// wider than `GTAO_STRIDE` or taller than `GTAO_MAX_HEIGHT` must raise these
 /// (and `GTAO_STRIDE` in `shade_cascades.wgsl` mirrors it through the uniform).
@@ -56,6 +59,7 @@ struct GtaoUniforms {
     slices: u32,
     steps: u32,
     step_bias: f32,
+    max_screen_radius_px: u32,
     enabled: u32,
     pad0: u32,
 }
@@ -184,6 +188,7 @@ fn draw_gtao(
         slices: SLICES,
         steps: STEPS,
         step_bias: 0.0,
+        max_screen_radius_px: MAX_SCREEN_RADIUS_PX,
         enabled: 1,
         pad0: 0,
     });

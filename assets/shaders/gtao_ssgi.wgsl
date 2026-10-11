@@ -56,6 +56,9 @@ struct GtaoUniforms {
     slices: u32,
     steps: u32,
     step_bias: f32,
+    // Maximum screen-space search radius in pixels (clamps far-plane
+    // projections of the world radius to prevent reaching foreground).
+    max_screen_radius_px: u32,
     enabled: u32,
     pad0: u32,
 }
@@ -183,6 +186,10 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
     let steps = max(ss.steps, 1u);
     let dphi = TAU / f32(slices);
 
+    // Maximum screen-space radius clamp (prevents far pixels from
+    // searching across the whole screen to foreground objects).
+    let max_r_px = f32(ss.max_screen_radius_px);
+
     var e = vec3<f32>(0.0);
     var coverage = 0.0;
     for (var m = 0u; m < slices; m = m + 1u) {
@@ -200,6 +207,12 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
                 break;
             }
             let uv = (clip.xy / clip.w) * 0.5 + vec2<f32>(0.5);
+            // Clamp screen-space search radius: compute projected delta from
+            // the receiver pixel and skip if beyond max_r_px.
+            let delta_px = (uv - vec2<f32>(px)) * vec2<f32>(ss.screen);
+            if length(delta_px) > max_r_px {
+                break;
+            }
             if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
                 break;
             }
