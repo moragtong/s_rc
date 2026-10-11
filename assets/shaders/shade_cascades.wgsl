@@ -31,6 +31,10 @@
 // costs one storage read rather than two. Probe positions and parallax radii
 // are the same in both relights, so they survive the mix unchanged.
 @group(1) @binding(2) var<storage, read> sh_probes: array<vec4<f32>>;
+// GTAO-SSGI per-pixel irradiance (xyz), written at EarlyPostProcess. Read only
+// when `view_info.gtao_enabled`; xyz is multiplied by albedo/pi like the
+// probe path, so the branch replaces the whole indirect term.
+@group(1) @binding(4) var<storage, read> gtao_buf: array<vec4<f32>>;
 
 struct ShadeUniforms {
     view_from_clip: mat4x4<f32>,
@@ -40,6 +44,8 @@ struct ShadeUniforms {
     bilateral_enabled: u32,
     normal_bias_enabled: u32,
     bsp_recon_enabled: u32,
+    gtao_enabled: u32,
+    gtao_stride: u32,
 }
 @group(1) @binding(3) var<uniform> view_info: ShadeUniforms;
 
@@ -308,6 +314,15 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let base_color = pow(unpack4x8unorm(g.r).rgb, vec3<f32>(2.2));
     let metallic = unpack4x8unorm(g.b).g;
     let n = oct_decode(vec2<f32>(f32(g.a & 0xFFFu), f32((g.a >> 12u) & 0xFFFu)) / 4095.0);
+
+    // GTAO-SSGI: the screen-space pass already produced this pixel's indirect
+    // irradiance (with its own world-GI fallback for off-screen directions), so
+    // there is nothing to gather here.
+    if view_info.gtao_enabled != 0u {
+        let gi = u32(pixel.y) * view_info.gtao_stride + u32(pixel.x);
+        let e = gtao_buf[gi].xyz;
+        return vec4<f32>(base_color / PI * e, 0.0);
+    }
 
     let info = uniforms.cascades[0];
     // Probe-grid read, currently unjittered. The original form jitters by up

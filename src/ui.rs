@@ -10,6 +10,7 @@ pub struct LightingState {
     pub bilateral_enabled: bool,
     pub normal_bias_enabled: bool,
     pub bsp_recon_enabled: bool,
+    pub gtao_ssgi_enabled: bool,
 }
 
 impl Default for LightingState {
@@ -32,6 +33,13 @@ impl Default for LightingState {
             // giving the C^2 field the `blend_sh` B-spline pre-filter's control
             // coefficients describe. Expensive (4x the shade taps), so opt-in.
             bsp_recon_enabled: false,
+            // Off: the shade gathers the world cascade probes and adds them.
+            // On (G): a GTAO horizon-slice screen-space pass (EarlyPostProcess,
+            // before shade) computes the indirect irradiance per pixel instead,
+            // falling back to the world probe field per direction where the
+            // screen cannot answer. Supersedes the world gather for the whole
+            // term when on.
+            gtao_ssgi_enabled: false,
         }
     }
 }
@@ -96,6 +104,7 @@ pub enum Action {
     ToggleNormalBias,
     ToggleLowPass,
     ToggleBspRecon,
+    ToggleGtaoSsgi,
 }
 
 impl Plugin for UiPlugin {
@@ -298,6 +307,19 @@ fn setup_ui(mut commands: Commands) {
                     Text::new("Cubic B-Spline Recon (C)"),
                     TextColor(Color::WHITE),
                 ));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                    ActionButton(Action::ToggleGtaoSsgi),
+                ))
+                .with_child((Text::new("GTAO SSGI (G)"), TextColor(Color::WHITE)));
         });
 }
 
@@ -323,6 +345,7 @@ fn button_system(
     let mut toggle_bias = keys.just_pressed(KeyCode::KeyN);
     let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
     let mut toggle_bsp = keys.just_pressed(KeyCode::KeyC);
+    let mut toggle_gtao = keys.just_pressed(KeyCode::KeyG);
 
     for (interaction, mut color, action) in &mut interaction_query {
         match *interaction {
@@ -339,6 +362,7 @@ fn button_system(
                     Action::ToggleNormalBias => toggle_bias = true,
                     Action::ToggleLowPass => toggle_lp = true,
                     Action::ToggleBspRecon => toggle_bsp = true,
+                    Action::ToggleGtaoSsgi => toggle_gtao = true,
                 }
             }
             Interaction::Hovered => {
@@ -413,6 +437,11 @@ fn button_system(
         );
     }
 
+    if toggle_gtao {
+        lighting_state.gtao_ssgi_enabled = !lighting_state.gtao_ssgi_enabled;
+        bevy::log::info!("GTAO-SSGI: {}", lighting_state.gtao_ssgi_enabled);
+    }
+
     // The button colour is the on-screen indicator: green while the toggle is
     // enabled, dark grey while it is disabled.
     for (_interaction, mut color, action) in &mut interaction_query {
@@ -461,6 +490,13 @@ fn button_system(
             }
             Action::ToggleBspRecon => {
                 *color = BackgroundColor(if lighting_state.bsp_recon_enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                });
+            }
+            Action::ToggleGtaoSsgi => {
+                *color = BackgroundColor(if lighting_state.gtao_ssgi_enabled {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)
