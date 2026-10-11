@@ -69,6 +69,12 @@ const HALF_PI: f32 = 1.57079632679;
 // reading the world field for the fallback, so the fallback stands in for the
 // same field the world gather would have read.
 const WORLD_BIAS_NORMAL: f32 = 0.6;
+// Thickness heuristic: reject occluders significantly in front of the ray's
+// expected hit distance. Without this, foreground objects (which only have
+// front-face depth) appear as infinitely thick monoliths occluding distant
+// surfaces. If the occluder's distance along the ray is less than the step
+// distance minus this thickness, it's a separate object.
+const OCCLUDER_THICKNESS_M: f32 = 0.2;
 
 fn hash12(seed: vec2<f32>) -> f32 {
     return fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
@@ -221,7 +227,13 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
             if sw.w < 0.5 {
                 continue;
             }
+            // Thickness check: if occluder is significantly in front of the
+            // ray's expected hit distance, it's a separate foreground object.
             let ev = sw.xyz - p;
+            let actual_dist = dot(ev, tdir);
+            if r - actual_dist > OCCLUDER_THICKNESS_M {
+                continue;
+            }
             let h = dot(ev, n);
             let horiz = ev - n * h;
             let dh = length(horiz);
