@@ -484,3 +484,7 @@ camera `-10.58,4.86,-3.21,-1.17,8.18,-3.83`.
   probes via `sh_radiance(coefs, band_dir)`. Cascade 0 stays world-space.
   Toggle: G key / `S_RC_GTAO_SSGI=1` / UI button. 0 shader errors, 77964
   ceiling hits, correlation 0.82 vs world GI.
+
+- **gtao-ssgi** (2276252): Fix fallback matrix/band_dir calculations. Pure fallback
+  (radius→0) matches world GI at corr **0.779**, ratio **0.973**; full GTAO at
+  corr **0.821**, ratio **0.891**. No shader errors, 77964 ceiling hits.

@@ -176,10 +176,12 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
     let has_world = wsum > 1e-4;
     let sky = uniforms.sky_color.xyz;
 
+    // World-space hash: stable slice rotation as camera moves (prevents ghosting).
+    let rot = hash12(p.xz * 0.1) * TAU;
+
     let slices = max(ss.slices, 1u);
     let steps = max(ss.steps, 1u);
     let dphi = TAU / f32(slices);
-    let rot = hash12(vec2<f32>(px)) * TAU;
 
     var e = vec3<f32>(0.0);
     var coverage = 0.0;
