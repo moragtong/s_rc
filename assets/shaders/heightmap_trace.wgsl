@@ -116,11 +116,6 @@ const PROBE_NORMAL_MIN_Y: f32 = 0.2;
 // Step back one texel along the ray instead.
 const NORMAL_DOT_THRESHOLD: f32 = 0.5;
 
-// Bias added to shadow ray origin along the surface normal to prevent
-// self-intersection / shadow acne. Applied in the heightmap trace instead of
-// the cascade interval bias.
-const SHADOW_RAY_BIAS: f32 = 0.02;
-
 // Check if the surface normal at texel is too oblique to the ray.
 // If so, step back one texel along the ray and return that hit.
 fn check_normal_and_step_back(texel: vec2<i32>, ceiling_hit: bool, d: vec3<f32>) -> vec2<i32> {
