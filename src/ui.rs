@@ -11,6 +11,12 @@ pub struct LightingState {
     pub normal_bias_enabled: bool,
     pub bsp_recon_enabled: bool,
     pub gtao_ssgi_enabled: bool,
+    // Bevy's built-in SSAO (the XeGTAO-derivative VBAO), applied to the
+    // *isolated indirect term* in the composite pass (see AGENTS.md). Flipping
+    // this off stops the multiply but leaves the component on the camera, so
+    // Bevy's AO compute keeps running each frame; `S_RC_SSAO=0` removes the
+    // component at startup, which also saves that cost.
+    pub bevy_ssao_enabled: bool,
 }
 
 impl Default for LightingState {
@@ -40,6 +46,7 @@ impl Default for LightingState {
             // screen cannot answer. Supersedes the world gather for the whole
             // term when on.
             gtao_ssgi_enabled: false,
+            bevy_ssao_enabled: true,
         }
     }
 }
@@ -105,6 +112,7 @@ pub enum Action {
     ToggleLowPass,
     ToggleBspRecon,
     ToggleGtaoSsgi,
+    ToggleSsoA,
 }
 
 impl Plugin for UiPlugin {
@@ -319,7 +327,23 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleGtaoSsgi),
                 ))
-                .with_child((Text::new("GTAO SSGI (G)"), TextColor(Color::WHITE)));
+                .with_child((
+                    Text::new("GTAO SSGI (G)"),
+                    TextColor(Color::WHITE),
+                ));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                    ActionButton(Action::ToggleSsoA),
+                ))
+                .with_child((Text::new("Bevy SSAO (U)"), TextColor(Color::WHITE)));
         });
 }
 
@@ -346,6 +370,7 @@ fn button_system(
     let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
     let mut toggle_bsp = keys.just_pressed(KeyCode::KeyC);
     let mut toggle_gtao = keys.just_pressed(KeyCode::KeyG);
+    let mut toggle_ssao = keys.just_pressed(KeyCode::KeyU);
 
     for (interaction, mut color, action) in &mut interaction_query {
         match *interaction {
@@ -363,6 +388,7 @@ fn button_system(
                     Action::ToggleLowPass => toggle_lp = true,
                     Action::ToggleBspRecon => toggle_bsp = true,
                     Action::ToggleGtaoSsgi => toggle_gtao = true,
+                    Action::ToggleSsoA => toggle_ssao = true,
                 }
             }
             Interaction::Hovered => {
@@ -442,6 +468,11 @@ fn button_system(
         bevy::log::info!("GTAO-SSGI: {}", lighting_state.gtao_ssgi_enabled);
     }
 
+    if toggle_ssao {
+        lighting_state.bevy_ssao_enabled = !lighting_state.bevy_ssao_enabled;
+        bevy::log::info!("Bevy SSAO: {}", lighting_state.bevy_ssao_enabled);
+    }
+
     // The button colour is the on-screen indicator: green while the toggle is
     // enabled, dark grey while it is disabled.
     for (_interaction, mut color, action) in &mut interaction_query {
@@ -497,6 +528,13 @@ fn button_system(
             }
             Action::ToggleGtaoSsgi => {
                 *color = BackgroundColor(if lighting_state.gtao_ssgi_enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                });
+            }
+            Action::ToggleSsoA => {
+                *color = BackgroundColor(if lighting_state.bevy_ssao_enabled {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)

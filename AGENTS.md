@@ -75,6 +75,8 @@ BEVY_ASSET_ROOT=$PWD S_RC_CAM="-10.58,4.86,-3.21,-1.17,8.18,-3.83" \
 # S_RC_LOWPASS=0         no spatial low-pass in blend_sh (plain cross-fade, F key);
 #                        the neighbour height gate is unconditional
 # S_RC_BSPLINE_RECON=1   cubic B-spline shade reconstruction (C key), default off
+# S_RC_SSAO=0            drop Bevy's screen-space AO component; the composite
+#                        then skips the AO multiply of the indirect (default on)
 # S_RC_SCREENSHOT=/tmp/x.png    also exits at frame 240
 # Dump any baked image whole, to poke at it in numpy:
 #   S_RC_DUMP_HEIGHT=/tmp/h.bin     Rg32Float  512x512x2, **x = ceiling, y = floor**
@@ -409,6 +411,33 @@ The earlier winding-only `is_solid` swap, the `Heightmap::solid` /
 `bake_caps.rs` deletion and the `EMPTY_FLOOR` sentinel fix (the `usable` test's
 `h.y > uniforms.split - 9.0`) are committed. `probe_visible` is an occlusion
 trace again.
+
+**The shade pass is split: indirect goes to its own texture, then Bevy's SSAO
+multiplies it in a composite pass.** `shade_cascades.wgsl` no longer blends the
+indirect into the view target; `draw_shade` (`src/shade.rs`) first renders that
+term into a per-frame texture (`TextureCache`,
+`shade_indirect_texture`, `LoadOp::Clear`), then `composite_indirect.wgsl`
+reads it and the Bevy SSAO AO and adds `indirect * ao` onto the HDR image
+(additive). The split is bit-identical to the old single pass (max |d| 0 at the
+interior camera). Bevy's own SSAO is wired in: the window camera carries
+`bevy::pbr::ScreenSpaceAmbientOcclusion` (its plugin is part of `PbrPlugin`,
+and `DepthPrepass`/`NormalPrepass` are already on the camera), and the
+composite reads `ScreenSpaceAmbientOcclusionResources` (a render-world
+component on the view) at `PostProcess`, *after* the SSAO compute has run.
+Bevy's AO term on its own is a scene no-op here — it only scales Bevy's own
+deferred indirect, which is off (`GlobalAmbientLight::NONE`), which is exactly
+why the indirect had to be isolated for the AO to have anything to darken.
+Toggle: `S_RC_SSAO=0` drops the component and the composite gates the multiply
+off via a uniform (`ao_enabled`). **Gotcha that cost real time:** binding the
+1×1 white `FallbackImage` as a stand-in AO and sampling it with `textureLoad`
+returns **0 for every pixel except texel (0,0)**, so a missed fallback reads as
+nearly-black indirect — the multiply is gated with `select(1.0, …,
+ao_enabled)` instead of an unconditional `textureLoad`. `R32Float` (unfilterable)
+SSAO adapters would not match the filterable AO binding; this box uses
+`R16Float`. Measured at the interior camera (sun 45,54.7, static): AO-off is
+bit-identical to the pre-AO split, AO-on mean luminance 0.1620 vs 0.1724, the
+AO darkens 1.7% of pixels past 0.03 (contact regions), mean|d| 0.0104, 0 shader
+errors.
 
 ## March-once, relight every 4, and the blend pass that made it not cost anything
 

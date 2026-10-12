@@ -48,6 +48,7 @@ fn take_screenshot(
         blend_toggle.lowpass = std::env::var("S_RC_LOWPASS").as_deref() != Ok("0");
         lighting.bsp_recon_enabled = std::env::var("S_RC_BSPLINE_RECON").as_deref() == Ok("1");
         lighting.gtao_ssgi_enabled = std::env::var("S_RC_GTAO_SSGI").as_deref() == Ok("1");
+        lighting.bevy_ssao_enabled = std::env::var("S_RC_SSAO").as_deref() != Ok("0");
         // S_RC_DIRECT_ONLY=1 disables indirect lighting
         if std::env::var("S_RC_DIRECT_ONLY").as_deref() == Ok("1") {
             lighting.indirect_enabled = false;

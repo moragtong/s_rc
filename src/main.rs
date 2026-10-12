@@ -10,7 +10,6 @@ mod heightmap_view;
 mod hi_z;
 mod hi_z_debug;
 mod probe_overlay;
-mod scene3d;
 mod screenshot;
 mod shade;
 mod ui;
@@ -174,7 +173,8 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         sun_transform(),
     ));
 
-    commands.spawn((
+    let camera = commands
+        .spawn((
         Camera3d::default(),
         // The indirect pass adds linear light before tonemapping.
         bevy::camera::Hdr,
@@ -189,7 +189,21 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         FreeCamera::default(),
         bevy::ui::IsDefaultUiCamera,
         initial_camera_transform(),
-    ));
+    ))
+        .id();
+    // Bevy's built-in screen-space ambient occlusion (VBAO, the XeGTAO
+    // derivative). `ScreenSpaceAmbientOcclusionPlugin` is already registered by
+    // `PbrPlugin` (DefaultPlugins); this component is what enables it for the
+    // window camera. It scales Bevy's *own* indirect diffuse (ambient +
+    // environment + irradiance volumes) in the deferred lighting pass -- not the
+    // cascade probes, which the shade pass adds afterwards -- so with the scene
+    // ambient off it has little to darken. Gated OFF-by-`S_RC_SSAO=0` so an A/B
+    // can be shot with one binary.
+    if std::env::var("S_RC_SSAO").as_deref() != Ok("0") {
+        commands
+            .entity(camera)
+            .insert(bevy::pbr::ScreenSpaceAmbientOcclusion::default());
+    }
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
