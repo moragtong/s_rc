@@ -232,7 +232,7 @@ fn setup_ui(mut commands: Commands) {
                     ActionButton(Action::ToggleTrilinear),
                 ))
                 .with_child((
-                    Text::new("Trilinear Shade (T)"),
+                    Text::new("Hybrid Probe Blend (T)"),
                     TextColor(Color::WHITE),
                 ));
             parent
@@ -425,7 +425,7 @@ fn button_system(
 
     if toggle_tri {
         lighting_state.trilinear_enabled = !lighting_state.trilinear_enabled;
-        bevy::log::info!("Trilinear shade: {}", lighting_state.trilinear_enabled);
+        bevy::log::info!("Hybrid probe blend: {}", lighting_state.trilinear_enabled);
     }
 
     if toggle_cross {
