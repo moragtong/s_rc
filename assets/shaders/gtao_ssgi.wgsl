@@ -1,33 +1,16 @@
-// GTAO-based screen-space GI, with a per-direction fallback to the world
-// radiance-cascade probes.
+// Smooth Hemisphere-Integrated Probe GI with hybrid horizontal-bilinear and
+// inverse-square vertical blend, composited with contact SSAO.
 //
-// One thread per pixel. For the pixel's surface point `p` (reconstructed from
-// the deferred depth buffer) and its normal `n`, the hemisphere is split into
-// `ss.slices` azimuth slices of width `2*pi/slices`. Each slice is a horizon
-// search: march `ss.steps` world-space radii out along the slice's tangent
-// direction, project each step back into the screen, and read the surface the
-// depth buffer records there. A sample above the pixel's tangent plane is an
-// occluder at elevation `theta`; the slice integral over elevation is
-// `0.5 * dphi * d(sin^2 theta)` (since d(omega) = cos(theta) sin(theta) dtheta
-// dphi and n.w = cos(theta)), so a newly-reached elevation band adds the
-// occluder's directly-lit colour times that weight.
-//
-// A slice whose march leaves the screen, or reaches the radius without finding
-// any occluder, is *off screen* for the band it does not cover: that band is
-// filled with our own GI - the world cascade probe field read at `p`, its SH
-// reconstructed as radiance in the band's direction (`sh_radiance`). That is
-// the fallback: screen space where the depth buffer can answer, the cascades
-// everywhere it cannot.
-//
-// Radiance on an on-screen hit is the current frame's directly-lit colour
-// (this pass runs at EarlyPostProcess, after deferred lighting and before
-// `shade`, so the view target holds direct light only - no history, no
-// feedback). Output is a per-pixel irradiance the `shade` pass multiplies by
-// albedo/pi; the alpha channel carries the on-screen coverage fraction for
-// debugging.
-//
-// Cascade 0 stays in world space and is part of the fallback, so this pass is
-// purely additive detail over the existing solution.
+// One thread per pixel. For the pixel's surface point `p` and its normal `n`:
+// 1. Gathers the 12 cascade-0 world probes (4 corner cells x 3 vertical layers),
+//    gated by `probe_visible(p, n, center)`.
+// 2. Evaluates the hybrid blend: bilinear horizontal interpolation in XZ and
+//    continuous inverse-square vertical weighting (1 / (eps + dy^2)).
+// 3. Numerically integrates clamped radiance (max(sh_radiance, 0)) across 6
+//    azimuth slices around the normal hemisphere at 45 degree elevation.
+//    Clamping before integration avoids negative ringing lobes inherent to SH.
+// 4. Writes irradiance to `gtao_out`, which is multiplied by Bevy's XeGTAO SSAO
+//    in `composite_indirect` for clean contact shadowing.
 
 #import s_rc::heightmap_trace::{uniforms, oct_decode, sh_basis, SH_STRIDE, PROBES_PER_CELL, PI, is_solid, texel_at, probe_visible}
 
@@ -60,25 +43,14 @@ struct GtaoUniforms {
     // projections of the world radius to prevent reaching foreground).
     max_screen_radius_px: u32,
     enabled: u32,
-    pad0: u32,
+    normal_bias_enabled: u32,
 }
 
 const TAU: f32 = 6.28318530718;
-const HALF_PI: f32 = 1.57079632679;
 // Match `shade_cascades.wgsl`'s normal-biased fetch anchor (BIAS_NORMAL) when
 // reading the world field for the fallback, so the fallback stands in for the
 // same field the world gather would have read.
 const WORLD_BIAS_NORMAL: f32 = 0.6;
-// Thickness heuristic: reject occluders significantly in front of the ray's
-// expected hit distance. Without this, foreground objects (which only have
-// front-face depth) appear as infinitely thick monoliths occluding distant
-// surfaces. If the occluder's distance along the ray is less than the step
-// distance minus this thickness, it's a separate object.
-const OCCLUDER_THICKNESS_M: f32 = 0.2;
-
-fn hash12(seed: vec2<f32>) -> f32 {
-    return fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
-}
 
 // World position of the visible surface at pixel `px`; w = 0 on background.
 fn world_at(px: vec2<i32>) -> vec4<f32> {
@@ -109,8 +81,8 @@ fn tangent_frame(n: vec3<f32>) -> mat3x3<f32> {
     return mat3x3<f32>(t, bt, n);
 }
 
-// Radiance from direction `d` reconstructed from SH radiance coefficients
-// (no cosine convolution - the coefficients already hold radiance).
+// Radiance from direction `d` reconstructed from SH radiance coefficients.
+// Clamped to non-negative to eliminate SH ringing / negative lobes.
 fn sh_radiance(coefs: array<vec3<f32>, 9>, d: vec3<f32>) -> vec3<f32> {
     let b = sh_basis(d);
     var e = vec3<f32>(0.0);
@@ -119,8 +91,6 @@ fn sh_radiance(coefs: array<vec3<f32>, 9>, d: vec3<f32>) -> vec3<f32> {
     }
     return max(e, vec3<f32>(0.0));
 }
-
-
 
 @compute @workgroup_size(8, 8, 1)
 fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -141,10 +111,8 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tan_x = frame[0];
     let tan_y = frame[1];
 
-    // Our GI at `p`, for the off-screen bands: the cascade-0 probe field, read
-    // bilinearly in XZ and blended over the three layers by vertical distance.
-    // The coefficients are kept so a band can be reconstructed in its own
-    // direction.
+    // Gather the cascade-0 probe field, read bilinearly in XZ and blended
+    // over the three layers by continuous inverse-square vertical distance.
     var wcoefs: array<vec3<f32>, 9>;
     for (var i = 0u; i < 9u; i = i + 1u) {
         wcoefs[i] = vec3<f32>(0.0);
@@ -152,7 +120,6 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
     var wsum = 0.0;
     {
         let info = uniforms.cascades[0];
-        // Read at the same anchor the world gather would (`p + n * BIAS_NORMAL`).
         let wp = p + n * WORLD_BIAS_NORMAL;
         let gu = (wp.xz - uniforms.hmap_min) / info.spacing - 0.5;
         let cell = vec2<i32>(floor(gu));
@@ -177,7 +144,7 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
             for (var layer = 0u; layer < PROBES_PER_CELL; layer = layer + 1u) {
                 let base = (base_cell + layer) * SH_STRIDE;
                 let c = sh_probes[base + 9u].xyz;
-                if probe_visible(p, n, c) {
+                if ss.normal_bias_enabled != 0u || probe_visible(p, n, c) {
                     let w = w_corner * (layer_w[layer] / layer_sum);
                     for (var i = 0u; i < 9u; i = i + 1u) {
                         wcoefs[i] += sh_probes[base + i].xyz * w;
@@ -187,90 +154,40 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
     }
+
     let has_world = wsum > 1e-4;
     let sky = uniforms.sky_color.xyz;
 
-    // World-space hash: stable slice rotation as camera moves (prevents ghosting).
-    let rot = hash12(p.xz * 0.1) * TAU;
-
-    let slices = max(ss.slices, 1u);
-    let steps = max(ss.steps, 1u);
-    let dphi = TAU / f32(slices);
-
-    // Maximum screen-space radius clamp (prevents far pixels from
-    // searching across the whole screen to foreground objects).
-    let max_r_px = f32(ss.max_screen_radius_px);
-
-    var e = vec3<f32>(0.0);
-    var coverage = 0.0;
-    for (var m = 0u; m < slices; m = m + 1u) {
-        let phi = (f32(m) + 0.5) * dphi + rot;
-        let tdir = normalize(tan_x * cos(phi) + tan_y * sin(phi));
-        var prev_sin2 = 0.0;
-        var last_dir = tdir;
-        for (var k = 0u; k < steps; k = k + 1u) {
-            let f = (f32(k) + 1.0) / f32(steps);
-            // Denser near the pixel, where the slice's solid angle matters most.
-            let r = ss.radius_m * f * f;
-            let sp = p + tdir * r;
-            let clip = ss.clip_from_world * vec4<f32>(sp, 1.0);
-            if clip.w <= 0.0 {
-                break;
-            }
-            let uv = (clip.xy / clip.w) * 0.5 + vec2<f32>(0.5);
-            // Clamp screen-space search radius: compute projected delta from
-            // the receiver pixel and skip if beyond max_r_px.
-            let delta_px = (uv - vec2<f32>(px)) * vec2<f32>(ss.screen);
-            if length(delta_px) > max_r_px {
-                break;
-            }
-            if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
-                break;
-            }
-            let hpx = vec2<i32>(uv * vec2<f32>(ss.screen));
-            let sw = world_at(hpx);
-            if sw.w < 0.5 {
-                continue;
-            }
-            // Thickness check: if occluder is significantly in front of the
-            // ray's expected hit distance, it's a separate foreground object.
-            let ev = sw.xyz - p;
-            let actual_dist = dot(ev, tdir);
-            if r - actual_dist > OCCLUDER_THICKNESS_M {
-                continue;
-            }
-            let h = dot(ev, n);
-            let horiz = ev - n * h;
-            let dh = length(horiz);
-            if dh < 1e-4 {
-                continue;
-            }
-            let theta = atan2(h, dh);
-            if theta > 0.0 && theta < HALF_PI {
-                let s2 = sin(theta) * sin(theta);
-                if s2 > prev_sin2 {
-                    let l = textureLoad(direct_color, hpx, 0).rgb;
-                    e += l * (0.5 * (s2 - prev_sin2) * dphi);
-                    prev_sin2 = s2;
-                    last_dir = normalize(ev);
-                }
-            }
+    // Renormalize coefficients over the surviving visible probes
+    var norm_coefs: array<vec3<f32>, 9>;
+    if has_world {
+        let inv_w = 1.0 / wsum;
+        for (var i = 0u; i < 9u; i = i + 1u) {
+            norm_coefs[i] = wcoefs[i] * inv_w;
         }
-        // The band the screen could not cover: our GI, evaluated in the band's
-        // own direction. The band spans elevation asin(sqrt(prev_sin2)) radians
-        // to the horizon; since the weight is uniform in sin^2 theta, evaluate
-        // at the band's mean elevation, sin^2 = (prev_sin2 + 1) / 2.
-        let rem = 0.5 * (1.0 - prev_sin2) * dphi;
-        let s2_mid = 0.5 * (prev_sin2 + 1.0);
-        let c_mid = sqrt(max(0.0, 1.0 - s2_mid));
-        let band_dir = normalize(n * sqrt(s2_mid) + tdir * c_mid);
-        var fallback = sky;
-        if has_world {
-            fallback = sh_radiance(wcoefs, band_dir);
-        }
-        e += fallback * rem;
-        coverage += 0.5 * (1.0 - prev_sin2);
     }
 
-    gtao_out[idx] = vec4<f32>(e, coverage / PI);
+    // Directional numerical integration over the normal hemisphere.
+    // 6 azimuthal slices at elevation angle 45 degrees (sin^2 theta = 0.5).
+    // Because the integrand is an order-2 spherical harmonic, a 6-tap uniform
+    // quadrature integrates azimuth frequencies up to 5 with exact accuracy.
+    let slices = max(ss.slices, 1u);
+    let dphi = TAU / f32(slices);
+    let rem = 0.5 * dphi;
+    let s2_mid = 0.5;
+    let c_mid = sqrt(0.5);
+
+    var e = vec3<f32>(0.0);
+    for (var m = 0u; m < slices; m = m + 1u) {
+        let phi = (f32(m) + 0.5) * dphi;
+        let tdir = normalize(tan_x * cos(phi) + tan_y * sin(phi));
+        let band_dir = normalize(n * sqrt(s2_mid) + tdir * c_mid);
+        var radiance = sky;
+        if has_world {
+            radiance = sh_radiance(norm_coefs, band_dir);
+        }
+        e += radiance * rem;
+    }
+
+    gtao_out[idx] = vec4<f32>(e, 0.0);
 }

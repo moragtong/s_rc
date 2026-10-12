@@ -328,7 +328,7 @@ fn setup_ui(mut commands: Commands) {
                     ActionButton(Action::ToggleGtaoSsgi),
                 ))
                 .with_child((
-                    Text::new("GTAO SSGI (G)"),
+                    Text::new("Smooth Probe GI (G)"),
                     TextColor(Color::WHITE),
                 ));
             parent
@@ -465,7 +465,7 @@ fn button_system(
 
     if toggle_gtao {
         lighting_state.gtao_ssgi_enabled = !lighting_state.gtao_ssgi_enabled;
-        bevy::log::info!("GTAO-SSGI: {}", lighting_state.gtao_ssgi_enabled);
+        bevy::log::info!("Smooth Probe GI: {}", lighting_state.gtao_ssgi_enabled);
     }
 
     if toggle_ssao {

@@ -61,7 +61,7 @@ struct GtaoUniforms {
     step_bias: f32,
     max_screen_radius_px: u32,
     enabled: u32,
-    pad0: u32,
+    normal_bias_enabled: u32,
 }
 
 #[derive(Resource)]
@@ -190,7 +190,7 @@ fn draw_gtao(
         step_bias: 0.0,
         max_screen_radius_px: MAX_SCREEN_RADIUS_PX,
         enabled: 1,
-        pad0: 0,
+        normal_bias_enabled: lighting_state.normal_bias_enabled as u32,
     });
     uniforms.write_buffer(&render_device, &render_queue);
 
