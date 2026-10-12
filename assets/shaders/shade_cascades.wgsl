@@ -22,7 +22,7 @@
 // instead - the cell in front of the surface - and `probe_visible` is skipped.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal, is_solid, texel_at}
+#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal, is_solid, texel_at, probe_visible}
 
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var gbuffer: texture_2d<u32>;
@@ -118,54 +118,6 @@ fn hash12(seed: vec2<f32>) -> f32 {
     return fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
-// Whether a probe is reachable from `p`. The heightmap records one floor and
-// one ceiling per column, so it cannot represent a wall: without this test a
-// probe on the far side of a wall, or a ground-floor probe under a second
-// floor, bleeds straight through. `trace` returns MISS for a segment that
-// stays in open space over its whole length.
-fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
-    let start_pos = p.xz + n.xz * 0.04;
-    let to_probe = center.xz - start_pos;
-    let dist_xz = length(to_probe);
-    if dist_xz <= 1e-4 {
-        return !is_solid(texel_at(center.xz));
-    }
-    // Reject if the probe center itself is inside a solid wall
-    if is_solid(texel_at(center.xz)) {
-        return false;
-    }
-    // March along the 2D ray segment in the winding map.
-    // Cascade 0 spacing is 1.0 m, walls are 0.3 m thick (~3.8 texels).
-    // Stepping 6 samples guarantees catching any interior or exterior wall crossed.
-    let steps = 6u;
-    for (var i = 1u; i < steps; i = i + 1u) {
-        let t = f32(i) / f32(steps);
-        let sample_xz = start_pos + to_probe * t;
-        if is_solid(texel_at(sample_xz)) {
-            return false;
-        }
-    }
-    return true;
-
-    // It was off for a while; when the build that turned it on (interior
-    // camera, pinned sun, mean luminance 0.2040 without) was A/B:
-    //
-    //   occlusion on, is_solid = normals || winding : mean|d| 0.0362, 31.9% of
-    //     px past 0.05, 4.01% brighter / 9.86% darker, luminance 0.2044
-    //   occlusion on, is_solid = winding only       : mean|d| 0.0509, 64.7%
-    //     px past 0.05, 33.91% brighter / 0.06% darker, luminance 0.2417
-    //
-    // The rule change is the bigger half of that, not the occlusion, and it
-    // goes bright rather than dark - 0.0593 mean|d| between the two occluded
-    // builds, max 0.92 - because `is_solid` is shared with `trace`, so it also
-    // moves where the cascade rays stop and what the probes gather. Turning
-    // occlusion on on top of it was worth 0.0362, and left 10% of pixels
-    // darker, which is the wall rejection doing its job.
-}
-
-// The SH coefficients are radiance, and `sh_probes` is already the cross-fade
-// between two relights (see blend_sh.wgsl), so this is a plain read: the blend
-// is done once over 18k words instead of once per coefficient per pixel.
 fn sh_coeff(base: u32, i: u32) -> vec3<f32> {
     return sh_probes[base + i].xyz;
 }

@@ -29,7 +29,7 @@
 // Cascade 0 stays in world space and is part of the fallback, so this pass is
 // purely additive detail over the existing solution.
 
-#import s_rc::heightmap_trace::{uniforms, oct_decode, sh_basis, SH_STRIDE, PROBES_PER_CELL, PI, is_solid, texel_at}
+#import s_rc::heightmap_trace::{uniforms, oct_decode, sh_basis, SH_STRIDE, PROBES_PER_CELL, PI, is_solid, texel_at, probe_visible}
 
 // Main camera bindings.
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
@@ -120,26 +120,7 @@ fn sh_radiance(coefs: array<vec3<f32>, 9>, d: vec3<f32>) -> vec3<f32> {
     return max(e, vec3<f32>(0.0));
 }
 
-fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
-    let start_pos = p.xz + n.xz * 0.04;
-    let to_probe = center.xz - start_pos;
-    let dist_xz = length(to_probe);
-    if dist_xz <= 1e-4 {
-        return !is_solid(texel_at(center.xz));
-    }
-    if is_solid(texel_at(center.xz)) {
-        return false;
-    }
-    let steps = 6u;
-    for (var i = 1u; i < steps; i = i + 1u) {
-        let t = f32(i) / f32(steps);
-        let sample_xz = start_pos + to_probe * t;
-        if is_solid(texel_at(sample_xz)) {
-            return false;
-        }
-    }
-    return true;
-}
+
 
 @compute @workgroup_size(8, 8, 1)
 fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
