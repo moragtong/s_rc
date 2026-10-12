@@ -16,6 +16,7 @@ use bevy::{
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
+        texture::TextureCache,
         view::{ExtractedView, ViewTarget},
     },
 };
@@ -38,6 +39,16 @@ struct ShadeUniforms {
     bsp_recon_enabled: u32,
 }
 
+/// The composite half of the shade split: writes the indirect term (times the
+/// SSAO AO when enabled) onto the HDR image.
+#[derive(ShaderType, Clone)]
+struct CompositeUniforms {
+    ao_enabled: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
 #[derive(Resource)]
 struct ShadePipeline {
     layout: BindGroupLayoutDescriptor,
@@ -52,6 +63,40 @@ impl SpecializedRenderPipeline for ShadePipeline {
         RenderPipelineDescriptor {
             label: Some("shade_cascades".into()),
             layout: vec![common_layout(), self.layout.clone()],
+            vertex: self.fullscreen_shader.to_vertex_state(),
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                targets: vec![Some(ColorTargetState {
+                    format,
+                    // The indirect term goes to its own texture now (see
+                    // `draw_shade`); replace, nothing to blend with.
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+                ..default()
+            }),
+            ..default()
+        }
+    }
+}
+
+/// The second half of the shade split: adds the indirect texel read from the
+/// shade pass's own buffer back onto the lit HDR image. This is where Bevy's
+/// SSAO AO is meant to multiply the indirect once it is wired in.
+#[derive(Resource)]
+struct CompositePipeline {
+    layout: BindGroupLayoutDescriptor,
+    shader: Handle<Shader>,
+    fullscreen_shader: FullscreenShader,
+}
+
+impl SpecializedRenderPipeline for CompositePipeline {
+    type Key = TextureFormat;
+
+    fn specialize(&self, format: TextureFormat) -> RenderPipelineDescriptor {
+        RenderPipelineDescriptor {
+            label: Some("composite_indirect".into()),
+            layout: vec![self.layout.clone()],
             vertex: self.fullscreen_shader.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
@@ -87,6 +132,7 @@ impl Plugin for ShadePlugin {
 
         render_app
             .init_resource::<SpecializedRenderPipelines<ShadePipeline>>()
+            .init_resource::<SpecializedRenderPipelines<CompositePipeline>>()
             .add_systems(RenderStartup, init_shade_pipeline)
             .add_systems(
                 Core3d,
@@ -119,16 +165,45 @@ fn init_shade_pipeline(
         shader: asset_server.load(SHADER_PATH),
         fullscreen_shader: fullscreen_shader.clone(),
     });
+    commands.insert_resource(CompositePipeline {
+        layout: BindGroupLayoutDescriptor::new(
+            "composite_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    // The isolated indirect term, written by the shade pass.
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                    // Bevy's SSAO AO (R16Float on this adapter, hence
+                    // filterable). Gated off by `ao_enabled` when the SSAO
+                    // component is absent; the fallback image is bound but not
+                    // read then (see the shader).
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    uniform_buffer::<CompositeUniforms>(false),
+                ),
+            ),
+        ),
+        shader: asset_server.load("shaders/composite_indirect.wgsl"),
+        fullscreen_shader: fullscreen_shader.clone(),
+    });
 }
 
 fn draw_shade(
-    view: ViewQuery<(&ViewTarget, &ExtractedView, Option<&ViewPrepassTextures>)>,
+    view: ViewQuery<(
+        &ViewTarget,
+        &ExtractedView,
+        Option<&ViewPrepassTextures>,
+        Option<&bevy::pbr::ScreenSpaceAmbientOcclusionResources>,
+    )>,
     lighting_state: Res<LightingState>,
     pipeline: Res<ShadePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<ShadePipeline>>,
+    composite: Res<CompositePipeline>,
+    mut composite_pipelines: ResMut<SpecializedRenderPipelines<CompositePipeline>>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    mut texture_cache: ResMut<TextureCache>,
+    fallback: Res<bevy::render::texture::FallbackImage>,
     render_data: Option<Res<CascadesRenderData>>,
     mut ctx: RenderContext,
 ) {
@@ -141,7 +216,7 @@ fn draw_shade(
     let Some(render_data) = render_data else {
         return;
     };
-    let (view_target, extracted_view, prepass) = view.into_inner();
+    let (view_target, extracted_view, prepass, ssao_resources) = view.into_inner();
     let Some(prepass) = prepass else {
         return;
     };
@@ -169,6 +244,27 @@ fn draw_shade(
         return;
     };
 
+    // Per-frame buffer for the isolated indirect term, one per view that
+    // reaches this pass. `TextureCache` recycles entries frame to frame.
+    let viewport = extracted_view.viewport;
+    let indirect_texture = texture_cache.get(
+        &render_device,
+        TextureDescriptor {
+            label: Some("shade_indirect_texture"),
+            size: Extent3d {
+                width: viewport.z,
+                height: viewport.w,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: view_target.main_texture_format(),
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+    );
+
     let bind_group = render_device.create_bind_group(
         "shade_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipeline.layout),
@@ -180,18 +276,81 @@ fn draw_shade(
         )),
     );
 
-    let mut pass = ctx
-        .command_encoder()
-        .begin_render_pass(&RenderPassDescriptor {
-            label: Some("shade_pass"),
-            color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-    pass.set_pipeline(render_pipeline);
-    pass.set_bind_group(0, &render_data.common_bind_group, &[]);
-    pass.set_bind_group(1, &bind_group, &[]);
-    pass.draw(0..3, 0..1);
+    // The render pass's borrow of `ctx` lives until it is dropped (its Drop
+    // calls `end()`), so each pass gets its own scope.
+    {
+        let mut pass = ctx
+            .command_encoder()
+            .begin_render_pass(&RenderPassDescriptor {
+                label: Some("shade_pass"),
+                // The indirect term lands in its own per-frame texture (so Bevy's
+                // SSAO AO can multiply it before it touches the image); the
+                // composite pass below adds it on. `LoadOp::Clear` is belt-and-
+                // braces: the fullscreen triangle covers every pixel anyway.
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &indirect_texture.default_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Default::default()),
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        pass.set_pipeline(render_pipeline);
+        pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+        pass.set_bind_group(1, &bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    // Composite the indirect buffer back onto the lit image (additive).
+    let composite_pipeline_id = composite_pipelines.specialize(
+        &pipeline_cache,
+        &composite,
+        view_target.main_texture_format(),
+    );
+    let Some(composite_pipeline) = pipeline_cache.get_render_pipeline(composite_pipeline_id) else {
+        return;
+    };
+    let mut composite_uniforms = UniformBuffer::from(CompositeUniforms {
+        ao_enabled: (ssao_resources.is_some() && lighting_state.bevy_ssao_enabled) as u32,
+        pad0: 0,
+        pad1: 0,
+        pad2: 0,
+    });
+    composite_uniforms.write_buffer(&render_device, &render_queue);
+    let composite_bind_group = render_device.create_bind_group(
+        "composite_bind_group",
+        &pipeline_cache.get_bind_group_layout(&composite.layout),
+        &BindGroupEntries::sequential((
+            &indirect_texture.default_view,
+            // Bevy's AO, or any texture when the SSAO component is off: the
+            // shader only reads it when `ao_enabled` is set.
+            match ssao_resources {
+                Some(res) => &res.screen_space_ambient_occlusion_texture.default_view,
+                None => &fallback.d2.texture_view,
+            },
+            composite_uniforms.binding().unwrap(),
+        )),
+    );
+
+    {
+        let mut pass = ctx
+            .command_encoder()
+            .begin_render_pass(&RenderPassDescriptor {
+                label: Some("composite_indirect"),
+                color_attachments: &[Some(view_target.get_unsampled_color_attachment())],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        pass.set_pipeline(composite_pipeline);
+        pass.set_bind_group(0, &composite_bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
 }
