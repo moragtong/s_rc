@@ -11,6 +11,7 @@
 
 #import s_rc::heightmap_trace::{
     uniforms, probe_position, cell_direction, stored_segment, parent_layer, MISS, PROBES_PER_CELL,
+    cell_size,
 }
 
 @group(1) @binding(0) var radiance_min: texture_2d<f32>;
@@ -35,12 +36,37 @@ fn hit_t(e: vec4<u32>) -> f32 {
     return bitcast<f32>(e.w);
 }
 
-fn surface_radiance(e: vec4<u32>) -> vec3<f32> {
-    let texel = vec2<i32>(e.xy);
-    if e.z != 0u {
-        return textureLoad(radiance_min, texel, 0).rgb;
+fn bilinear_surface_radiance(hit_xz: vec2<f32>, is_ceiling: bool) -> vec3<f32> {
+    let fcoord = (hit_xz - uniforms.hmap_min) / cell_size() - 0.5;
+    let base = vec2<i32>(floor(fcoord));
+    let frac = fcoord - floor(fcoord);
+    let max_t = vec2<i32>(uniforms.hmap_res) - 1;
+
+    let t00 = clamp(base, vec2<i32>(0), max_t);
+    let t10 = clamp(base + vec2<i32>(1, 0), vec2<i32>(0), max_t);
+    let t01 = clamp(base + vec2<i32>(0, 1), vec2<i32>(0), max_t);
+    let t11 = clamp(base + vec2<i32>(1, 1), vec2<i32>(0), max_t);
+
+    var r00: vec3<f32>;
+    var r10: vec3<f32>;
+    var r01: vec3<f32>;
+    var r11: vec3<f32>;
+
+    if is_ceiling {
+        r00 = textureLoad(radiance_min, t00, 0).rgb;
+        r10 = textureLoad(radiance_min, t10, 0).rgb;
+        r01 = textureLoad(radiance_min, t01, 0).rgb;
+        r11 = textureLoad(radiance_min, t11, 0).rgb;
+    } else {
+        r00 = textureLoad(radiance_max, t00, 0).rgb;
+        r10 = textureLoad(radiance_max, t10, 0).rgb;
+        r01 = textureLoad(radiance_max, t01, 0).rgb;
+        r11 = textureLoad(radiance_max, t11, 0).rgb;
     }
-    return textureLoad(radiance_max, texel, 0).rgb;
+
+    let rx0 = mix(r00, r10, frac.x);
+    let rx1 = mix(r01, r11, frac.x);
+    return mix(rx0, rx1, frac.y);
 }
 
 // Distance along this ray at which the parent probe's nearest stored surface
@@ -140,7 +166,8 @@ fn cascade(c: u32, id: u32) {
         let e = hit_at(info.ray_base + id, 0u);
         let t = hit_t(e);
         if t != MISS {
-            out = vec4<f32>(surface_radiance(e), t);
+            let hit_p = p + d * t;
+            out = vec4<f32>(bilinear_surface_radiance(hit_p.xz, e.z != 0u), t);
         }
         rays[info.ray_base + id] = out;
         return;
@@ -186,8 +213,9 @@ fn cascade(c: u32, id: u32) {
         let t = hit_t(e);
         if t != MISS {
             let dir = seg / len;
-            radiance += w * surface_radiance(e);
-            distance_sum += w * distance(p, a + dir * t);
+            let hit_p = a + dir * t;
+            radiance += w * bilinear_surface_radiance(hit_p.xz, e.z != 0u);
+            distance_sum += w * distance(p, hit_p);
             distance_weight += w;
             continue;
         }
