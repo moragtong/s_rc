@@ -583,7 +583,9 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 let base = (base_cell + layer) * SH_STRIDE;
                 let center = sh_probes[base + 9u].xyz;
                 if view_info.normal_bias_enabled != 0u || probe_is_visible(vis_mask, k, layer) {
-                    let w = w_corner * (layer_w[layer] / layer_sum);
+                    let d_xz = center.xz - fetch.xz;
+                    let w_horiz = 1.0 / (1e-3 + dot(d_xz, d_xz));
+                    let w = w_horiz * (layer_w[layer] / layer_sum);
                     if SH_MIX_COEFFS {
                         for (var i = 0u; i < 9u; i++) {
                             cf_blend[i] += sh_coeff(base, i) * w;
