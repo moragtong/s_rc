@@ -53,7 +53,7 @@ impl Default for BlendToggleState {
 #[derive(Component)]
 pub struct ActionButton(pub Action);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ToggleHeightmap,
     ToggleIndirect,
@@ -80,24 +80,28 @@ impl Plugin for UiPlugin {
     }
 }
 
-/// Draws an on-screen button bar along the top edge of the window.
-///
-/// Designed so screenshots can crop or ignore the top 48 pixels and get an
+/// Set false to skip rendering the on-screen toggle panel. The panel is drawn
+/// over the scene, so its button pixels land in every screenshot and pollute an
 /// A/B diff (`S_RC_INDIRECT`-style comparisons are on the scene, not the UI);
-/// the hotkeys (M, I, P...) do the exact same work as clicking the buttons.
+/// with it off the resources are still registered, only the nodes are not
+/// spawned. Rebuild to toggle; the panel's own F/G keys still work when it is
+/// on.
+pub const SHOW_TOGGLE_PANEL: bool = true;
+
 fn setup_ui(mut commands: Commands) {
+    if !SHOW_TOGGLE_PANEL {
+        return;
+    }
     commands
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Px(8.0),
-                left: Val::Px(8.0),
-                flex_direction: FlexDirection::Row,
-                column_gap: Val::Px(6.0),
+                top: Val::Px(10.0),
+                left: Val::Px(10.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(8.0),
                 ..default()
             },
-            // Pick up clicks through the rest of the UI root so the scene
-            // camera doesn't steal them.
             Pickable::IGNORE,
         ))
         .with_children(|parent| {
@@ -113,7 +117,7 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleHeightmap),
                 ))
-                .with_child((Text::new("Heightmap (M)"), TextColor(Color::WHITE)));
+                .with_child((Text::new("Toggle Heightmap (M)"), TextColor(Color::WHITE)));
             parent
                 .spawn((
                     Button,
@@ -126,7 +130,10 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
                     ActionButton(Action::ToggleIndirect),
                 ))
-                .with_child((Text::new("Indirect (I)"), TextColor(Color::WHITE)));
+                .with_child((
+                    Text::new("Toggle Indirect Lighting (I)"),
+                    TextColor(Color::WHITE),
+                ));
             parent
                 .spawn((
                     Button,
@@ -139,7 +146,7 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleProbes),
                 ))
-                .with_child((Text::new("Probes (P)"), TextColor(Color::WHITE)));
+                .with_child((Text::new("Toggle Probes (P)"), TextColor(Color::WHITE)));
             parent
                 .spawn((
                     Button,
@@ -217,32 +224,68 @@ fn button_system(
     let mut toggle_ssao = keys.just_pressed(KeyCode::KeyU);
 
     for (interaction, mut color, action) in &mut interaction_query {
-        match *interaction {
-            Interaction::Pressed => {
-                *color = BackgroundColor(Color::srgb(0.35, 0.75, 0.35));
-                match action.0 {
-                    Action::ToggleHeightmap => toggle_h = true,
-                    Action::ToggleIndirect => toggle_i = true,
-                    Action::ToggleProbes => toggle_p = true,
-                    Action::ToggleVisMask => toggle_vis = true,
-                    Action::ToggleNormalBias => toggle_bias = true,
-                    Action::ToggleLowPass => toggle_lp = true,
-                    Action::ToggleSsoA => toggle_ssao = true,
-                }
+        if *interaction == Interaction::Pressed {
+            match action.0 {
+                Action::ToggleHeightmap => toggle_h = true,
+                Action::ToggleIndirect => toggle_i = true,
+                Action::ToggleProbes => toggle_p = true,
+                Action::ToggleVisMask => toggle_vis = true,
+                Action::ToggleNormalBias => toggle_bias = true,
+                Action::ToggleLowPass => toggle_lp = true,
+                Action::ToggleSsoA => toggle_ssao = true,
             }
-            Interaction::Hovered => {
-                *color = BackgroundColor(Color::srgb(0.25, 0.25, 0.25));
+        }
+        match action.0 {
+            Action::ToggleIndirect => {
+                color.0 = if lighting_state.indirect_enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                };
             }
-            Interaction::None => {
-                *color = BackgroundColor(Color::srgb(0.15, 0.15, 0.15));
+            Action::ToggleProbes => {
+                color.0 = if lighting_state.probes_enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                };
             }
+            Action::ToggleVisMask => {
+                color.0 = if lighting_state.use_vis_mask {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                };
+            }
+            Action::ToggleNormalBias => {
+                color.0 = if lighting_state.normal_bias_enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                };
+            }
+            Action::ToggleLowPass => {
+                color.0 = if blend_toggle.lowpass {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                };
+            }
+            Action::ToggleSsoA => {
+                color.0 = if lighting_state.bevy_ssao_enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                };
+            }
+            _ => {}
         }
     }
 
     if toggle_h {
-        for mut vis in &mut heightmap_query {
+        if let Ok(mut vis) = heightmap_query.single_mut() {
             *vis = match *vis {
-                Visibility::Hidden => Visibility::Inherited,
+                Visibility::Hidden => Visibility::Visible,
                 _ => Visibility::Hidden,
             };
         }
@@ -250,21 +293,22 @@ fn button_system(
 
     if toggle_i {
         lighting_state.indirect_enabled = !lighting_state.indirect_enabled;
-        bevy::log::info!("Indirect Lighting: {}", lighting_state.indirect_enabled);
+        bevy::log::info!("Indirect diffuse: {}", lighting_state.indirect_enabled);
     }
 
     if toggle_p {
         lighting_state.probes_enabled = !lighting_state.probes_enabled;
+        bevy::log::info!("Probes overlay: {}", lighting_state.probes_enabled);
     }
 
     if toggle_vis {
         lighting_state.use_vis_mask = !lighting_state.use_vis_mask;
         bevy::log::info!(
-            "Visibility test mode: {}",
+            "Probe visibility method: {}",
             if lighting_state.use_vis_mask {
-                "probe_is_visible (precalculated texture mask)"
+                "baked mask (probe_is_visible)"
             } else {
-                "probe_visible (per-tap ray trace)"
+                "dynamic ray march (probe_visible)"
             }
         );
     }
@@ -279,47 +323,11 @@ fn button_system(
 
     if toggle_lp {
         blend_toggle.lowpass = !blend_toggle.lowpass;
-        bevy::log::info!("Low-pass filter: {}", blend_toggle.lowpass);
+        bevy::log::info!("Low-pass spatial filter: {}", blend_toggle.lowpass);
     }
 
     if toggle_ssao {
         lighting_state.bevy_ssao_enabled = !lighting_state.bevy_ssao_enabled;
         bevy::log::info!("Bevy SSAO: {}", lighting_state.bevy_ssao_enabled);
-    }
-
-    // The button colour is the on-screen indicator: green while the toggle is
-    // enabled, dark grey while it is disabled.
-    for (_interaction, mut color, action) in &mut interaction_query {
-        match action.0 {
-            Action::ToggleVisMask => {
-                *color = BackgroundColor(if lighting_state.use_vis_mask {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            Action::ToggleNormalBias => {
-                *color = BackgroundColor(if lighting_state.normal_bias_enabled {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            Action::ToggleLowPass => {
-                *color = BackgroundColor(if blend_toggle.lowpass {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            Action::ToggleSsoA => {
-                *color = BackgroundColor(if lighting_state.bevy_ssao_enabled {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            _ => {}
-        }
     }
 }
