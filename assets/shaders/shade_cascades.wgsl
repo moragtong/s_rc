@@ -392,12 +392,9 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                     * normal_weight
                     * exp(-abs(dot(n, center - p)) / BI_PLANE_M);
                 // The occlusion trace only runs for taps that survive the
-                // kernels - the ones the guides already agree on - and only in
-                // the `probe_visible` mode: the normal-biased fetch already
-                // selects the cell in front of the surface, so it does not need
-                // the trace.
+                // kernels - the ones the guides already agree on.
                 if w > WEIGHT_EPS
-                    && (view_info.normal_bias_enabled != 0u || probe_is_visible(vis_mask, k, layer))
+                    && probe_is_visible(vis_mask, k, layer)
                 {
                     e_bi += w * sh_irradiance(base, n);
                     w_bi += w;
@@ -456,7 +453,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                         h_ceil += w * center.y;
                     }
                     if w > 0.0
-                        && (view_info.normal_bias_enabled != 0u || probe_visible(p, n, center))
+                        && probe_visible(p, n, center)
                     {
                         if SH_MIX_COEFFS {
                             for (var i = 0u; i < 9u; i++) {
@@ -574,7 +571,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 }
                 let base = (base_cell + layer) * SH_STRIDE;
                 let center = sh_probes[base + 9u].xyz;
-                if view_info.normal_bias_enabled != 0u || probe_is_visible(vis_mask, k, layer) {
+                if probe_is_visible(vis_mask, k, layer) {
                     let w = w_corner * (layer_w[layer] / layer_sum);
                     if SH_MIX_COEFFS {
                         for (var i = 0u; i < 9u; i++) {

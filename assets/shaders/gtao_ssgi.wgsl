@@ -174,7 +174,7 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 let base = (base_cell + layer) * SH_STRIDE;
                 let c = sh_probes[base + 9u].xyz;
-                if ss.normal_bias_enabled != 0u || probe_is_visible(vis_mask, k, layer) {
+                if probe_is_visible(vis_mask, k, layer) {
                     let w = w_corner * (layer_w[layer] / layer_sum);
                     for (var i = 0u; i < 9u; i = i + 1u) {
                         wcoefs[i] += sh_probes[base + i].xyz * w;
