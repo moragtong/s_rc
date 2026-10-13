@@ -1,7 +1,4 @@
-// Merges one cascade, one thread per probe ray, top cascade first. Each ray
-// stores the radiance arriving along it from its interval start outward (its
-// own interval merged with every cascade above), and how far away that
-// radiance came from.
+// Combines probe rays into 2.5D radiance cascades.
 //
 // Where each ray lands was decided once, by `march_hits.wgsl`: the scene is
 // static, so the marching itself is never repeated here. This pass only looks
@@ -11,21 +8,22 @@
 
 #import s_rc::heightmap_trace::{
     uniforms, probe_position, cell_direction, stored_segment, parent_layer, MISS, PROBES_PER_CELL,
+    ceiling_normal, floor_normal, PI,
 }
 
-@group(1) @binding(0) var radiance_min: texture_2d<f32>;
-@group(1) @binding(1) var radiance_max: texture_2d<f32>;
+@group(1) @binding(0) var albedo_min: texture_2d<f32>;
+@group(1) @binding(1) var albedo_max: texture_2d<f32>;
 // Per ray: rgb = radiance, a = distance from the probe to where it came
 // from (MISS if nothing was hit).
 @group(1) @binding(2) var<storage, read_write> rays: array<vec4<f32>>;
-// Per ray: texel, ceiling flag and distance, as recorded by the one-shot
-// march. Read-only — nothing here writes geometry back.
+// Per ray: texel, ceiling flag, cached sun visibility and distance, as recorded by
+// march_hits.wgsl / update_sun_vis. Read-only — nothing here writes geometry back.
 @group(1) @binding(3) var<storage, read> hits: array<vec4<u32>>;
 
 const HITS_PER_RAY: u32 = 4u;
 
 // A stored hit, left exactly as the march wrote it: (texel.x, texel.y,
-// ceiling, t). naga will not build a `Hit` literal out of an imported type,
+// ceiling | (vis << 16), t). naga will not build a `Hit` literal out of an imported type,
 // so the encoding stays packed and is unpacked field by field instead.
 fn hit_at(base: u32, slot: u32) -> vec4<u32> {
     return hits[base * HITS_PER_RAY + slot];
@@ -35,39 +33,61 @@ fn hit_t(e: vec4<u32>) -> f32 {
     return bitcast<f32>(e.w);
 }
 
+// Option A+B: Evaluates surface radiance on-the-fly using cached sun visibility
+// computed by Aaltonen / Quilez (2018) soft shadow ray marching.
 fn surface_radiance(e: vec4<u32>) -> vec3<f32> {
     let texel = vec2<i32>(e.xy);
-    if e.z != 0u {
-        return textureLoad(radiance_min, texel, 0).rgb;
+    let is_ceiling = (e.z & 1u) != 0u;
+
+    let vis = f32(e.z >> 16u) / 65535.0;
+    if vis <= 0.0 {
+        return vec3<f32>(0.0);
     }
-    return textureLoad(radiance_max, texel, 0).rgb;
+
+    let n_raw = select(
+        textureLoad(floor_normal, texel, 0).xyz,
+        textureLoad(ceiling_normal, texel, 0).xyz,
+        is_ceiling,
+    );
+    if dot(n_raw, n_raw) <= 0.01 {
+        return vec3<f32>(0.0);
+    }
+    let n = normalize(n_raw);
+    let cos_l = dot(n, uniforms.sun_toward);
+    if cos_l <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+
+    let albedo = select(
+        textureLoad(albedo_max, texel, 0).rgb,
+        textureLoad(albedo_min, texel, 0).rgb,
+        is_ceiling,
+    );
+
+    return albedo / PI * uniforms.sun_irradiance * cos_l * vis;
 }
 
 // Distance along this ray at which the parent probe's nearest stored surface
-// appears, with the parent direction cell it came from; x is -1 when the
-// parent has none in this direction. **Must give the same answer
-// `march_hits.wgsl` gave**, or the stored hit's `t` would be measured along a
-// different segment than the one derived here; only the reads differ (its
+// hit lies, projected onto this ray, or -1 when the parent ray hit nothing.
+//
+// The parent's hit is mapped to the child's frame by distance so the child
+// traces straight along `d` rather than sideways to `q + d * parent.interval`:
+//
+//     t_child = t_parent + dot(q - p, d) .
+//
+// When multiple slots hit, min over their projected distances matches what
+// `march_hits.wgsl` did when it decided where to march this cascade's segments
+// to. Keeping the endpoint in sync is essential: **`cascade()` must integrate
+// over the exact segment `march_hits.wgsl` gave**, or the stored hit's `t` would be measured along a
+// different segment than the one being merged.
+//
+// The parent cascade's hits live in the same buffer, offset by its ray base.
+// The array length check is implicit in the buffer bound (the march bind
 // group binds `hits` at binding 0, this one at binding 3).
 //
-// The mapping is the parallax correction: the parent's hit is measured from
-// the parent, so the endpoint `q + d * parent.interval.x` - what this used to
-// use - is a point in the *parent's* frame and the segment bent sideways to
-// reach it. Projecting the parent's hit point `s` onto the child's direction
-// keeps the geometry and drops the offset,
-//
-//     t_child = dot(s - p, d) = t_parent + dot(q - p, d),
-//
-// so the segment lies along `d`, `seg / len` below is `d`, and the distance
-// stored for the child is its own distance along its own ray.
-//
-// Candidates are the parent's four direction cells covering this ray (twice
-// the angular resolution, so this cell is a 2x2 block of the parent's) times
-// that ray's four stored segments - the parent probe's own hit points, not the
-// ones it inherited from coarser cascades. Nearest wins: the segment is a
-// first-hit search and only has to reach the closest surface the parent
-// already knows about. `y` is the direction cell that surface was seen in,
-// which is the direction the parent's radiance for it is stored under - so the
+// Returns a 4-vector: (projected distance or -1, hit slot, 0, 0) per
+// parent direction, indexed by (by * 2 + bx). The 2x2 parent directions
+// cover this ray's direction; when one of them intersected something, the
 // merge below reads *that* ray rather than averaging the whole block, which
 // is what it does when there is no hit to correct against.
 fn parent_dir_hits(

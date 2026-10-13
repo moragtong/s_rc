@@ -131,6 +131,8 @@ pub struct SunParams {
     /// Irradiance times the camera exposure, so cascade radiance matches the
     /// main pass's output.
     pub irradiance: Vec3,
+    /// Soft shadow cone factor k = 1 / tan(angular_radius).
+    pub k: f32,
 }
 
 #[derive(ShaderType, Clone, Copy, Default)]
@@ -155,6 +157,7 @@ pub struct CascadesUniforms {
     pub cascade_count: u32,
     pub hmap_top: f32,
     pub split: f32,
+    pub sun_k: f32,
     pub sun_toward: Vec3,
     pub sun_irradiance: Vec3,
     pub sky_color: Vec4,
@@ -176,6 +179,7 @@ struct CascadesPipeline {
     probe_positions_layout: BindGroupLayoutDescriptor,
     blend_layout: BindGroupLayoutDescriptor,
     light_pipeline: CachedComputePipelineId,
+    update_sun_vis_pipeline: CachedComputePipelineId,
     trace_pipelines: Vec<CachedComputePipelineId>,
     gather_pipelines: Vec<CachedComputePipelineId>,
     march_pipelines: Vec<CachedComputePipelineId>,
@@ -292,11 +296,24 @@ fn update_sun(
         .unwrap_or_default()
         .exposure();
     let color = light.color.to_linear();
+    // Real sun angular radius is ~0.27 degrees (~0.004712 rad) -> k = 1 / tan(theta) ~ 212.2.
+    // Configurable via S_RC_SUN_K or S_RC_SUN_W (w = tan(theta) -> k = 1 / w).
+    let k = std::env::var("S_RC_SUN_K")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .or_else(|| {
+            std::env::var("S_RC_SUN_W")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|w| if w > 0.0 { 1.0 / w } else { 212.2 })
+        })
+        .unwrap_or(212.2);
     let new = SunParams {
         toward: -transform.forward().as_vec3(),
         irradiance: Vec3::new(color.red, color.green, color.blue) * light.illuminance * exposure,
+        k,
     };
-    if new.toward != sun.toward || new.irradiance != sun.irradiance {
+    if new.toward != sun.toward || new.irradiance != sun.irradiance || new.k != sun.k {
         *sun = new;
     }
 }
@@ -325,8 +342,8 @@ fn setup_pipelines(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                texture_2d(TextureSampleType::Float { filterable: false }), // radiance_min
-                texture_2d(TextureSampleType::Float { filterable: false }), // radiance_max
+                texture_2d(TextureSampleType::Float { filterable: false }), // albedo_min
+                texture_2d(TextureSampleType::Float { filterable: false }), // albedo_max
                 storage_buffer::<Vec4>(false),                              // rays
                 storage_buffer_read_only::<Vec4>(false),                    // hits
             ),
@@ -398,6 +415,12 @@ fn setup_pipelines(
             &light_layout,
             &light_shader,
             "surface_light".into(),
+        ),
+        update_sun_vis_pipeline: pipeline(
+            "cascades_update_sun_vis".into(),
+            &march_layout,
+            &march_shader,
+            "update_sun_vis".into(),
         ),
         trace_pipelines: cascades
             .clone()
@@ -549,6 +572,7 @@ fn prepare_buffers(
         cascade_count: layout.cascades.len() as u32,
         hmap_top: heightmap.top,
         split: crate::heightmap::SPLIT,
+        sun_k: sun.k,
         sun_toward: sun.toward,
         sun_irradiance: sun.irradiance,
         sky_color,
@@ -715,8 +739,8 @@ fn prepare_buffers(
         "cascades_trace",
         &pipeline.trace_layout,
         &BindGroupEntries::sequential((
-            radiance_min,
-            radiance_max,
+            albedo_min,
+            albedo_max,
             rays_buffer.as_entire_binding(),
             hits_buffer.as_entire_binding(),
         )),
@@ -796,9 +820,13 @@ fn dispatch_cascades(
     // send the march back through when they differ from the uniforms.
     mut marched_toggles: Local<Option<(bool, bool)>>,
     mut probe_positions_baked: Local<bool>,
-    parallax: Res<ParallaxState>,
-    cross_layer: Res<CrossLayerState>,
-    blend_toggle: Res<BlendToggleState>,
+    (parallax, cross_layer, blend_toggle, sun): (
+        Res<ParallaxState>,
+        Res<CrossLayerState>,
+        Res<BlendToggleState>,
+        Res<SunParams>,
+    ),
+    mut last_sun_toward: Local<Option<Vec3>>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
         return;
@@ -807,14 +835,14 @@ fn dispatch_cascades(
     // have compiled.
     let get = |id: &CachedComputePipelineId| pipeline_cache.get_compute_pipeline(*id);
     let (
-        Some(light),
+        Some(update_sun_vis),
         Some(traces),
         Some(gathers),
         Some(marches),
         Some(probe_positions),
         Some(blend),
     ) = (
-        get(&pipeline.light_pipeline),
+        get(&pipeline.update_sun_vis_pipeline),
         pipeline
             .trace_pipelines
             .iter()
@@ -917,6 +945,15 @@ fn dispatch_cascades(
             pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
         }
         *marched = true;
+
+        // Initialize cached sun visibility in hits
+        pass.set_pipeline(update_sun_vis);
+        pass.dispatch_workgroups(
+            ((layout.layout.hit_words * HITS_PER_RAY) as u32).div_ceil(WORKGROUP),
+            1,
+            1,
+        );
+        *last_sun_toward = Some(sun.toward);
     }
 
     if relight_now {
@@ -929,13 +966,21 @@ fn dispatch_cascades(
         // when the swap has made it `prev` - the exact weights the copy
         // produced, without the copy.
         let phase = (relight.phase % 3) as usize;
-        pass.set_pipeline(light);
-        pass.set_bind_group(1, &render_data.light_bind_group, &[]);
-        pass.dispatch_workgroups(
-            heightmap.resolution.x.div_ceil(LIGHT_WORKGROUP),
-            heightmap.resolution.y.div_ceil(LIGHT_WORKGROUP),
-            1,
-        );
+
+        // Option A+B: Update cached sun visibility in hits using Aaltonen / Quilez when sun moves
+        let sun_moved = last_sun_toward
+            .map(|last| last.distance_squared(sun.toward) > 1e-6)
+            .unwrap_or(true);
+        if sun_moved {
+            pass.set_bind_group(1, &render_data.march_bind_group, &[]);
+            pass.set_pipeline(update_sun_vis);
+            pass.dispatch_workgroups(
+                ((layout.layout.hit_words * HITS_PER_RAY) as u32).div_ceil(WORKGROUP),
+                1,
+                1,
+            );
+            *last_sun_toward = Some(sun.toward);
+        }
 
         // Top-down: each cascade merges the one above it.
         pass.set_bind_group(1, &render_data.trace_bind_group, &[]);

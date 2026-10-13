@@ -8,7 +8,7 @@
 
 #import s_rc::heightmap_trace::{
     uniforms, trace, Hit, probe_position, cell_direction, stored_segment, parent_layer, MISS,
-    PROBES_PER_CELL,
+    PROBES_PER_CELL, heightmap, ceiling_normal, floor_normal, cell_size, sun_visibility,
 }
 
 // Per ray: the top cascade's own trace, or the four bilinear-parent segments
@@ -177,6 +177,55 @@ fn march(c: u32, id: u32) {
         }
         store(base, k, trace(a, seg / len, 0.0, len));
     }
+}
+
+// Option A+B: evaluates sun visibility using Aaltonen / Quilez (2018) soft shadow
+// marching from each cached probe hit surface position, updating the cached
+// visibility stored in hits[hit_idx].z.
+@compute @workgroup_size(64, 1, 1)
+fn update_sun_vis(@builtin(global_invocation_id) id: vec3<u32>) {
+    let hit_idx = id.x;
+    if hit_idx >= arrayLength(&hits) {
+        return;
+    }
+    var e = hits[hit_idx];
+    let t = bitcast<f32>(e.w);
+    if t == MISS {
+        return;
+    }
+
+    let texel = vec2<i32>(e.xy);
+    let is_ceiling = (e.z & 1u) != 0u;
+
+    let n_raw = select(
+        textureLoad(floor_normal, texel, 0).xyz,
+        textureLoad(ceiling_normal, texel, 0).xyz,
+        is_ceiling,
+    );
+    if dot(n_raw, n_raw) <= 0.01 {
+        e.z = e.z & 1u;
+        hits[hit_idx] = e;
+        return;
+    }
+    let n = normalize(n_raw);
+    let cos_l = dot(n, uniforms.sun_toward);
+    if cos_l <= 0.0 || uniforms.sun_toward.y <= 0.0 {
+        e.z = e.z & 1u;
+        hits[hit_idx] = e;
+        return;
+    }
+
+    let xz = (vec2<f32>(texel) + 0.5) * cell_size() + uniforms.hmap_min;
+    let h = textureLoad(heightmap, texel, 0).xy;
+    let y = select(h.y, h.x, is_ceiling);
+    let p = vec3<f32>(xz.x, y, xz.y);
+
+    const SHADOW_BIAS: f32 = 0.02;
+    let vis = sun_visibility(p + n * SHADOW_BIAS, uniforms.sun_toward);
+
+    let packed_vis = u32(round(clamp(vis, 0.0, 1.0) * 65535.0));
+    e.z = (e.z & 1u) | (packed_vis << 16u);
+    hits[hit_idx] = e;
 }
 
 @compute @workgroup_size(64, 1, 1) fn march_0(@builtin(global_invocation_id) id: vec3<u32>) { march(0u, id.x); }
