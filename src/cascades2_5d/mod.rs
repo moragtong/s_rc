@@ -64,7 +64,7 @@ pub const SH_STRIDE: u64 = 10;
 const HITS_PER_RAY: u64 = 4;
 /// Frames between two relights. The sun moves every frame, so this is the
 /// period the indirect light lags behind the direct light by.
-const RELIGHT_INTERVAL: u32 = 4;
+pub const RELIGHT_INTERVAL: u32 = 1;
 /// Which of the three rotating probe buffers plays each role, per
 /// [`Relight::phase`]. `A` is `blend_sh`'s `cur` operand (weight `alpha`, the
 /// freshest relight), `B` its `prev` operand (weight `1 - alpha`), and `G`
@@ -96,8 +96,12 @@ pub struct Relight {
 
 impl Default for Relight {
     fn default() -> Self {
+        let interval = std::env::var("S_RC_RELIGHT_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(RELIGHT_INTERVAL);
         Self {
-            interval: RELIGHT_INTERVAL,
+            interval,
             alpha: 0.0,
             phase: 0,
         }
@@ -1024,7 +1028,11 @@ fn dispatch_cascades(
     let interval = relight.interval.max(1);
     let since = *frame % interval;
     *frame = frame.wrapping_add(1);
-    relight.alpha = since as f32 / interval as f32;
+    relight.alpha = if interval == 1 {
+        1.0
+    } else {
+        since as f32 / interval as f32
+    };
     let relight_now = need_march || since == 0;
 
     // Number of spatial blur iterations applied.
