@@ -15,6 +15,8 @@
 
 pub mod layout;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use bevy::{
     core_pipeline::{Core3d, Core3dSystems},
     prelude::*,
@@ -38,6 +40,10 @@ use crate::heightmap::Heightmap;
 use crate::heightmap_bake::BakeState;
 use crate::ui::BlendToggleState;
 
+/// Global variable controlling the number of times the spatial low-pass blur is applied.
+pub static LOWPASS_BLUR_PASSES: AtomicU32 = AtomicU32::new(1);
+const MAX_BLUR_PASSES: usize = 8;
+
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
 const LIGHT_SHADER_PATH: &str = "shaders/surface_light.wgsl";
 const TRACE_SHADER_PATH: &str = "shaders/cascades2_5d.wgsl";
@@ -46,6 +52,7 @@ const MARCH_SHADER_PATH: &str = "shaders/march_hits.wgsl";
 const BLEND_SHADER_PATH: &str = "shaders/blend_sh.wgsl";
 const PROBE_POSITIONS_SHADER_PATH: &str = "shaders/probe_positions.wgsl";
 const BAKE_PROBE_VIS_SHADER_PATH: &str = "shaders/bake_probe_vis.wgsl";
+const BAKE_PROBE_ADJ_SHADER_PATH: &str = "shaders/bake_probe_adj.wgsl";
 /// Workgroup sizes: 8x8 texels for the light pass, 64 rays or probes for
 /// the others.
 const LIGHT_WORKGROUP: u32 = 8;
@@ -100,14 +107,13 @@ impl Default for Relight {
 /// What `blend_sh` mixes with. Sized to a whole 16 bytes on purpose: the
 /// two scalars would be 8 bytes naturally, but uniform address space rounds a
 /// struct up to 16, and the two sides have to agree on the binding's minimum
-/// size or the bind group fails validation. The height gate is unconditional
-/// in `blend_sh` now, so only the filter's on/off toggle has a field.
+/// size or the bind group fails validation.
 #[derive(ShaderType, Clone, Copy, Default)]
 struct BlendUniforms {
     pub alpha: f32,
     pub probe_words: u32,
     pub lowpass: u32,
-    pub pad0: u32,
+    pub pass_index: u32,
 }
 
 #[derive(Resource, Clone, ExtractResource)]
@@ -169,6 +175,7 @@ struct CascadesPipeline {
     gather_layout: BindGroupLayoutDescriptor,
     march_layout: BindGroupLayoutDescriptor,
     probe_positions_layout: BindGroupLayoutDescriptor,
+    bake_probe_adj_layout: BindGroupLayoutDescriptor,
     blend_layout: BindGroupLayoutDescriptor,
     light_pipeline: CachedComputePipelineId,
     trace_pipelines: Vec<CachedComputePipelineId>,
@@ -176,6 +183,7 @@ struct CascadesPipeline {
     march_pipelines: Vec<CachedComputePipelineId>,
     probe_positions_pipelines: Vec<CachedComputePipelineId>,
     bake_probe_vis_pipeline: CachedComputePipelineId,
+    bake_probe_adj_pipelines: Vec<CachedComputePipelineId>,
     blend_pipeline: CachedComputePipelineId,
     bake_probe_vis_layout: BindGroupLayoutDescriptor,
 }
@@ -198,13 +206,17 @@ pub struct CascadesRenderData {
     /// What `shade` reads: the cross-fade between the two relights, written
     /// once per frame over the whole probe set.
     pub sh_probes_blend_buffer: Buffer,
+    /// Scratch buffer for ping-pong multi-pass low-pass filtering.
+    pub sh_probes_scratch_buffer: Buffer,
+    /// Pre-baked 9-bit probe-to-probe visibility adjacency mask.
+    pub probe_adj_buffer: Buffer,
     /// Where each ray landed, written once by `march_hits.wgsl`.
     pub hits_buffer: Buffer,
     /// Persistent so a moving sun rewrites its contents instead of allocating
     /// a new buffer every frame.
     pub uniform_buffer: Buffer,
-    /// `BlendUniforms`, rewritten every frame.
-    blend_uniform_buffer: Buffer,
+    /// `BlendUniforms`, rewritten every frame per pass.
+    blend_uniform_buffers: [Buffer; MAX_BLUR_PASSES],
     subsamples_buffer: Buffer,
     /// Group 0 of every pass: the heightmap and the uniforms.
     pub common_bind_group: BindGroup,
@@ -215,13 +227,20 @@ pub struct CascadesRenderData {
     pub probe_positions_bind_group: BindGroup,
     pub probe_vis_pass_bind_group: BindGroup,
     pub probe_vis_bind_group: BindGroup,
+    pub probe_adj_bind_group: BindGroup,
     light_bind_group: BindGroup,
     trace_bind_group: BindGroup,
     /// One per rotation phase, writing into the phase's gather target.
     gather_bind_groups: [BindGroup; 3],
     march_bind_group: BindGroup,
-    /// One per rotation phase, reading the phase's `prev` and `cur` buffers.
-    blend_bind_groups: [BindGroup; 3],
+    /// Pass 0 writing directly into `sh_probes_blend_buffer`.
+    blend_pass0_to_blend: [BindGroup; 3],
+    /// Pass 0 writing into `sh_probes_scratch_buffer` for even pass counts.
+    blend_pass0_to_scratch: [BindGroup; 3],
+    /// Successive ping pass: scratch -> blend.
+    blend_ping: [BindGroup; MAX_BLUR_PASSES],
+    /// Successive pong pass: blend -> scratch.
+    blend_pong: [BindGroup; MAX_BLUR_PASSES],
 }
 
 /// Group 0, shared with the shading pass.
@@ -245,7 +264,7 @@ pub fn common_layout() -> BindGroupLayoutDescriptor {
                 // one. Written on the CPU by `winding`.
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 storage_buffer_read_only::<Vec4>(false), // probe_positions
-                texture_2d(TextureSampleType::Uint),    // probe_vis
+                texture_2d(TextureSampleType::Uint),     // probe_vis
             ),
         ),
     )
@@ -358,15 +377,20 @@ fn setup_pipelines(
             (storage_buffer::<Vec4>(false),),
         ),
     );
+    let bake_probe_adj_layout = BindGroupLayoutDescriptor::new(
+        "cascades_bake_probe_adj_layout",
+        &BindGroupLayoutEntries::sequential(ShaderStages::COMPUTE, (storage_buffer::<u32>(false),)),
+    );
     let blend_layout = BindGroupLayoutDescriptor::new(
         "cascades_blend_layout",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
             (
-                storage_buffer_read_only::<Vec4>(false), // sh_probes_prev
-                storage_buffer_read_only::<Vec4>(false), // sh_probes
-                storage_buffer::<Vec4>(false),           // sh_probes_blend
-                uniform_buffer::<BlendUniforms>(false),  // alpha
+                storage_buffer_read_only::<Vec4>(false), // sh_probes_in
+                storage_buffer_read_only::<Vec4>(false), // sh_probes_cur
+                storage_buffer::<Vec4>(false),           // sh_probes_out
+                uniform_buffer::<BlendUniforms>(false),  // blend uniforms
+                storage_buffer_read_only::<u32>(false),  // probe_adj
             ),
         ),
     );
@@ -390,11 +414,15 @@ fn setup_pipelines(
     let blend_shader = asset_server.load(BLEND_SHADER_PATH);
     let probe_positions_shader = asset_server.load(PROBE_POSITIONS_SHADER_PATH);
     let bake_probe_vis_shader = asset_server.load(BAKE_PROBE_VIS_SHADER_PATH);
+    let bake_probe_adj_shader = asset_server.load(BAKE_PROBE_ADJ_SHADER_PATH);
     let bake_probe_vis_layout = BindGroupLayoutDescriptor::new(
         "cascades_bake_probe_vis_layout",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::COMPUTE,
-            (texture_storage_2d(TextureFormat::R32Uint, StorageTextureAccess::WriteOnly),),
+            (texture_storage_2d(
+                TextureFormat::R32Uint,
+                StorageTextureAccess::WriteOnly,
+            ),),
         ),
     );
     let cascades = 0..layout::CASCADES;
@@ -441,6 +469,7 @@ fn setup_pipelines(
             })
             .collect(),
         probe_positions_pipelines: cascades
+            .clone()
             .map(|c| {
                 pipeline(
                     format!("cascades_probe_positions{c}"),
@@ -456,6 +485,16 @@ fn setup_pipelines(
             &bake_probe_vis_shader,
             "main".into(),
         ),
+        bake_probe_adj_pipelines: cascades
+            .map(|c| {
+                pipeline(
+                    format!("cascades_bake_probe_adj{c}"),
+                    &bake_probe_adj_layout,
+                    &bake_probe_adj_shader,
+                    format!("bake_adj_{c}"),
+                )
+            })
+            .collect(),
         blend_pipeline: pipeline(
             "cascades_blend_sh".into(),
             &blend_layout,
@@ -467,6 +506,7 @@ fn setup_pipelines(
         gather_layout,
         march_layout,
         probe_positions_layout,
+        bake_probe_adj_layout,
         blend_layout,
         bake_probe_vis_layout,
     });
@@ -582,82 +622,93 @@ fn prepare_buffers(
         probe_positions_buffer,
         sh_probes,
         sh_probes_blend_buffer,
+        sh_probes_scratch_buffer,
+        probe_adj_buffer,
         subsamples_buffer,
         hits_buffer,
         uniform_buffer,
-        blend_uniform_buffer,
+        blend_uniform_buffers,
     ) = match &existing {
-            Some(e) => (
-                e.rays_buffer.clone(),
-                e.probe_positions_buffer.clone(),
-                e.sh_probes.clone(),
-                e.sh_probes_blend_buffer.clone(),
-                e.subsamples_buffer.clone(),
-                e.hits_buffer.clone(),
-                e.uniform_buffer.clone(),
-                e.blend_uniform_buffer.clone(),
-            ),
-            None => {
-                let storage = |label: &'static str, vec4s: u64, usage: BufferUsages| {
-                    render_device.create_buffer(&BufferDescriptor {
-                        label: Some(label),
-                        size: vec4s * 16,
-                        usage,
-                        mapped_at_creation: false,
-                    })
-                };
-                let readback = BufferUsages::STORAGE | BufferUsages::COPY_DST;
-                let subsamples: Vec<u8> = layout
-                    .subsamples
-                    .iter()
-                    .flat_map(|v| v.to_array())
-                    .flat_map(f32::to_ne_bytes)
-                    .collect();
-                (
-                    storage("cascades_rays", layout.hit_words, readback),
-                    storage(
-                        "cascades_probe_positions",
-                        probes * 2,
-                        BufferUsages::STORAGE | BufferUsages::COPY_DST,
-                    ),
-                    // Three rotating buffers: the roles (fresh/prev/gather)
-                    // follow Relight::phase, so none has a fixed meaning. The
-                    // gather overwrites one of them as `read_write`; the blend
-                    // reads two of them `read`. No COPY_SRC: there is no copy
-                    // anymore, the rotation moves the data by changing which
-                    // bind group the passes use.
-                    [
-                        storage("cascades_sh_probes_0", probes * SH_STRIDE, readback),
-                        storage("cascades_sh_probes_1", probes * SH_STRIDE, readback),
-                        storage("cascades_sh_probes_2", probes * SH_STRIDE, readback),
-                    ],
-                    // Written by `blend_sh`, read by `shade`: no copy usage,
-                    // it is never uploaded or read back.
-                    storage("cascades_sh_probes_blend", probes * SH_STRIDE, BufferUsages::STORAGE),
-                    render_device.create_buffer_with_data(&BufferInitDescriptor {
-                        label: Some("cascades_subsamples"),
-                        contents: &subsamples,
-                        usage: BufferUsages::STORAGE,
-                    }),
-                    storage("cascades_hits", layout.hit_words * HITS_PER_RAY, readback),
-                    render_device.create_buffer(&BufferDescriptor {
-                        label: Some("cascades_uniforms"),
-                        size: bytes.as_ref().len() as u64,
-                        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }),
-                    // Zero-filled, which is what `blend_sh` wants before
-                    // `dispatch_cascades` has written a frame: alpha 0 reads
-                    // the previous relight.
-                    render_device.create_buffer(&BufferDescriptor {
-                        label: Some("cascades_blend_uniforms"),
-                        size: BlendUniforms::min_size().get(),
-                        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }),
-                )
-            }
-        };
+        Some(e) => (
+            e.rays_buffer.clone(),
+            e.probe_positions_buffer.clone(),
+            e.sh_probes.clone(),
+            e.sh_probes_blend_buffer.clone(),
+            e.sh_probes_scratch_buffer.clone(),
+            e.probe_adj_buffer.clone(),
+            e.subsamples_buffer.clone(),
+            e.hits_buffer.clone(),
+            e.uniform_buffer.clone(),
+            e.blend_uniform_buffers.clone(),
+        ),
+        None => {
+            let storage = |label: &'static str, vec4s: u64, usage: BufferUsages| {
+                render_device.create_buffer(&BufferDescriptor {
+                    label: Some(label),
+                    size: vec4s * 16,
+                    usage,
+                    mapped_at_creation: false,
+                })
+            };
+            let readback = BufferUsages::STORAGE | BufferUsages::COPY_DST;
+            let subsamples: Vec<u8> = layout
+                .subsamples
+                .iter()
+                .flat_map(|v| v.to_array())
+                .flat_map(f32::to_ne_bytes)
+                .collect();
+            let blend_uniform_buffers: [Buffer; MAX_BLUR_PASSES] = std::array::from_fn(|i| {
+                render_device.create_buffer(&BufferDescriptor {
+                    label: Some(&format!("cascades_blend_uniforms_{i}")),
+                    size: BlendUniforms::min_size().get(),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+            (
+                storage("cascades_rays", layout.hit_words, readback),
+                storage(
+                    "cascades_probe_positions",
+                    probes * 2,
+                    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                ),
+                [
+                    storage("cascades_sh_probes_0", probes * SH_STRIDE, readback),
+                    storage("cascades_sh_probes_1", probes * SH_STRIDE, readback),
+                    storage("cascades_sh_probes_2", probes * SH_STRIDE, readback),
+                ],
+                storage(
+                    "cascades_sh_probes_blend",
+                    probes * SH_STRIDE,
+                    BufferUsages::STORAGE,
+                ),
+                storage(
+                    "cascades_sh_probes_scratch",
+                    probes * SH_STRIDE,
+                    BufferUsages::STORAGE,
+                ),
+                render_device.create_buffer(&BufferDescriptor {
+                    label: Some("cascades_probe_adj"),
+                    size: (probes * 4).max(64),
+                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                render_device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("cascades_subsamples"),
+                    contents: &subsamples,
+                    usage: BufferUsages::STORAGE,
+                }),
+                storage("cascades_hits", layout.hit_words * HITS_PER_RAY, readback),
+                render_device.create_buffer(&BufferDescriptor {
+                    label: Some("cascades_uniforms"),
+                    size: bytes.as_ref().len() as u64,
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                blend_uniform_buffers,
+            )
+        }
+    };
     // The sun moves every frame, so this is a write rather than the
     // allocation it used to be.
     render_queue.write_buffer(&uniform_buffer, 0, bytes.as_ref());
@@ -769,7 +820,11 @@ fn prepare_buffers(
     // differ, so the dispatch just selects the right set for Relight::phase.
     let gather_bind_groups = [0, 1, 2].map(|p| {
         bind_group(
-            ["cascades_gather_p0", "cascades_gather_p1", "cascades_gather_p2"][p],
+            [
+                "cascades_gather_p0",
+                "cascades_gather_p1",
+                "cascades_gather_p2",
+            ][p],
             &pipeline.gather_layout,
             &BindGroupEntries::sequential((
                 rays_buffer.as_entire_binding(),
@@ -793,15 +848,68 @@ fn prepare_buffers(
         &pipeline.bake_probe_vis_layout,
         &BindGroupEntries::sequential((probe_vis,)),
     );
-    let blend_bind_groups = [0, 1, 2].map(|p| {
+    let probe_adj_bind_group = bind_group(
+        "cascades_bake_probe_adj",
+        &pipeline.bake_probe_adj_layout,
+        &BindGroupEntries::sequential((probe_adj_buffer.as_entire_binding(),)),
+    );
+    let blend_pass0_to_blend = [0, 1, 2].map(|p| {
         bind_group(
-            ["cascades_blend_p0", "cascades_blend_p1", "cascades_blend_p2"][p],
+            [
+                "cascades_blend_p0_b",
+                "cascades_blend_p1_b",
+                "cascades_blend_p2_b",
+            ][p],
             &pipeline.blend_layout,
             &BindGroupEntries::sequential((
                 sh_probes[B_OF_PHASE[p]].as_entire_binding(),
                 sh_probes[A_OF_PHASE[p]].as_entire_binding(),
                 sh_probes_blend_buffer.as_entire_binding(),
-                blend_uniform_buffer.as_entire_binding(),
+                blend_uniform_buffers[0].as_entire_binding(),
+                probe_adj_buffer.as_entire_binding(),
+            )),
+        )
+    });
+    let blend_pass0_to_scratch = [0, 1, 2].map(|p| {
+        bind_group(
+            [
+                "cascades_blend_p0_s",
+                "cascades_blend_p1_s",
+                "cascades_blend_p2_s",
+            ][p],
+            &pipeline.blend_layout,
+            &BindGroupEntries::sequential((
+                sh_probes[B_OF_PHASE[p]].as_entire_binding(),
+                sh_probes[A_OF_PHASE[p]].as_entire_binding(),
+                sh_probes_scratch_buffer.as_entire_binding(),
+                blend_uniform_buffers[0].as_entire_binding(),
+                probe_adj_buffer.as_entire_binding(),
+            )),
+        )
+    });
+    let blend_ping: [BindGroup; MAX_BLUR_PASSES] = std::array::from_fn(|k| {
+        bind_group(
+            "cascades_blend_ping",
+            &pipeline.blend_layout,
+            &BindGroupEntries::sequential((
+                sh_probes_scratch_buffer.as_entire_binding(),
+                sh_probes_scratch_buffer.as_entire_binding(),
+                sh_probes_blend_buffer.as_entire_binding(),
+                blend_uniform_buffers[k].as_entire_binding(),
+                probe_adj_buffer.as_entire_binding(),
+            )),
+        )
+    });
+    let blend_pong: [BindGroup; MAX_BLUR_PASSES] = std::array::from_fn(|k| {
+        bind_group(
+            "cascades_blend_pong",
+            &pipeline.blend_layout,
+            &BindGroupEntries::sequential((
+                sh_probes_blend_buffer.as_entire_binding(),
+                sh_probes_blend_buffer.as_entire_binding(),
+                sh_probes_scratch_buffer.as_entire_binding(),
+                blend_uniform_buffers[k].as_entire_binding(),
+                probe_adj_buffer.as_entire_binding(),
             )),
         )
     });
@@ -811,20 +919,26 @@ fn prepare_buffers(
         probe_positions_buffer,
         sh_probes,
         sh_probes_blend_buffer,
+        sh_probes_scratch_buffer,
+        probe_adj_buffer,
         hits_buffer,
         uniform_buffer,
-        blend_uniform_buffer,
+        blend_uniform_buffers,
         subsamples_buffer,
         common_bind_group,
         probe_positions_pass_bind_group,
         probe_positions_bind_group,
         probe_vis_pass_bind_group,
         probe_vis_bind_group,
+        probe_adj_bind_group,
         light_bind_group,
         trace_bind_group,
         gather_bind_groups,
         march_bind_group,
-        blend_bind_groups,
+        blend_pass0_to_blend,
+        blend_pass0_to_scratch,
+        blend_ping,
+        blend_pong,
     });
 }
 
@@ -840,7 +954,7 @@ fn dispatch_cascades(
     mut render_context: RenderContext,
     mut frame: Local<u32>,
     mut marched: Local<bool>,
-    mut bakes_done: Local<(bool, bool)>,
+    mut bakes_done: Local<(bool, bool, bool)>,
     blend_toggle: Res<BlendToggleState>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
@@ -856,6 +970,7 @@ fn dispatch_cascades(
         Some(marches),
         Some(probe_positions),
         Some(bake_probe_vis),
+        Some(bake_probe_adj),
         Some(blend),
     ) = (
         get(&pipeline.light_pipeline),
@@ -880,8 +995,14 @@ fn dispatch_cascades(
             .map(get)
             .collect::<Option<Vec<_>>>(),
         get(&pipeline.bake_probe_vis_pipeline),
+        pipeline
+            .bake_probe_adj_pipelines
+            .iter()
+            .map(get)
+            .collect::<Option<Vec<_>>>(),
         get(&pipeline.blend_pipeline),
-    ) else {
+    )
+    else {
         return;
     };
 
@@ -904,8 +1025,16 @@ fn dispatch_cascades(
     relight.alpha = since as f32 / interval as f32;
     let relight_now = need_march || since == 0;
 
-    // `blend_sh` runs every frame whatever else does, so its alpha is written
-    // unconditionally - the cross-fade is the only thing `shade` can read.
+    // Number of spatial blur iterations applied.
+    let passes = if blend_toggle.lowpass {
+        LOWPASS_BLUR_PASSES
+            .load(Ordering::Relaxed)
+            .max(1)
+            .min(MAX_BLUR_PASSES as u32)
+    } else {
+        0
+    };
+
     let probe_words = layout
         .layout
         .cascades
@@ -913,24 +1042,29 @@ fn dispatch_cascades(
         .map(|c| (c.size.x * c.size.y) as u64 * layout::LAYERS as u64)
         .sum::<u64>()
         * SH_STRIDE;
-    let mut bytes = encase::UniformBuffer::new(Vec::new());
-    bytes
-        .write(&BlendUniforms {
-            alpha: relight.alpha,
-            probe_words: probe_words as u32,
-            lowpass: blend_toggle.lowpass as u32,
-            pad0: 0,
-        })
-        .unwrap();
-    render_queue.write_buffer(&render_data.blend_uniform_buffer, 0, bytes.as_ref());
+
+    let num_dispatches = if passes <= 1 { 1 } else { passes as usize };
+    for k in 0..num_dispatches {
+        let mut bytes = encase::UniformBuffer::new(Vec::new());
+        bytes
+            .write(&BlendUniforms {
+                alpha: relight.alpha,
+                probe_words: probe_words as u32,
+                lowpass: (passes > 0) as u32,
+                pass_index: k as u32,
+            })
+            .unwrap();
+        render_queue.write_buffer(&render_data.blend_uniform_buffers[k], 0, bytes.as_ref());
+    }
 
     if verified && !bakes_done.0 {
-        let mut pos_pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cascades_probe_positions"),
-                ..default()
-            });
+        let mut pos_pass =
+            render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cascades_probe_positions"),
+                    ..default()
+                });
         pos_pass.set_bind_group(0, &render_data.probe_positions_pass_bind_group, &[]);
         pos_pass.set_bind_group(1, &render_data.probe_positions_bind_group, &[]);
         for (c, pos) in layout.layout.cascades.iter().zip(&probe_positions) {
@@ -945,12 +1079,13 @@ fn dispatch_cascades(
     }
 
     if verified && bakes_done.0 && !bakes_done.1 {
-        let mut vis_pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cascades_bake_probe_vis"),
-                ..default()
-            });
+        let mut vis_pass =
+            render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cascades_bake_probe_vis"),
+                    ..default()
+                });
         vis_pass.set_pipeline(bake_probe_vis);
         vis_pass.set_bind_group(0, &render_data.probe_vis_pass_bind_group, &[]);
         vis_pass.set_bind_group(1, &render_data.probe_vis_bind_group, &[]);
@@ -962,70 +1097,126 @@ fn dispatch_cascades(
         bakes_done.1 = true;
     }
 
-    let mut pass = render_context
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor {
-            label: Some("cascades2_5d"),
-            ..default()
-        });
-    pass.set_bind_group(0, &render_data.common_bind_group, &[]);
-
-    if need_march {
-        // Where every ray lands, computed here and never again while the sun
-        // moves. Top-down so a cascade's segments exist before the one below
-        // reads them as parents.
-        pass.set_bind_group(1, &render_data.march_bind_group, &[]);
-        for (c, march) in layout.layout.cascades.iter().zip(&marches).rev() {
-            pass.set_pipeline(march);
-            pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
-        }
-        *marched = true;
-    }
-
-    if relight_now {
-        // The rotation phase that just gathered. The gather overwrites this
-        // phase's `G` buffer; advancing the phase afterwards makes that buffer
-        // the new `A` (the `cur` `blend_sh` fades in at weight `alpha`), the
-        // old `A` the new `B` (fading out at `1 - alpha`), and the old `B` the
-        // next gather target. The fresh relight therefore enters at weight 0
-        // on its own frame and reaches weight 1 "by itself" at the next sync,
-        // when the swap has made it `prev` - the exact weights the copy
-        // produced, without the copy.
-        let phase = (relight.phase % 3) as usize;
-        pass.set_pipeline(light);
-        pass.set_bind_group(1, &render_data.light_bind_group, &[]);
-        pass.dispatch_workgroups(
-            heightmap.resolution.x.div_ceil(LIGHT_WORKGROUP),
-            heightmap.resolution.y.div_ceil(LIGHT_WORKGROUP),
-            1,
-        );
-
-        // Top-down: each cascade merges the one above it.
-        pass.set_bind_group(1, &render_data.trace_bind_group, &[]);
-        for (c, trace) in layout.layout.cascades.iter().zip(&traces).rev() {
-            pass.set_pipeline(trace);
-            pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
-        }
-
-        pass.set_bind_group(1, &render_data.gather_bind_groups[phase], &[]);
-        for (c, gather) in layout.layout.cascades.iter().zip(&gathers) {
-            pass.set_pipeline(gather);
-            pass.dispatch_workgroups(
+    if verified && bakes_done.0 && !bakes_done.2 {
+        let mut adj_pass =
+            render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cascades_bake_probe_adj"),
+                    ..default()
+                });
+        adj_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+        adj_pass.set_bind_group(1, &render_data.probe_adj_bind_group, &[]);
+        for (c, adj_pipe) in layout.layout.cascades.iter().zip(&bake_probe_adj) {
+            adj_pass.set_pipeline(adj_pipe);
+            adj_pass.dispatch_workgroups(
                 (c.size.x * c.size.y * layout::LAYERS).div_ceil(WORKGROUP),
                 1,
                 1,
             );
         }
-
-        // G becomes A, A becomes B, B becomes G.
-        relight.phase = (relight.phase + 1).rem_euclid(3);
+        bakes_done.2 = true;
     }
 
-    // A relight's blend runs against the phase its gather just rotated into,
-    // so it reads the fresh relight as `cur` at weight `alpha` and the last
-    // one as `prev` at `1 - alpha`.
+    {
+        let mut pass =
+            render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cascades2_5d"),
+                    ..default()
+                });
+        pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+
+        if need_march {
+            pass.set_bind_group(1, &render_data.march_bind_group, &[]);
+            for (c, march) in layout.layout.cascades.iter().zip(&marches).rev() {
+                pass.set_pipeline(march);
+                pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
+            }
+            *marched = true;
+        }
+
+        if relight_now {
+            let phase = (relight.phase % 3) as usize;
+            pass.set_pipeline(light);
+            pass.set_bind_group(1, &render_data.light_bind_group, &[]);
+            pass.dispatch_workgroups(
+                heightmap.resolution.x.div_ceil(LIGHT_WORKGROUP),
+                heightmap.resolution.y.div_ceil(LIGHT_WORKGROUP),
+                1,
+            );
+
+            pass.set_bind_group(1, &render_data.trace_bind_group, &[]);
+            for (c, trace) in layout.layout.cascades.iter().zip(&traces).rev() {
+                pass.set_pipeline(trace);
+                pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
+            }
+
+            pass.set_bind_group(1, &render_data.gather_bind_groups[phase], &[]);
+            for (c, gather) in layout.layout.cascades.iter().zip(&gathers) {
+                pass.set_pipeline(gather);
+                pass.dispatch_workgroups(
+                    (c.size.x * c.size.y * layout::LAYERS).div_ceil(WORKGROUP),
+                    1,
+                    1,
+                );
+            }
+
+            relight.phase = (relight.phase + 1).rem_euclid(3);
+        }
+    }
+
     let phase = (relight.phase % 3) as usize;
-    pass.set_pipeline(blend);
-    pass.set_bind_group(1, &render_data.blend_bind_groups[phase], &[]);
-    pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
+    if passes <= 1 {
+        let mut blend_pass =
+            render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cascades_blend_sh"),
+                    ..default()
+                });
+        blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+        blend_pass.set_pipeline(blend);
+        blend_pass.set_bind_group(1, &render_data.blend_pass0_to_blend[phase], &[]);
+        blend_pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
+    } else {
+        let mut writing_to_blend = passes % 2 != 0;
+        {
+            let mut blend_pass =
+                render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("cascades_blend_sh_p0"),
+                        ..default()
+                    });
+            blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+            blend_pass.set_pipeline(blend);
+            if writing_to_blend {
+                blend_pass.set_bind_group(1, &render_data.blend_pass0_to_blend[phase], &[]);
+            } else {
+                blend_pass.set_bind_group(1, &render_data.blend_pass0_to_scratch[phase], &[]);
+            }
+            blend_pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
+        }
+
+        for k in 1..passes as usize {
+            writing_to_blend = !writing_to_blend;
+            let mut blend_pass =
+                render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("cascades_blend_sh_pn"),
+                        ..default()
+                    });
+            blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+            blend_pass.set_pipeline(blend);
+            if writing_to_blend {
+                blend_pass.set_bind_group(1, &render_data.blend_ping[k], &[]);
+            } else {
+                blend_pass.set_bind_group(1, &render_data.blend_pong[k], &[]);
+            }
+            blend_pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
+        }
+    }
 }

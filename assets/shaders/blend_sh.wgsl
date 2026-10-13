@@ -51,18 +51,14 @@
 //
 // Both kernels gate each neighbour tap on vertical agreement with the center
 // probe (`height_agreement_tol`, tolerance `LOWPASS_HEIGHT_TOL_SPACING`
-// spacings) and renormalise the surviving weights, so an XZ step that the
-// probes look across (a platform edge, a wall) does not bleed: the filter
-// sharpens back towards the center probe instead of smoothing a discontinuity.
-//
-// The pre-filter body is kept commented at the bottom as the reference the
-// filter is A/B'd against.
+// spacings) AND pre-baked probe-to-probe visibility (`probe_adj`), so
+// horizontal occluders like walls and vertical steps do not bleed across.
 
 #import s_rc::heightmap_trace::{uniforms, height_agreement_tol, SH_STRIDE, PROBES_PER_CELL}
 
-@group(1) @binding(0) var<storage, read> sh_probes_prev: array<vec4<f32>>;
-@group(1) @binding(1) var<storage, read> sh_probes: array<vec4<f32>>;
-@group(1) @binding(2) var<storage, read_write> sh_probes_blend: array<vec4<f32>>;
+@group(1) @binding(0) var<storage, read> sh_probes_in: array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read> sh_probes_cur: array<vec4<f32>>;
+@group(1) @binding(2) var<storage, read_write> sh_probes_out: array<vec4<f32>>;
 
 struct BlendUniforms {
     // 0 on the frame the probes were rewritten, 1 just before the next relight.
@@ -70,13 +66,12 @@ struct BlendUniforms {
     // Total vec4s of the probe set, so the dispatch knows where to stop.
     probe_words: u32,
     // 0 to skip the spatial low-pass entirely (plain cross-fade), 1 to filter.
-    // The height gate is unconditional - there is no separate switch for it.
     lowpass: u32,
-    // Uniform address space rounds the struct up to 16 bytes; the shader and
-    // the CPU-side struct must agree on the binding's minimum size.
-    pad0: u32,
+    // Pass index: 0 for the initial temporal mix + blur pass, >0 for successive blur passes.
+    pass_index: u32,
 }
 @group(1) @binding(3) var<uniform> blend: BlendUniforms;
+@group(1) @binding(4) var<storage, read> probe_adj: array<u32>;
 
 // Cubic B-spline pre-filter (separable [1,4,1]/6 tensor mask) vs the previous
 // 5-tap tent cross. Flip to `false` for the A/B; the tent path is the block
@@ -97,8 +92,12 @@ const LOWPASS_HEIGHT_TOL_SPACING: f32 = 1.5;
 // Weight normalization epsilon - raised to prevent dark bands
 const WEIGHT_EPS: f32 = 1e-3;
 
-fn mixed_word(word: u32) -> vec4<f32> {
-    return mix(sh_probes_prev[word], sh_probes[word], blend.alpha);
+fn input_word(word: u32) -> vec4<f32> {
+    if blend.pass_index == 0u {
+        return mix(sh_probes_in[word], sh_probes_cur[word], blend.alpha);
+    } else {
+        return sh_probes_in[word];
+    }
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -112,7 +111,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
     // The (position, radius) word is geometry, not light: positions differ
     // between probes, so it must not enter the spatial average.
     if coeff >= 9u || blend.lowpass == 0u {
-        sh_probes_blend[i] = mixed_word(i);
+        sh_probes_out[i] = input_word(i);
         return;
     }
 
@@ -134,19 +133,25 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // The gate compares heights, so the center probe's position has to be
     // read too; it lives in the stride-10 word like every probe's does.
-    let center_pos = mixed_word(probe * SH_STRIDE + 9u).xyz;
+    let center_pos = input_word(probe * SH_STRIDE + 9u).xyz;
 
     var acc = vec3<f32>(0.0);
-    // Renormalise: a neighbour that fails agreement is dropped and the
+    // Renormalise: a neighbour that fails agreement or visibility is dropped and the
     // remaining weights must still sum to one, so the filter sharpens towards
     // the center probe rather than dimming.
     var wsum = 0.0;
+    let adj_mask = probe_adj[probe];
 
     if TENT_PREFILTER {
         // PREVIOUS anisotropic 5-tap cross (see the header). Kept for A/B.
-        acc = mixed_word(i).xyz * FILTER_CENTER;
+        acc = input_word(i).xyz * FILTER_CENTER;
         wsum = FILTER_CENTER;
         for (var n = 0u; n < 4u; n++) {
+            // Map n (0..3) to 3x3 neighbor index
+            let adj_idx = select(select(select(7u, 5u, n == 2u), 3u, n == 1u), 1u, n == 0u);
+            if ((adj_mask & (1u << adj_idx)) == 0u) {
+                continue;
+            }
             // Clamp at the edge (replicate) so the 5 weights always sum to 1.
             var qx = px;
             var qy = py;
@@ -160,12 +165,12 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
                 if py + 1u < info.size.y { qy = py + 1u; }
             }
             let q_probe = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL + layer;
-            let q_pos = mixed_word(q_probe * SH_STRIDE + 9u).xyz;
+            let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
             let wn = FILTER_NEIGHBOUR * height_agreement_tol(
                 q_pos.y - center_pos.y,
                 info.spacing * LOWPASS_HEIGHT_TOL_SPACING,
             );
-            acc += mixed_word(q_probe * SH_STRIDE + coeff).xyz * wn;
+            acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
             wsum += wn;
         }
     } else {
@@ -182,30 +187,25 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
             BSPLINE_EDGE, BSPLINE_CENTER, BSPLINE_EDGE,
             BSPLINE_CORNER, BSPLINE_EDGE, BSPLINE_CORNER,
         );
-        for (var n = 0u; n < 9u; n++) {
+        for (var n = 0u; n < 9u; n = n + 1u) {
+            // Pre-baked probe-to-probe visibility test:
+            // bit n is 1 if neighbor n is visible, 0 if occluded by a wall.
+            if ((adj_mask & (1u << n)) == 0u) {
+                continue;
+            }
+
             // Clamp at the grid edge (replicate) so the weights sum to 1.
             let qx = u32(clamp(i32(px) + offs[n].x, 0, i32(info.size.x) - 1));
             let qy = u32(clamp(i32(py) + offs[n].y, 0, i32(info.size.y) - 1));
             let q_probe = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL + layer;
-            let q_pos = mixed_word(q_probe * SH_STRIDE + 9u).xyz;
+            let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
             let wn = base_w[n] * height_agreement_tol(
                 q_pos.y - center_pos.y,
                 info.spacing * LOWPASS_HEIGHT_TOL_SPACING,
             );
-            acc += mixed_word(q_probe * SH_STRIDE + coeff).xyz * wn;
+            acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
             wsum += wn;
         }
     }
-    sh_probes_blend[i] = vec4<f32>(acc / max(wsum, WEIGHT_EPS), 0.0);
+    sh_probes_out[i] = vec4<f32>(acc / max(wsum, WEIGHT_EPS), 0.0);
 }
-
-// Reference (no low-pass), the A/B baseline. Swap it in for the body above:
-//
-// @compute @workgroup_size(64, 1, 1)
-// fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
-//     let i = id.x;
-//     if i >= blend.probe_words {
-//         return;
-//     }
-//     sh_probes_blend[i] = mix(sh_probes_prev[i], sh_probes[i], blend.alpha);
-// }

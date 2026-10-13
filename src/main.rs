@@ -1,5 +1,6 @@
 use crate::bake_camera_readback::BakeCameraReadbackPlugin;
 use crate::cascades2_5d::Cascades2_5dPlugin;
+pub use crate::cascades2_5d::LOWPASS_BLUR_PASSES;
 mod bake_camera_readback;
 mod cascades2_5d;
 mod heightmap;
@@ -31,32 +32,40 @@ use hi_z_debug::HiZDebugPlugin;
 fn main() {
     let measure_fps = std::env::var("S_RC_FPS").is_ok();
     let mut app = App::new();
-    app.add_systems(Update, (draw_probes_gizmos, camera_readout, animate_sun, sync_sky_color))
-        .insert_resource(DefaultOpaqueRendererMethod::deferred())
-.add_plugins((
-            DefaultPlugins,
-            HiZPlugin,
-            FreeCameraPlugin,
-            HeightmapPlugin,
-            HeightmapBakePlugin,
-            winding::WindingPlugin,
-            heightmap_verify::HeightmapVerifyPlugin,
-            HeightmapViewPlugin,
-            ui::UiPlugin,
-            Cascades2_5dPlugin,
-            shade::ShadePlugin,
-            probe_overlay::ProbeOverlayPlugin,
-            screenshot::ScreenshotPlugin,
-            bevy::render::diagnostic::RenderDiagnosticsPlugin,
-            bake_camera_readback::BakeCameraReadbackPlugin,
-        ))
-        // Bevy's `LightPlugin` inserts `GlobalAmbientLight` at brightness 80
-        // cd/m^2. This scene lights the room entirely with the baked cascade
-        // probes (plus the sun), so that flat ambient is a second, unrelated
-        // light that washes the room out. `NONE` is the same resource at
-        // brightness 0. Delete this line to get Bevy's default ambient back.
-        .insert_resource(bevy::light::GlobalAmbientLight::NONE)
-        .add_systems(Startup, (setup_scene, log_adapter_info));
+    app.add_systems(
+        Update,
+        (
+            draw_probes_gizmos,
+            camera_readout,
+            animate_sun,
+            sync_sky_color,
+        ),
+    )
+    .insert_resource(DefaultOpaqueRendererMethod::deferred())
+    .add_plugins((
+        DefaultPlugins,
+        HiZPlugin,
+        FreeCameraPlugin,
+        HeightmapPlugin,
+        HeightmapBakePlugin,
+        winding::WindingPlugin,
+        heightmap_verify::HeightmapVerifyPlugin,
+        HeightmapViewPlugin,
+        ui::UiPlugin,
+        Cascades2_5dPlugin,
+        shade::ShadePlugin,
+        probe_overlay::ProbeOverlayPlugin,
+        screenshot::ScreenshotPlugin,
+        bevy::render::diagnostic::RenderDiagnosticsPlugin,
+        bake_camera_readback::BakeCameraReadbackPlugin,
+    ))
+    // Bevy's `LightPlugin` inserts `GlobalAmbientLight` at brightness 80
+    // cd/m^2. This scene lights the room entirely with the baked cascade
+    // probes (plus the sun), so that flat ambient is a second, unrelated
+    // light that washes the room out. `NONE` is the same resource at
+    // brightness 0. Delete this line to get Bevy's default ambient back.
+    .insert_resource(bevy::light::GlobalAmbientLight::NONE)
+    .add_systems(Startup, (setup_scene, log_adapter_info));
     if measure_fps {
         app.add_systems(Update, log_fps);
     }
@@ -97,8 +106,7 @@ fn sun_transform() -> Transform {
     // The light shines along -Z of its transform, so -Z becomes the direction
     // of travel: down at `elevation`, swung round by `azimuth`. The sun the
     // shaders use is the negation of that.
-    transform.rotation =
-        Quat::from_rotation_y(azimuth) * Quat::from_rotation_x(-elevation);
+    transform.rotation = Quat::from_rotation_y(azimuth) * Quat::from_rotation_x(-elevation);
     transform
 }
 
@@ -119,33 +127,30 @@ fn animate_sun(
     if frozen.is_none() {
         *frozen = Some(std::env::var("S_RC_SUN_STILL").is_ok());
     }
-    let Ok(mut light) = lights.single_mut() else {
-        return;
-    };
-    if !frozen.unwrap() {
-        // Pre-multiply so the sweep is about the world's up axis: the elevation
-        // stays put and only the azimuth moves.
-        let step =
-            Quat::from_rotation_y(time.delta_secs() * std::f32::consts::TAU / SUN_SWEEP_PERIOD_SECS);
-        light.rotation = step * light.rotation;
+    // Print the starting angle once on frame 0, before anything moves.
+    let print_now = printed.is_none();
+    if !frozen.unwrap_or(false) {
+        let period = SUN_SWEEP_PERIOD_SECS;
+        let delta = time.delta_secs() * (std::f32::consts::TAU / period);
+        for mut transform in &mut lights {
+            transform.rotate_y(delta);
+        }
     }
-    // The sweep makes the sun position something you can see but not otherwise
-    // recover, so print it in the form `S_RC_SUN` accepts, once a second: at
-    // 20 s per turn that is 20 samples a revolution, and the line's timestamp
-    // puts any frame of the sweep within a degree or two of its position.
-    // Frozen runs print too, which is how a pinned run states its own pin.
-    let now = time.elapsed_secs();
-    if printed.is_none_or(|next| now >= next) {
-        *printed = Some(now + 1.0);
-        // The light travels along -Z of its transform, so the sun is the
-        // negation of that, and azimuth is measured about +Y from +Z.
-        let sun = -(light.rotation * Vec3::NEG_Z);
-        // +360 before the modulo so azimuth 0 comes out as `0` rather than
-        // `-0`, which would not round-trip through `S_RC_SUN`'s parser as
-        // written.
-        let azimuth = (sun.x.atan2(sun.z).to_degrees() + 360.0) % 360.0;
-        let elevation = sun.y.clamp(-1.0, 1.0).asin().to_degrees();
+    // Direction the light is shining *toward* (its -Z).
+    let toward = lights
+        .iter()
+        .next()
+        .map(|t| -t.forward().as_vec3())
+        .unwrap_or(Vec3::Y);
+    // Recover azimuth and elevation from the unit vector so the log line is in
+    // the same format as S_RC_SUN.
+    let elevation = toward.y.asin().to_degrees();
+    let azimuth = toward.x.atan2(toward.z).to_degrees().rem_euclid(360.0);
+    // Print on any change, throttled to 1 Hz so the log stays readable.
+    let print_cooled = printed.map(|p| (azimuth - p).abs() >= 18.0).unwrap_or(true);
+    if print_now || print_cooled {
         info!("S_RC_SUN={azimuth:.0},{elevation:.1}");
+        *printed = Some(azimuth);
     }
 }
 
@@ -171,31 +176,23 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         RenderLayers::from_layers(&[SCENE_LAYER, LIGHT_LAYER]),
         sun_transform(),
     ));
+}
 
+fn setup_camera(mut commands: Commands) {
     let camera = commands
         .spawn((
-        Camera3d::default(),
-        // The indirect pass adds linear light before tonemapping.
-        bevy::camera::Hdr,
-        Msaa::Off,
-        DepthPrepass,
-        NormalPrepass,
-        DeferredPrepass,
-        HiZ,
-        // The main camera sees the scene *and* the heightmap debug overlay;
-        // the bake cameras see only the scene.
-        RenderLayers::from_layers(&[SCENE_LAYER, DEBUG_LAYER, LIGHT_LAYER]),
-        FreeCamera::default(),
-        bevy::ui::IsDefaultUiCamera,
-        initial_camera_transform(),
-    ))
+            Camera3d::default(),
+            initial_camera_transform(),
+            FreeCamera::default(),
+            HiZ::default(),
+            RenderLayers::layer(SCENE_LAYER),
+            DepthPrepass,
+            NormalPrepass,
+            DeferredPrepass,
+        ))
         .id();
-    // Bevy's built-in screen-space ambient occlusion (VBAO, the XeGTAO
-    // derivative). `ScreenSpaceAmbientOcclusionPlugin` is already registered by
-    // `PbrPlugin` (DefaultPlugins); this component is what enables it for the
-    // window camera. It scales Bevy's *own* indirect diffuse (ambient +
-    // environment + irradiance volumes) in the deferred lighting pass -- not the
-    // cascade probes, which the shade pass adds afterwards -- so with the scene
+
+    // SSAO runs in the deferred prepass and multiplies ambient light, but with
     // ambient off it has little to darken. Gated OFF-by-`S_RC_SSAO=0` so an A/B
     // can be shot with one binary.
     if std::env::var("S_RC_SSAO").as_deref() != Ok("0") {
@@ -203,6 +200,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             .entity(camera)
             .insert(bevy::pbr::ScreenSpaceAmbientOcclusion::default());
     }
+
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
@@ -271,13 +269,12 @@ fn sync_sky_color(
         Ok(c) => c,
         Err(_) => return,
     };
-    let Ok((light, transform)) = lights.single() else {
+    let Ok((light, _transform)) = lights.single() else {
         return;
     };
     let exposure = exposure.map(|e| e.exposure()).unwrap_or(1.0);
     let color = light.color.to_linear();
-    let irradiance =
-        Vec3::new(color.red, color.green, color.blue) * light.illuminance * exposure;
+    let irradiance = Vec3::new(color.red, color.green, color.blue) * light.illuminance * exposure;
     let sky = crate::cascades2_5d::sky_color(irradiance);
     camera.clear_color = ClearColorConfig::Custom(Color::linear_rgb(sky.x, sky.y, sky.z));
 }
@@ -316,59 +313,10 @@ fn log_adapter_info(adapter_info: Res<RenderAdapterInfo>) {
 }
 
 fn draw_probes_gizmos(
-    mut gizmos: Gizmos,
-    lighting_state: Res<crate::ui::LightingState>,
-    hmap_res: Res<crate::heightmap::Heightmap>,
-    camera_q: Query<(&Camera, &GlobalTransform)>,
+    mut _gizmos: Gizmos,
+    _lighting_state: Res<crate::ui::LightingState>,
+    _hmap_res: Res<crate::heightmap::Heightmap>,
+    _camera_q: Query<(&Camera, &GlobalTransform)>,
 ) {
     return;
-
-    let Some((_, cam_trans)) = camera_q.iter().next() else {
-        return;
-    };
-    let cam_pos = cam_trans.translation();
-
-    let hmap_min = hmap_res.min_bounds;
-    let hmap_max = hmap_res.max_bounds;
-
-    let cascades = crate::cascades2_5d::layout::Layout::new();
-
-    for (i, c) in cascades.cascades.iter().enumerate() {
-        let mut color = Color::srgb(1.0, 0.0, 0.0);
-        if i == 0 {
-            color = Color::srgb(0.0, 1.0, 0.0);
-        }
-        if i == 1 {
-            color = Color::srgb(0.0, 0.5, 1.0);
-        }
-        if i == 2 {
-            color = Color::srgb(0.5, 0.0, 1.0);
-        }
-        if i == 3 {
-            color = Color::srgb(1.0, 1.0, 0.0);
-        }
-
-        let radius = c.spacing * 0.15;
-        let c_spacing = c.spacing;
-
-        let s_x = (hmap_max.x - hmap_min.x) / c_spacing;
-        let s_z = (hmap_max.y - hmap_min.y) / c_spacing;
-        let limit_x = (s_x.ceil() as u32) + 1;
-        let limit_z = (s_z.ceil() as u32) + 1;
-
-        for z in 0..limit_z {
-            for x in 0..limit_x {
-                let w_pos_x = (x as f32 + 0.5) * c_spacing + hmap_min.x;
-                let w_pos_z = (z as f32 + 0.5) * c_spacing + hmap_min.y;
-
-                // Only draw spheres within 15 meters to save perf
-                if (w_pos_x - cam_pos.x).abs() > 40.0 || (w_pos_z - cam_pos.z).abs() > 40.0 {
-                    continue;
-                }
-
-                // For performance, we just draw them flat since reading GPU depth buffer continually requires readback callbacks.
-                gizmos.sphere(Vec3::new(w_pos_x, 1.5, w_pos_z), radius, color);
-            }
-        }
-    }
 }

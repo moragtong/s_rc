@@ -1,13 +1,19 @@
 use bevy::prelude::*;
 
-pub struct UiPlugin;
-
+/// Shading pass configuration, extracted to the render app.
 #[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
 pub struct LightingState {
+    /// Indirect lighting enabled.
     pub indirect_enabled: bool,
+    /// Probes visualization overlay enabled.
     pub probes_enabled: bool,
+    /// Offset the probe-field sample position along the surface normal
+    /// (`BIAS_NORMAL`) plus a fraction of the view direction (`BIAS_VIEW`).
     pub normal_bias_enabled: bool,
+    /// Use precalculated texture mask for visibility test (`probe_is_visible`),
+    /// false means use dynamic per-tap ray-tracing (`probe_visible`).
     pub use_vis_mask: bool,
+    /// Bevy standard SSAO pass on/off.
     pub bevy_ssao_enabled: bool,
 }
 
@@ -25,19 +31,22 @@ impl Default for LightingState {
 
 /// The `blend_sh` toggle, extracted to the render app where the blend
 /// dispatch reads it (same shape as the other extracted toggle resources).
-/// The height gate is unconditional inside `blend_sh` now, so this is only
-/// the filter's on/off switch.
+/// The height gate and pre-baked line-of-sight visibility check are active inside `blend_sh`.
 #[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
 pub struct BlendToggleState {
-    /// 5-tap horizontal cross on the SH coefficients in `blend_sh`, each
-    /// neighbour gated on vertical agreement and renormalised. Off means the
-    /// plain cross-fade, bit identical to the pre-filter frames.
+    /// Spatial low-pass pre-filter on the SH coefficients in `blend_sh`.
+    /// Off means the plain cross-fade, bit identical to the pre-filter frames.
     pub lowpass: bool,
+    /// Number of spatial blur iterations applied.
+    pub blur_passes: u32,
 }
 
 impl Default for BlendToggleState {
     fn default() -> Self {
-        Self { lowpass: true }
+        Self {
+            lowpass: true,
+            blur_passes: 1,
+        }
     }
 }
 
@@ -55,42 +64,42 @@ pub enum Action {
     ToggleSsoA,
 }
 
+pub struct UiPlugin;
+
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LightingState>()
             .init_resource::<BlendToggleState>()
-            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
-                LightingState,
-            >::default())
-            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
-                BlendToggleState,
-            >::default())
+            .add_plugins((
+                bevy::render::extract_resource::ExtractResourcePlugin::<LightingState>::default(),
+                bevy::render::extract_resource::ExtractResourcePlugin::<BlendToggleState>::default(
+                ),
+            ))
             .add_systems(Startup, setup_ui)
             .add_systems(Update, button_system);
     }
 }
 
-/// Set false to skip rendering the on-screen toggle panel. The panel is drawn
-/// over the scene, so its button pixels land in every screenshot and pollute an
+/// Draws an on-screen button bar along the top edge of the window.
+///
+/// Designed so screenshots can crop or ignore the top 48 pixels and get an
 /// A/B diff (`S_RC_INDIRECT`-style comparisons are on the scene, not the UI);
-/// with it off the resources are still registered, only the nodes are not
-/// spawned. Rebuild to toggle; the panel's own F/G keys still work when it is
-/// on.
-pub const SHOW_TOGGLE_PANEL: bool = true;
-
+/// the hotkeys (M, I, P...) do the exact same work as clicking the buttons.
 fn setup_ui(mut commands: Commands) {
-    if !SHOW_TOGGLE_PANEL {
-        return;
-    }
     commands
-        .spawn((Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(10.0),
-            left: Val::Px(10.0),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(8.0),
-            ..default()
-        },))
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(8.0),
+                left: Val::Px(8.0),
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(6.0),
+                ..default()
+            },
+            // Pick up clicks through the rest of the UI root so the scene
+            // camera doesn't steal them.
+            Pickable::IGNORE,
+        ))
         .with_children(|parent| {
             parent
                 .spawn((
@@ -104,8 +113,7 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleHeightmap),
                 ))
-                .with_child((Text::new("Toggle Heightmap (M)"), TextColor(Color::WHITE)));
-
+                .with_child((Text::new("Heightmap (M)"), TextColor(Color::WHITE)));
             parent
                 .spawn((
                     Button,
@@ -115,13 +123,10 @@ fn setup_ui(mut commands: Commands) {
                         align_items: AlignItems::Center,
                         ..default()
                     },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                    BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
                     ActionButton(Action::ToggleIndirect),
                 ))
-                .with_child((
-                    Text::new("Toggle Indirect Lighting (I)"),
-                    TextColor(Color::WHITE),
-                ));
+                .with_child((Text::new("Indirect (I)"), TextColor(Color::WHITE)));
             parent
                 .spawn((
                     Button,
@@ -134,7 +139,7 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleProbes),
                 ))
-                .with_child((Text::new("Toggle Probes (P)"), TextColor(Color::WHITE)));
+                .with_child((Text::new("Probes (P)"), TextColor(Color::WHITE)));
             parent
                 .spawn((
                     Button,
@@ -179,10 +184,7 @@ fn setup_ui(mut commands: Commands) {
                     BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
                     ActionButton(Action::ToggleLowPass),
                 ))
-                .with_child((
-                    Text::new("Low-Pass Filter (F)"),
-                    TextColor(Color::WHITE),
-                ));
+                .with_child((Text::new("Low-Pass Filter (F)"), TextColor(Color::WHITE)));
             parent
                 .spawn((
                     Button,
@@ -200,10 +202,7 @@ fn setup_ui(mut commands: Commands) {
 }
 
 fn button_system(
-    mut interaction_query: Query<
-        (&Interaction, &mut BackgroundColor, &ActionButton),
-        With<Button>,
-    >,
+    mut interaction_query: Query<(&Interaction, &mut BackgroundColor, &ActionButton), With<Button>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut heightmap_query: Query<&mut Visibility, With<crate::heightmap_view::HeightmapViewMesh>>,
     mut lighting_state: ResMut<LightingState>,
@@ -272,7 +271,10 @@ fn button_system(
 
     if toggle_bias {
         lighting_state.normal_bias_enabled = !lighting_state.normal_bias_enabled;
-        bevy::log::info!("Normal-biased fetch: {}", lighting_state.normal_bias_enabled);
+        bevy::log::info!(
+            "Normal-biased fetch: {}",
+            lighting_state.normal_bias_enabled
+        );
     }
 
     if toggle_lp {
