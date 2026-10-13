@@ -47,6 +47,7 @@ const GATHER_SHADER_PATH: &str = "shaders/gather_cascades.wgsl";
 const MARCH_SHADER_PATH: &str = "shaders/march_hits.wgsl";
 const BLEND_SHADER_PATH: &str = "shaders/blend_sh.wgsl";
 const PROBE_POSITIONS_SHADER_PATH: &str = "shaders/probe_positions.wgsl";
+const BAKE_PROBE_VIS_SHADER_PATH: &str = "shaders/bake_probe_vis.wgsl";
 /// Workgroup sizes: 8x8 texels for the light pass, 64 rays or probes for
 /// the others.
 const LIGHT_WORKGROUP: u32 = 8;
@@ -180,7 +181,9 @@ struct CascadesPipeline {
     gather_pipelines: Vec<CachedComputePipelineId>,
     march_pipelines: Vec<CachedComputePipelineId>,
     probe_positions_pipelines: Vec<CachedComputePipelineId>,
+    bake_probe_vis_pipeline: CachedComputePipelineId,
     blend_pipeline: CachedComputePipelineId,
+    bake_probe_vis_layout: BindGroupLayoutDescriptor,
 }
 
 #[derive(Resource)]
@@ -216,6 +219,8 @@ pub struct CascadesRenderData {
     /// import module without binding the destination twice.
     pub probe_positions_pass_bind_group: BindGroup,
     pub probe_positions_bind_group: BindGroup,
+    pub probe_vis_pass_bind_group: BindGroup,
+    pub probe_vis_bind_group: BindGroup,
     light_bind_group: BindGroup,
     trace_bind_group: BindGroup,
     /// One per rotation phase, writing into the phase's gather target.
@@ -246,6 +251,7 @@ pub fn common_layout() -> BindGroupLayoutDescriptor {
                 // one. Written on the CPU by `winding`.
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 storage_buffer_read_only::<Vec4>(false), // probe_positions
+                texture_2d(TextureSampleType::Uint),    // probe_vis
             ),
         ),
     )
@@ -389,6 +395,14 @@ fn setup_pipelines(
     let march_shader = asset_server.load(MARCH_SHADER_PATH);
     let blend_shader = asset_server.load(BLEND_SHADER_PATH);
     let probe_positions_shader = asset_server.load(PROBE_POSITIONS_SHADER_PATH);
+    let bake_probe_vis_shader = asset_server.load(BAKE_PROBE_VIS_SHADER_PATH);
+    let bake_probe_vis_layout = BindGroupLayoutDescriptor::new(
+        "cascades_bake_probe_vis_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (texture_storage_2d(TextureFormat::R32Uint, StorageTextureAccess::WriteOnly),),
+        ),
+    );
     let cascades = 0..layout::CASCADES;
 
     commands.insert_resource(CascadesPipeline {
@@ -442,6 +456,12 @@ fn setup_pipelines(
                 )
             })
             .collect(),
+        bake_probe_vis_pipeline: pipeline(
+            "cascades_bake_probe_vis".into(),
+            &bake_probe_vis_layout,
+            &bake_probe_vis_shader,
+            "main".into(),
+        ),
         blend_pipeline: pipeline(
             "cascades_blend_sh".into(),
             &blend_layout,
@@ -454,6 +474,7 @@ fn setup_pipelines(
         march_layout,
         probe_positions_layout,
         blend_layout,
+        bake_probe_vis_layout,
     });
 }
 
@@ -512,6 +533,7 @@ fn prepare_buffers(
         Some(radiance_min),
         Some(radiance_max),
         Some(winding),
+        Some(probe_vis),
     ) = (
         image(&heightmap.texture),
         image(&heightmap.metadata_min),
@@ -521,6 +543,7 @@ fn prepare_buffers(
         image(&heightmap.radiance_min),
         image(&heightmap.radiance_max),
         image(&heightmap.winding),
+        image(&heightmap.probe_vis),
     )
     else {
         return;
@@ -679,8 +702,25 @@ fn prepare_buffers(
             normal_max,
             winding,
             probe_positions_buffer.as_entire_binding(),
+            probe_vis,
         )),
     );
+    let probe_vis_dummy = render_device.create_texture(&TextureDescriptor {
+        label: Some("cascades_probe_vis_dummy"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Uint,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let probe_vis_dummy_view = probe_vis_dummy.create_view(&TextureViewDescriptor::default());
+
     let probe_positions_dummy_buffer = render_device.create_buffer(&BufferDescriptor {
         label: Some("cascades_probe_positions_dummy"),
         size: 16,
@@ -697,6 +737,20 @@ fn prepare_buffers(
             normal_max,
             winding,
             probe_positions_dummy_buffer.as_entire_binding(),
+            &probe_vis_dummy_view,
+        )),
+    );
+    let probe_vis_pass_bind_group = bind_group(
+        "cascades_probe_vis_pass",
+        &common_layout(),
+        &BindGroupEntries::sequential((
+            heights,
+            uniform_buffer.as_entire_binding(),
+            normal_min,
+            normal_max,
+            winding,
+            probe_positions_buffer.as_entire_binding(),
+            &probe_vis_dummy_view,
         )),
     );
     let light_bind_group = bind_group(
@@ -746,6 +800,11 @@ fn prepare_buffers(
         &pipeline.probe_positions_layout,
         &BindGroupEntries::sequential((probe_positions_buffer.as_entire_binding(),)),
     );
+    let probe_vis_bind_group = bind_group(
+        "cascades_probe_vis",
+        &pipeline.bake_probe_vis_layout,
+        &BindGroupEntries::sequential((probe_vis,)),
+    );
     let blend_bind_groups = [0, 1, 2].map(|p| {
         bind_group(
             ["cascades_blend_p0", "cascades_blend_p1", "cascades_blend_p2"][p],
@@ -771,6 +830,8 @@ fn prepare_buffers(
         common_bind_group,
         probe_positions_pass_bind_group,
         probe_positions_bind_group,
+        probe_vis_pass_bind_group,
+        probe_vis_bind_group,
         light_bind_group,
         trace_bind_group,
         gather_bind_groups,
@@ -795,7 +856,7 @@ fn dispatch_cascades(
     // silently invalidates the hit/march cache, so record both together and
     // send the march back through when they differ from the uniforms.
     mut marched_toggles: Local<Option<(bool, bool)>>,
-    mut probe_positions_baked: Local<bool>,
+    mut bakes_done: Local<(bool, bool)>,
     parallax: Res<ParallaxState>,
     cross_layer: Res<CrossLayerState>,
     blend_toggle: Res<BlendToggleState>,
@@ -812,6 +873,7 @@ fn dispatch_cascades(
         Some(gathers),
         Some(marches),
         Some(probe_positions),
+        Some(bake_probe_vis),
         Some(blend),
     ) = (
         get(&pipeline.light_pipeline),
@@ -835,6 +897,7 @@ fn dispatch_cascades(
             .iter()
             .map(get)
             .collect::<Option<Vec<_>>>(),
+        get(&pipeline.bake_probe_vis_pipeline),
         get(&pipeline.blend_pipeline),
     ) else {
         return;
@@ -884,6 +947,44 @@ fn dispatch_cascades(
         .unwrap();
     render_queue.write_buffer(&render_data.blend_uniform_buffer, 0, bytes.as_ref());
 
+    if verified && !bakes_done.0 {
+        let mut pos_pass = render_context
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some("cascades_probe_positions"),
+                ..default()
+            });
+        pos_pass.set_bind_group(0, &render_data.probe_positions_pass_bind_group, &[]);
+        pos_pass.set_bind_group(1, &render_data.probe_positions_bind_group, &[]);
+        for (c, pos) in layout.layout.cascades.iter().zip(&probe_positions) {
+            pos_pass.set_pipeline(pos);
+            pos_pass.dispatch_workgroups(
+                (c.size.x * c.size.y * layout::LAYERS).div_ceil(WORKGROUP),
+                1,
+                1,
+            );
+        }
+        bakes_done.0 = true;
+    }
+
+    if verified && bakes_done.0 && !bakes_done.1 {
+        let mut vis_pass = render_context
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some("cascades_bake_probe_vis"),
+                ..default()
+            });
+        vis_pass.set_pipeline(bake_probe_vis);
+        vis_pass.set_bind_group(0, &render_data.probe_vis_pass_bind_group, &[]);
+        vis_pass.set_bind_group(1, &render_data.probe_vis_bind_group, &[]);
+        vis_pass.dispatch_workgroups(
+            heightmap.resolution.x.div_ceil(16),
+            heightmap.resolution.y.div_ceil(16),
+            1,
+        );
+        bakes_done.1 = true;
+    }
+
     let mut pass = render_context
         .command_encoder()
         .begin_compute_pass(&ComputePassDescriptor {
@@ -891,21 +992,6 @@ fn dispatch_cascades(
             ..default()
         });
     pass.set_bind_group(0, &render_data.common_bind_group, &[]);
-
-    if verified && !*probe_positions_baked {
-        pass.set_bind_group(0, &render_data.probe_positions_pass_bind_group, &[]);
-        pass.set_bind_group(1, &render_data.probe_positions_bind_group, &[]);
-        for (c, pos) in layout.layout.cascades.iter().zip(&probe_positions) {
-            pass.set_pipeline(pos);
-            pass.dispatch_workgroups(
-                (c.size.x * c.size.y * layout::LAYERS).div_ceil(WORKGROUP),
-                1,
-                1,
-            );
-        }
-        *probe_positions_baked = true;
-        pass.set_bind_group(0, &render_data.common_bind_group, &[]);
-    }
 
     if need_march {
         // Where every ray lands, computed here and never again while the sun

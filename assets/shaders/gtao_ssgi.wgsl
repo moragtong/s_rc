@@ -16,7 +16,7 @@
 // 4. Writes irradiance to `gtao_out`, which is multiplied by Bevy's XeGTAO SSAO
 //    in `composite_indirect` for clean contact shadowing.
 
-#import s_rc::heightmap_trace::{uniforms, oct_decode, sh_basis, SH_STRIDE, PROBES_PER_CELL, PI, is_solid, texel_at, probe_visible}
+#import s_rc::heightmap_trace::{uniforms, oct_decode, sh_basis, SH_STRIDE, PROBES_PER_CELL, PI, is_solid, texel_at, probe_visible, probe_visibility_mask, probe_is_visible}
 
 // Main camera bindings.
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
@@ -128,6 +128,7 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gu = (wp.xz - uniforms.hmap_min) / info.spacing - 0.5;
         let cell = vec2<i32>(floor(gu));
         let frac = gu - vec2<f32>(cell);
+        let vis_mask = probe_visibility_mask(p, n);
         for (var k = 0u; k < 4u; k = k + 1u) {
             let corner = vec2<u32>(k & 1u, k >> 1u);
             let q = vec2<u32>(clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(info.size) - 1));
@@ -173,7 +174,7 @@ fn gtao(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 let base = (base_cell + layer) * SH_STRIDE;
                 let c = sh_probes[base + 9u].xyz;
-                if ss.normal_bias_enabled != 0u || probe_visible(p, n, c) {
+                if ss.normal_bias_enabled != 0u || probe_is_visible(vis_mask, k, layer) {
                     let w = w_corner * (layer_w[layer] / layer_sum);
                     for (var i = 0u; i < 9u; i = i + 1u) {
                         wcoefs[i] += sh_probes[base + i].xyz * w;

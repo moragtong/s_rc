@@ -78,6 +78,7 @@ struct Uniforms {
 // nudge (see `probe_normal_baked`); anything else keeps its column's surface
 // normal from the heightmap's normal channels.
 @group(0) @binding(5) var<storage, read> probe_positions: array<vec4<f32>>;
+@group(0) @binding(6) var probe_vis: texture_2d<u32>;
 
 const PI: f32 = 3.14159265;
 // Stored instead of a distance for rays that hit nothing.
@@ -611,6 +612,21 @@ fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
         }
     }
     return true;
+}
+
+// Lookup precalculated probe visibility mask for surface point `p` and normal `n`.
+// Returns a 12-bit mask where bit `k * 3u + layer` is 1 if probe (k, layer) is visible.
+fn probe_visibility_mask(p: vec3<f32>, n: vec3<f32>) -> u32 {
+    let sample_p = p + n * 0.04;
+    let t = clamp(texel_at(sample_p.xz), vec2<i32>(0), vec2<i32>(uniforms.hmap_res) - 1);
+    let packed_mask = textureLoad(probe_vis, vec2<u32>(t), 0).x;
+    let is_ceiling = n.y < -0.1 || (abs(n.y) <= 0.1 && p.y >= uniforms.split);
+    return select(packed_mask & 0xFFFu, (packed_mask >> 16u) & 0xFFFu, is_ceiling);
+}
+
+// Whether probe at corner `k` and layer `layer` is visible according to the baked visibility mask.
+fn probe_is_visible(vis_mask: u32, k: u32, layer: u32) -> bool {
+    return ((vis_mask >> (k * 3u + layer)) & 1u) != 0u;
 }
 
 // Whether `t` is an open column a probe can be lifted from at all.

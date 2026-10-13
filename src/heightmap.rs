@@ -34,6 +34,9 @@ pub struct Heightmap {
     /// `is_solid` never fires there. Same resolution and bounds as the
     /// heightmap, so a heightmap texel indexes it directly.
     pub winding: Handle<Image>,
+    /// Precalculated visibility of Cascade 0 probes for floor and ceiling
+    /// surfaces. R32Uint storing 12 bits for floor and 12 bits for ceiling.
+    pub probe_vis: Handle<Image>,
     /// Highest ceiling or floor in the map; above it rays can't hit.
     pub top: f32,
 }
@@ -145,6 +148,8 @@ fn setup_heightmap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
     let winding = images.add(winding);
 
+    let probe_vis = images.add(create_empty_image(RESOLUTION, TextureFormat::R32Uint, 1));
+
     commands.insert_resource(Heightmap {
         min_bounds: MIN_BOUNDS,
         max_bounds: MAX_BOUNDS,
@@ -157,6 +162,7 @@ fn setup_heightmap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         radiance_min,
         radiance_max,
         winding,
+        probe_vis,
         top: SPLIT,
     });
 }

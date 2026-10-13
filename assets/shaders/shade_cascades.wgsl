@@ -22,7 +22,7 @@
 // instead - the cell in front of the surface - and `probe_visible` is skipped.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal, is_solid, texel_at, probe_visible}
+#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal, is_solid, texel_at, probe_visible, probe_visibility_mask, probe_is_visible}
 
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var gbuffer: texture_2d<u32>;
@@ -330,6 +330,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let ft = gu - vec2<f32>(cell);
     var frac = gu - vec2<f32>(cell);
     frac = frac * frac * frac * (frac * (frac * 6.0 - 15.0) + 10.0);
+    let vis_mask = probe_visibility_mask(p, n);
     var e = vec3<f32>(0.0);
     if view_info.bilateral_enabled != 0u {
         // Cross-bilateral (joint) filter over the immediate neighbours, guided
@@ -404,7 +405,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 // selects the cell in front of the surface, so it does not need
                 // the trace.
                 if w > WEIGHT_EPS
-                    && (view_info.normal_bias_enabled != 0u || probe_visible(p, n, center))
+                    && (view_info.normal_bias_enabled != 0u || probe_is_visible(vis_mask, k, layer))
                 {
                     e_bi += w * sh_irradiance(base, n);
                     w_bi += w;
@@ -581,7 +582,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 }
                 let base = (base_cell + layer) * SH_STRIDE;
                 let center = sh_probes[base + 9u].xyz;
-                if view_info.normal_bias_enabled != 0u || probe_visible(p, n, center) {
+                if view_info.normal_bias_enabled != 0u || probe_is_visible(vis_mask, k, layer) {
                     let w = w_corner * (layer_w[layer] / layer_sum);
                     if SH_MIX_COEFFS {
                         for (var i = 0u; i < 9u; i++) {
@@ -619,7 +620,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
                 let base = (info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL + layer) * SH_STRIDE;
                 let center = sh_probes[base + 9u].xyz;
-                if w > 0.0 && probe_visible(p, n, center) {
+                if w > 0.0 && probe_is_visible(vis_mask, k, layer) {
                     e += w * sh_irradiance(base, n) * height_agreement(center.y - p.y, info.spacing);
                     w_sum += w;
                 }
