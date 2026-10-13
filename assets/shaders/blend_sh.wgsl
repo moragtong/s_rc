@@ -90,6 +90,20 @@ const FILTER_NEIGHBOUR: f32 = 0.125;
 // platform edge (~1.5 m) really cuts. Tune this to the discontinuity.
 const LOWPASS_HEIGHT_TOL_SPACING: f32 = 1.5;
 // Weight normalization epsilon - raised to prevent dark bands
+// Vertical cross-layer blur radius in meters.
+// Probes across layers within this vertical distance blend together, weighted smoothly by distance.
+const CROSS_LAYER_RADIUS: f32 = 4.0;
+
+fn layer_distance_weight(dy: f32, radius: f32) -> f32 {
+    let s = max(radius, 1e-3);
+    let u = abs(dy) / s;
+    if u >= 1.0 {
+        return 0.0;
+    }
+    let inv_u2 = 1.0 - u * u;
+    return inv_u2 * inv_u2;
+}
+
 const WEIGHT_EPS: f32 = 1e-3;
 
 fn input_word(word: u32) -> vec4<f32> {
@@ -142,41 +156,48 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
     var wsum = 0.0;
     let adj_mask = probe_adj[probe];
 
+    let r_y = max(CROSS_LAYER_RADIUS, info.spacing * 1.5);
+
     if TENT_PREFILTER {
         // PREVIOUS anisotropic 5-tap cross (see the header). Kept for A/B.
-        acc = input_word(i).xyz * FILTER_CENTER;
-        wsum = FILTER_CENTER;
-        for (var n = 0u; n < 4u; n++) {
-            // Map n (0..3) to 3x3 neighbor index
-            let adj_idx = select(select(select(7u, 5u, n == 2u), 3u, n == 1u), 1u, n == 0u);
-            if ((adj_mask & (1u << adj_idx)) == 0u) {
-                continue;
-            }
-            // Clamp at the edge (replicate) so the 5 weights always sum to 1.
+        for (var n = 0u; n < 5u; n = n + 1u) {
             var qx = px;
             var qy = py;
-            if n == 0u {
-                if px > 0u { qx = px - 1u; }
-            } else if n == 1u {
-                if px + 1u < info.size.x { qx = px + 1u; }
-            } else if n == 2u {
-                if py > 0u { qy = py - 1u; }
-            } else {
-                if py + 1u < info.size.y { qy = py + 1u; }
+            var bw = FILTER_CENTER;
+            if n > 0u {
+                let adj_idx = select(select(select(7u, 5u, n == 3u), 3u, n == 2u), 1u, n == 1u);
+                if ((adj_mask & (1u << adj_idx)) == 0u) {
+                    continue;
+                }
+                bw = FILTER_NEIGHBOUR;
+                if n == 1u {
+                    if px > 0u { qx = px - 1u; }
+                } else if n == 2u {
+                    if px + 1u < info.size.x { qx = px + 1u; }
+                } else if n == 3u {
+                    if py > 0u { qy = py - 1u; }
+                } else {
+                    if py + 1u < info.size.y { qy = py + 1u; }
+                }
             }
-            let q_probe = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL + layer;
-            let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
-            let wn = FILTER_NEIGHBOUR * height_agreement_tol(
-                q_pos.y - center_pos.y,
-                info.spacing * LOWPASS_HEIGHT_TOL_SPACING,
-            );
-            acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
-            wsum += wn;
+            let cell_base = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL;
+            for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
+                let q_probe = cell_base + l;
+                let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
+                let dy = abs(q_pos.y - center_pos.y);
+                let wy = layer_distance_weight(dy, r_y);
+                if wy <= 0.0 {
+                    continue;
+                }
+                let wn = bw * wy;
+                acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
+                wsum += wn;
+            }
         }
     } else {
-        // Cubic B-spline pre-filter: separable [1,4,1]/6 tensor mask, 3x3.
-        // The weights are the products of the 1D mask, so the kernel is
-        // isotropic and C^2. `offs` is (dx, dz) with the matching base weight.
+        // Cubic B-spline pre-filter: separable [1,4,1]/6 tensor mask across the
+        // 3x3 horizontal footprint, combined with continuous distance weighting
+        // across vertical layers within the cascade.
         let offs = array<vec2<i32>, 9>(
             vec2<i32>(-1, -1), vec2<i32>(0, -1), vec2<i32>(1, -1),
             vec2<i32>(-1,  0), vec2<i32>(0,  0), vec2<i32>(1,  0),
@@ -189,23 +210,30 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
         );
         for (var n = 0u; n < 9u; n = n + 1u) {
             // Pre-baked probe-to-probe visibility test:
-            // bit n is 1 if neighbor n is visible, 0 if occluded by a wall.
+            // bit n is 1 if neighbor column n is visible, 0 if occluded by a wall.
             // Center tap (n == 4u) is always visible to itself.
             if n != 4u && ((adj_mask & (1u << n)) == 0u) {
                 continue;
             }
 
-            // Clamp at the grid edge (replicate) so the weights sum to 1.
+            // Clamp at the grid edge (replicate).
             let qx = u32(clamp(i32(px) + offs[n].x, 0, i32(info.size.x) - 1));
             let qy = u32(clamp(i32(py) + offs[n].y, 0, i32(info.size.y) - 1));
-            let q_probe = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL + layer;
-            let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
-            let wn = base_w[n] * height_agreement_tol(
-                q_pos.y - center_pos.y,
-                info.spacing * LOWPASS_HEIGHT_TOL_SPACING,
-            );
-            acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
-            wsum += wn;
+            let cell_base = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL;
+
+            // Blur across layers within the cascade, respecting physical vertical distance.
+            for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
+                let q_probe = cell_base + l;
+                let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
+                let dy = abs(q_pos.y - center_pos.y);
+                let wy = layer_distance_weight(dy, r_y);
+                if wy <= 0.0 {
+                    continue;
+                }
+                let wn = base_w[n] * wy;
+                acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
+                wsum += wn;
+            }
         }
     }
     if wsum <= WEIGHT_EPS {
