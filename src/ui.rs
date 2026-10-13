@@ -1,6 +1,8 @@
 use std::sync::atomic::Ordering;
 use bevy::prelude::*;
-use crate::cascades2_5d::{LOWPASS_BLUR_PASSES, MAX_BLUR_PASSES};
+use crate::cascades2_5d::{
+    CROSS_LAYER_RADIUS_TENTHS, LOWPASS_BLUR_PASSES, MAX_BLUR_PASSES, MAX_CROSS_LAYER_TENTHS,
+};
 
 /// Shading pass configuration, extracted to the render app.
 #[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
@@ -41,6 +43,8 @@ pub struct BlendToggleState {
     pub lowpass: bool,
     /// Number of spatial blur iterations applied.
     pub blur_passes: u32,
+    /// Vertical cross-layer blur radius in meters.
+    pub cross_layer_radius: f32,
 }
 
 impl Default for BlendToggleState {
@@ -48,6 +52,7 @@ impl Default for BlendToggleState {
         Self {
             lowpass: true,
             blur_passes: 40,
+            cross_layer_radius: 4.0,
         }
     }
 }
@@ -73,13 +78,25 @@ pub struct FpsCounter;
 pub struct BlurPassesLabel;
 
 #[derive(Component)]
-pub struct SliderTrack;
+pub struct PassesTrack;
 
 #[derive(Component)]
-pub struct SliderFill;
+pub struct PassesFill;
 
 #[derive(Component)]
-pub struct BlurStepButton(pub i32);
+pub struct PassesStepButton(pub i32);
+
+#[derive(Component)]
+pub struct CrossLayerLabel;
+
+#[derive(Component)]
+pub struct CrossLayerTrack;
+
+#[derive(Component)]
+pub struct CrossLayerFill;
+
+#[derive(Component)]
+pub struct CrossLayerStepButton(pub i32);
 
 pub struct UiPlugin;
 
@@ -246,13 +263,19 @@ fn setup_ui(mut commands: Commands) {
             FpsCounter,
         ));
 
-    // Bottom-right corner: Blur Passes Slider
+    // Bottom-right corner: Dual sliders panel (Blur Passes & Cross-Layer Radius)
     let initial_passes = LOWPASS_BLUR_PASSES
         .load(Ordering::Relaxed)
         .clamp(1, MAX_BLUR_PASSES as u32);
-    let initial_pct = (initial_passes.saturating_sub(1)) as f32
+    let passes_pct = (initial_passes.saturating_sub(1)) as f32
         / (MAX_BLUR_PASSES - 1) as f32
         * 100.0;
+
+    let initial_radius_tenths = CROSS_LAYER_RADIUS_TENTHS
+        .load(Ordering::Relaxed)
+        .clamp(0, MAX_CROSS_LAYER_TENTHS);
+    let radius_pct = (initial_radius_tenths as f32 / MAX_CROSS_LAYER_TENTHS as f32) * 100.0;
+    let radius_m = initial_radius_tenths as f32 / 10.0;
 
     commands
         .spawn((
@@ -261,94 +284,197 @@ fn setup_ui(mut commands: Commands) {
                 bottom: Val::Px(12.0),
                 right: Val::Px(12.0),
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(6.0),
-                padding: UiRect::all(Val::Px(10.0)),
+                row_gap: Val::Px(10.0),
+                padding: UiRect::all(Val::Px(12.0)),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
                 align_items: AlignItems::Center,
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.85)),
+            BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.88)),
         ))
         .with_children(|parent| {
-            parent.spawn((
-                Text::new(format!("Blur Passes: {}", initial_passes)),
-                TextColor(Color::WHITE),
-                TextFont::from_font_size(14.0),
-                BlurPassesLabel,
-            ));
+            // --- Section 1: Blur Passes ---
             parent
                 .spawn(Node {
-                    flex_direction: FlexDirection::Row,
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(5.0),
                     align_items: AlignItems::Center,
-                    column_gap: Val::Px(8.0),
                     ..default()
                 })
-                .with_children(|row| {
-                    row.spawn((
-                        Button,
-                        Node {
-                            width: Val::Px(28.0),
-                            height: Val::Px(24.0),
-                            justify_content: JustifyContent::Center,
-                            align_items: AlignItems::Center,
-                            border_radius: BorderRadius::all(Val::Px(4.0)),
-                            ..default()
-                        },
-                        BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
-                        BlurStepButton(-1),
-                    ))
-                    .with_child((
-                        Text::new("-"),
+                .with_children(|sec| {
+                    sec.spawn((
+                        Text::new(format!("Blur Passes: {}", initial_passes)),
                         TextColor(Color::WHITE),
-                        TextFont::from_font_size(16.0),
+                        TextFont::from_font_size(13.5),
+                        BlurPassesLabel,
                     ));
-
-                    row.spawn((
-                        Button,
-                        Node {
-                            width: Val::Px(160.0),
-                            height: Val::Px(16.0),
-                            border_radius: BorderRadius::all(Val::Px(8.0)),
-                            overflow: Overflow::clip(),
-                            justify_content: JustifyContent::FlexStart,
-                            align_items: AlignItems::Center,
-                            ..default()
-                        },
-                        BackgroundColor(Color::srgb(0.2, 0.2, 0.2)),
-                        SliderTrack,
-                    ))
-                    .with_children(|track| {
-                        track.spawn((
+                    sec.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Button,
                             Node {
-                                width: Val::Percent(initial_pct),
-                                height: Val::Percent(100.0),
-                                border_radius: BorderRadius::all(Val::Px(8.0)),
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
                                 ..default()
                             },
-                            BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
-                            SliderFill,
-                            Pickable::IGNORE,
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            PassesStepButton(-1),
+                        ))
+                        .with_child((
+                            Text::new("-"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(160.0),
+                                height: Val::Px(14.0),
+                                border_radius: BorderRadius::all(Val::Px(7.0)),
+                                overflow: Overflow::clip(),
+                                justify_content: JustifyContent::FlexStart,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.2, 0.2)),
+                            PassesTrack,
+                        ))
+                        .with_children(|track| {
+                            track.spawn((
+                                Node {
+                                    width: Val::Percent(passes_pct),
+                                    height: Val::Percent(100.0),
+                                    border_radius: BorderRadius::all(Val::Px(7.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
+                                PassesFill,
+                                Pickable::IGNORE,
+                            ));
+                        });
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            PassesStepButton(1),
+                        ))
+                        .with_child((
+                            Text::new("+"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
                         ));
                     });
+                });
 
-                    row.spawn((
-                        Button,
-                        Node {
-                            width: Val::Px(28.0),
-                            height: Val::Px(24.0),
-                            justify_content: JustifyContent::Center,
-                            align_items: AlignItems::Center,
-                            border_radius: BorderRadius::all(Val::Px(4.0)),
-                            ..default()
-                        },
-                        BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
-                        BlurStepButton(1),
-                    ))
-                    .with_child((
-                        Text::new("+"),
+            // --- Section 2: Cross-Layer Radius ---
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(5.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|sec| {
+                    sec.spawn((
+                        Text::new(if radius_m <= 0.001 {
+                            "Cross-Layer: 0.0 m (isolated)".to_string()
+                        } else {
+                            format!("Cross-Layer Radius: {:.1} m", radius_m)
+                        }),
                         TextColor(Color::WHITE),
-                        TextFont::from_font_size(16.0),
+                        TextFont::from_font_size(13.5),
+                        CrossLayerLabel,
                     ));
+                    sec.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            CrossLayerStepButton(-1),
+                        ))
+                        .with_child((
+                            Text::new("-"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(160.0),
+                                height: Val::Px(14.0),
+                                border_radius: BorderRadius::all(Val::Px(7.0)),
+                                overflow: Overflow::clip(),
+                                justify_content: JustifyContent::FlexStart,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.2, 0.2)),
+                            CrossLayerTrack,
+                        ))
+                        .with_children(|track| {
+                            track.spawn((
+                                Node {
+                                    width: Val::Percent(radius_pct),
+                                    height: Val::Percent(100.0),
+                                    border_radius: BorderRadius::all(Val::Px(7.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.35, 0.65, 0.85)),
+                                CrossLayerFill,
+                                Pickable::IGNORE,
+                            ));
+                        });
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            CrossLayerStepButton(1),
+                        ))
+                        .with_child((
+                            Text::new("+"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+                    });
                 });
         });
 }
@@ -502,57 +628,62 @@ fn fps_system(
 }
 
 fn slider_system(
-    mut step_buttons: Query<(&Interaction, &BlurStepButton), (With<Button>, Changed<Interaction>)>,
-    track_query: Query<(&Interaction, &ComputedNode, &GlobalTransform), With<SliderTrack>>,
+    mut passes_buttons: Query<(&Interaction, &PassesStepButton), (With<Button>, Changed<Interaction>)>,
+    mut layer_buttons: Query<(&Interaction, &CrossLayerStepButton), (With<Button>, Changed<Interaction>)>,
+    passes_track_query: Query<(&Interaction, &ComputedNode, &GlobalTransform), With<PassesTrack>>,
+    layer_track_query: Query<(&Interaction, &ComputedNode, &GlobalTransform), With<CrossLayerTrack>>,
     windows: Query<&Window>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut blend_toggle: ResMut<BlendToggleState>,
-    mut label_query: Query<&mut Text, With<BlurPassesLabel>>,
-    mut fill_query: Query<&mut Node, With<SliderFill>>,
-    mut is_dragging: Local<bool>,
+    mut passes_label: Query<&mut Text, (With<BlurPassesLabel>, Without<CrossLayerLabel>)>,
+    mut layer_label: Query<&mut Text, (With<CrossLayerLabel>, Without<BlurPassesLabel>)>,
+    mut passes_fill: Query<&mut Node, (With<PassesFill>, Without<CrossLayerFill>)>,
+    mut layer_fill: Query<&mut Node, (With<CrossLayerFill>, Without<PassesFill>)>,
+    mut is_dragging_passes: Local<bool>,
+    mut is_dragging_layer: Local<bool>,
 ) {
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let passes_step_size = if shift { 5 } else { 1 };
+    let layer_step_size = if shift { 10 } else { 5 }; // 0.5m default, 1.0m with shift
+
+    // -------------------------------------------------------------
+    // 1. Passes Slider
+    // -------------------------------------------------------------
     let current_passes = LOWPASS_BLUR_PASSES
         .load(Ordering::Relaxed)
         .clamp(1, MAX_BLUR_PASSES as u32);
-    let mut delta: i32 = 0;
+    let mut passes_delta: i32 = 0;
 
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    let step_size = if shift { 5 } else { 1 };
-
-    // Step buttons [-] and [+]
-    for (interaction, step) in &mut step_buttons {
+    for (interaction, step) in &mut passes_buttons {
         if *interaction == Interaction::Pressed {
-            delta += step.0 * step_size;
+            passes_delta += step.0 * passes_step_size;
         }
     }
 
-    // Keyboard shortcuts: '[' / '-' to decrement, ']' / '+' / '=' to increment
     if keys.just_pressed(KeyCode::BracketLeft)
         || keys.just_pressed(KeyCode::Minus)
         || keys.just_pressed(KeyCode::NumpadSubtract)
     {
-        delta -= step_size;
+        passes_delta -= passes_step_size;
     }
     if keys.just_pressed(KeyCode::BracketRight)
         || keys.just_pressed(KeyCode::Equal)
         || keys.just_pressed(KeyCode::NumpadAdd)
     {
-        delta += step_size;
+        passes_delta += passes_step_size;
     }
 
-    let mut direct_target: Option<u32> = None;
-
-    // Track interaction / dragging
-    if let Ok((track_interaction, node, transform)) = track_query.single() {
-        if *track_interaction == Interaction::Pressed {
-            *is_dragging = true;
+    let mut direct_target_passes: Option<u32> = None;
+    if let Ok((interaction, node, transform)) = passes_track_query.single() {
+        if *interaction == Interaction::Pressed {
+            *is_dragging_passes = true;
         }
         if mouse_button.just_released(MouseButton::Left) {
-            *is_dragging = false;
+            *is_dragging_passes = false;
         }
 
-        if *is_dragging {
+        if *is_dragging_passes {
             if let Ok(window) = windows.single() {
                 if let Some(cursor_pos) = window.cursor_position() {
                     let width = node.size().x;
@@ -560,17 +691,17 @@ fn slider_system(
                         let left = transform.translation().x - width * 0.5;
                         let ratio = ((cursor_pos.x - left) / width).clamp(0.0, 1.0);
                         let target = 1 + (ratio * (MAX_BLUR_PASSES - 1) as f32).round() as u32;
-                        direct_target = Some(target);
+                        direct_target_passes = Some(target);
                     }
                 }
             }
         }
     }
 
-    let new_passes = if let Some(target) = direct_target {
+    let new_passes = if let Some(target) = direct_target_passes {
         target.clamp(1, MAX_BLUR_PASSES as u32)
-    } else if delta != 0 {
-        ((current_passes as i32) + delta).clamp(1, MAX_BLUR_PASSES as i32) as u32
+    } else if passes_delta != 0 {
+        ((current_passes as i32) + passes_delta).clamp(1, MAX_BLUR_PASSES as i32) as u32
     } else {
         current_passes
     };
@@ -579,13 +710,85 @@ fn slider_system(
         LOWPASS_BLUR_PASSES.store(new_passes, Ordering::Relaxed);
         blend_toggle.blur_passes = new_passes;
 
-        for mut text in &mut label_query {
+        for mut text in &mut passes_label {
             text.0 = format!("Blur Passes: {}", new_passes);
         }
 
         let pct = (new_passes.saturating_sub(1)) as f32 / (MAX_BLUR_PASSES - 1) as f32 * 100.0;
-        for mut fill_node in &mut fill_query {
-            fill_node.width = Val::Percent(pct);
+        for mut fill in &mut passes_fill {
+            fill.width = Val::Percent(pct);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 2. Cross-Layer Radius Slider
+    // -------------------------------------------------------------
+    let current_radius_tenths = CROSS_LAYER_RADIUS_TENTHS
+        .load(Ordering::Relaxed)
+        .clamp(0, MAX_CROSS_LAYER_TENTHS);
+    let mut radius_delta: i32 = 0;
+
+    for (interaction, step) in &mut layer_buttons {
+        if *interaction == Interaction::Pressed {
+            radius_delta += step.0 * layer_step_size;
+        }
+    }
+
+    if keys.just_pressed(KeyCode::Comma) {
+        radius_delta -= layer_step_size;
+    }
+    if keys.just_pressed(KeyCode::Period) {
+        radius_delta += layer_step_size;
+    }
+
+    let mut direct_target_radius: Option<u32> = None;
+    if let Ok((interaction, node, transform)) = layer_track_query.single() {
+        if *interaction == Interaction::Pressed {
+            *is_dragging_layer = true;
+        }
+        if mouse_button.just_released(MouseButton::Left) {
+            *is_dragging_layer = false;
+        }
+
+        if *is_dragging_layer {
+            if let Ok(window) = windows.single() {
+                if let Some(cursor_pos) = window.cursor_position() {
+                    let width = node.size().x;
+                    if width > 0.0 {
+                        let left = transform.translation().x - width * 0.5;
+                        let ratio = ((cursor_pos.x - left) / width).clamp(0.0, 1.0);
+                        let target = (ratio * MAX_CROSS_LAYER_TENTHS as f32).round() as u32;
+                        direct_target_radius = Some(target);
+                    }
+                }
+            }
+        }
+    }
+
+    let new_radius_tenths = if let Some(target) = direct_target_radius {
+        target.clamp(0, MAX_CROSS_LAYER_TENTHS)
+    } else if radius_delta != 0 {
+        ((current_radius_tenths as i32) + radius_delta).clamp(0, MAX_CROSS_LAYER_TENTHS as i32) as u32
+    } else {
+        current_radius_tenths
+    };
+
+    let new_radius_m = new_radius_tenths as f32 / 10.0;
+    if new_radius_tenths != current_radius_tenths || (blend_toggle.cross_layer_radius - new_radius_m).abs() > 0.01 {
+        CROSS_LAYER_RADIUS_TENTHS.store(new_radius_tenths, Ordering::Relaxed);
+        blend_toggle.cross_layer_radius = new_radius_m;
+
+        for mut text in &mut layer_label {
+            text.0 = if new_radius_m <= 0.001 {
+                "Cross-Layer: 0.0 m (isolated)".to_string()
+            } else {
+                format!("Cross-Layer Radius: {:.1} m", new_radius_m)
+            };
+        }
+
+        let pct = (new_radius_tenths as f32 / MAX_CROSS_LAYER_TENTHS as f32) * 100.0;
+        for mut fill in &mut layer_fill {
+            fill.width = Val::Percent(pct);
         }
     }
 }

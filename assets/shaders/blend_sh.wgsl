@@ -69,6 +69,11 @@ struct BlendUniforms {
     lowpass: u32,
     // Pass index: 0 for the initial temporal mix + blur pass, >0 for successive blur passes.
     pass_index: u32,
+    // Vertical cross-layer blur radius in meters.
+    cross_layer_radius: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
 }
 @group(1) @binding(3) var<uniform> blend: BlendUniforms;
 @group(1) @binding(4) var<storage, read> probe_adj: array<u32>;
@@ -90,9 +95,7 @@ const FILTER_NEIGHBOUR: f32 = 0.125;
 // platform edge (~1.5 m) really cuts. Tune this to the discontinuity.
 const LOWPASS_HEIGHT_TOL_SPACING: f32 = 1.5;
 // Weight normalization epsilon - raised to prevent dark bands
-// Vertical cross-layer blur radius in meters.
-// Probes across layers within this vertical distance blend together, weighted smoothly by distance.
-const CROSS_LAYER_RADIUS: f32 = 4.0;
+// Probes across layers within cross_layer_radius blend together, weighted smoothly by distance.
 
 fn layer_distance_weight(dy: f32, radius: f32) -> f32 {
     let s = max(radius, 1e-3);
@@ -156,7 +159,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
     var wsum = 0.0;
     let adj_mask = probe_adj[probe];
 
-    let r_y = max(CROSS_LAYER_RADIUS, info.spacing * 1.5);
+    let r_y = blend.cross_layer_radius;
 
     if TENT_PREFILTER {
         // PREVIOUS anisotropic 5-tap cross (see the header). Kept for A/B.
@@ -182,10 +185,13 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             let cell_base = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL;
             for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
+                if r_y <= 0.001 && l != layer {
+                    continue;
+                }
                 let q_probe = cell_base + l;
                 let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
                 let dy = abs(q_pos.y - center_pos.y);
-                let wy = layer_distance_weight(dy, r_y);
+                let wy = select(layer_distance_weight(dy, r_y), 1.0, r_y <= 0.001);
                 if wy <= 0.0 {
                     continue;
                 }
@@ -223,10 +229,13 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
 
             // Blur across layers within the cascade, respecting physical vertical distance.
             for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
+                if r_y <= 0.001 && l != layer {
+                    continue;
+                }
                 let q_probe = cell_base + l;
                 let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
                 let dy = abs(q_pos.y - center_pos.y);
-                let wy = layer_distance_weight(dy, r_y);
+                let wy = select(layer_distance_weight(dy, r_y), 1.0, r_y <= 0.001);
                 if wy <= 0.0 {
                     continue;
                 }

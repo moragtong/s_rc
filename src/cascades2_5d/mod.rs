@@ -44,6 +44,10 @@ use crate::ui::BlendToggleState;
 pub static LOWPASS_BLUR_PASSES: AtomicU32 = AtomicU32::new(40);
 pub const MAX_BLUR_PASSES: usize = 50;
 
+/// Global variable controlling the cross-layer blur radius in tenths of a meter (40 = 4.0m).
+pub static CROSS_LAYER_RADIUS_TENTHS: AtomicU32 = AtomicU32::new(40);
+pub const MAX_CROSS_LAYER_TENTHS: u32 = 80;
+
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
 const LIGHT_SHADER_PATH: &str = "shaders/surface_light.wgsl";
 const TRACE_SHADER_PATH: &str = "shaders/cascades2_5d.wgsl";
@@ -118,6 +122,10 @@ struct BlendUniforms {
     pub probe_words: u32,
     pub lowpass: u32,
     pub pass_index: u32,
+    pub cross_layer_radius: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
 }
 
 #[derive(Resource, Clone, ExtractResource)]
@@ -1053,6 +1061,7 @@ fn dispatch_cascades(
         .sum::<u64>()
         * SH_STRIDE;
 
+    let cross_layer_radius = CROSS_LAYER_RADIUS_TENTHS.load(Ordering::Relaxed) as f32 / 10.0;
     let num_dispatches = if passes <= 1 { 1 } else { passes as usize };
     for k in 0..num_dispatches {
         let mut bytes = encase::UniformBuffer::new(Vec::new());
@@ -1062,6 +1071,10 @@ fn dispatch_cascades(
                 probe_words: probe_words as u32,
                 lowpass: (passes > 0) as u32,
                 pass_index: k as u32,
+                cross_layer_radius,
+                pad0: 0.0,
+                pad1: 0.0,
+                pad2: 0.0,
             })
             .unwrap();
         render_queue.write_buffer(&render_data.blend_uniform_buffers[k], 0, bytes.as_ref());
