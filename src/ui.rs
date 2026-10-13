@@ -113,7 +113,6 @@ pub enum Action {
     ToggleNormalBias,
     ToggleLowPass,
     ToggleBspRecon,
-    ToggleGtaoSsgi,
     ToggleTwoClosestLayers,
     ToggleSsoA,
 }
@@ -327,22 +326,6 @@ fn setup_ui(mut commands: Commands) {
                         align_items: AlignItems::Center,
                         ..default()
                     },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
-                    ActionButton(Action::ToggleGtaoSsgi),
-                ))
-                .with_child((
-                    Text::new("Smooth Probe GI (G)"),
-                    TextColor(Color::WHITE),
-                ));
-            parent
-                .spawn((
-                    Button,
-                    Node {
-                        padding: UiRect::all(Val::Px(10.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
                     BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
                     ActionButton(Action::ToggleTwoClosestLayers),
                 ))
@@ -388,7 +371,6 @@ fn button_system(
     let mut toggle_bias = keys.just_pressed(KeyCode::KeyN);
     let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
     let mut toggle_bsp = keys.just_pressed(KeyCode::KeyC);
-    let mut toggle_gtao = keys.just_pressed(KeyCode::KeyG);
     let mut toggle_two = keys.just_pressed(KeyCode::KeyV);
     let mut toggle_ssao = keys.just_pressed(KeyCode::KeyU);
 
@@ -407,7 +389,6 @@ fn button_system(
                     Action::ToggleNormalBias => toggle_bias = true,
                     Action::ToggleLowPass => toggle_lp = true,
                     Action::ToggleBspRecon => toggle_bsp = true,
-                    Action::ToggleGtaoSsgi => toggle_gtao = true,
                     Action::ToggleTwoClosestLayers => toggle_two = true,
                     Action::ToggleSsoA => toggle_ssao = true,
                 }
@@ -484,11 +465,6 @@ fn button_system(
         );
     }
 
-    if toggle_gtao {
-        lighting_state.gtao_ssgi_enabled = !lighting_state.gtao_ssgi_enabled;
-        bevy::log::info!("Smooth Probe GI: {}", lighting_state.gtao_ssgi_enabled);
-    }
-
     if toggle_two {
         lighting_state.two_closest_layers = !lighting_state.two_closest_layers;
         bevy::log::info!("Two Closest Layers: {}", lighting_state.two_closest_layers);
@@ -547,13 +523,6 @@ fn button_system(
             }
             Action::ToggleBspRecon => {
                 *color = BackgroundColor(if lighting_state.bsp_recon_enabled {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            Action::ToggleGtaoSsgi => {
-                *color = BackgroundColor(if lighting_state.gtao_ssgi_enabled {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)

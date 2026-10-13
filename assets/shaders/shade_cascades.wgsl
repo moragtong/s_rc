@@ -155,7 +155,7 @@ const SH_MIX_COEFFS: bool = true;
 // clamp sees the field's value, not a per-probe value.
 fn sh_irradiance_v(coefs: array<vec3<f32>, 9>, n: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(n);
-    let band = array<f32, 3>(PI, 2.094395, 0.785398);
+    let band = array<f32, 3>(PI, 1.5707963, 0.1963495);
     var e = vec3<f32>(0.0);
     for (var i = 0u; i < 9u; i++) {
         let l = select(select(2u, 1u, i < 4u), 0u, i == 0u);
@@ -168,7 +168,7 @@ fn sh_irradiance_v(coefs: array<vec3<f32>, 9>, n: vec3<f32>) -> vec3<f32> {
 // Still the read for the legacy single-layer branch and the bilateral gather.
 fn sh_irradiance(base: u32, n: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(n);
-    let band = array<f32, 3>(PI, 2.094395, 0.785398);
+    let band = array<f32, 3>(PI, 1.5707963, 0.1963495);
     var e = vec3<f32>(0.0);
     for (var i = 0u; i < 9u; i++) {
         let l = select(select(2u, 1u, i < 4u), 0u, i == 0u);
@@ -281,14 +281,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let metallic = unpack4x8unorm(g.b).g;
     let n = oct_decode(vec2<f32>(f32(g.a & 0xFFFu), f32((g.a >> 12u) & 0xFFFu)) / 4095.0);
 
-    // GTAO-SSGI: the screen-space pass already produced this pixel's indirect
-    // irradiance (with its own world-GI fallback for off-screen directions), so
-    // there is nothing to gather here.
-    if view_info.gtao_enabled != 0u {
-        let gi = u32(pixel.y) * view_info.gtao_stride + u32(pixel.x);
-        let e = gtao_buf[gi].xyz;
-        return vec4<f32>(base_color / PI * e, 0.0);
-    }
+
 
     let info = uniforms.cascades[0];
     // Probe-grid read, currently unjittered. The original form jitters by up
@@ -595,14 +588,18 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 }
             }
         }
-        if SH_MIX_COEFFS {
-            e = select(
-                sh_irradiance_v(cf_blend, n),
-                sh_irradiance_v(cf_blend, n) / w_sum,
-                w_sum > WEIGHT_EPS,
-            );
-        } else {
-            e = select(e_blend, e_blend / w_sum, w_sum > WEIGHT_EPS);
+        var e = vec3<f32>(0.0);
+        if w_sum > WEIGHT_EPS {
+            if SH_MIX_COEFFS {
+                let inv_w = 1.0 / w_sum;
+                var norm_coefs: array<vec3<f32>, 9>;
+                for (var i = 0u; i < 9u; i++) {
+                    norm_coefs[i] = cf_blend[i] * inv_w;
+                }
+                e = sh_irradiance_v(norm_coefs, n);
+            } else {
+                e = e_blend / w_sum;
+            }
         }
         return vec4<f32>(base_color / PI * e, 0.0);
     } else {
