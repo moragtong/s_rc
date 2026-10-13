@@ -41,8 +41,8 @@ use crate::heightmap_bake::BakeState;
 use crate::ui::BlendToggleState;
 
 /// Global variable controlling the number of times the spatial low-pass blur is applied.
-pub static LOWPASS_BLUR_PASSES: AtomicU32 = AtomicU32::new(1);
-const MAX_BLUR_PASSES: usize = 8;
+pub static LOWPASS_BLUR_PASSES: AtomicU32 = AtomicU32::new(40);
+pub const MAX_BLUR_PASSES: usize = 50;
 
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
 const LIGHT_SHADER_PATH: &str = "shaders/surface_light.wgsl";

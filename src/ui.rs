@@ -1,4 +1,6 @@
+use std::sync::atomic::Ordering;
 use bevy::prelude::*;
+use crate::cascades2_5d::{LOWPASS_BLUR_PASSES, MAX_BLUR_PASSES};
 
 /// Shading pass configuration, extracted to the render app.
 #[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
@@ -45,7 +47,7 @@ impl Default for BlendToggleState {
     fn default() -> Self {
         Self {
             lowpass: true,
-            blur_passes: 1,
+            blur_passes: 40,
         }
     }
 }
@@ -64,6 +66,21 @@ pub enum Action {
     ToggleSsoA,
 }
 
+#[derive(Component)]
+pub struct FpsCounter;
+
+#[derive(Component)]
+pub struct BlurPassesLabel;
+
+#[derive(Component)]
+pub struct SliderTrack;
+
+#[derive(Component)]
+pub struct SliderFill;
+
+#[derive(Component)]
+pub struct BlurStepButton(pub i32);
+
 pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
@@ -72,11 +89,10 @@ impl Plugin for UiPlugin {
             .init_resource::<BlendToggleState>()
             .add_plugins((
                 bevy::render::extract_resource::ExtractResourcePlugin::<LightingState>::default(),
-                bevy::render::extract_resource::ExtractResourcePlugin::<BlendToggleState>::default(
-                ),
+                bevy::render::extract_resource::ExtractResourcePlugin::<BlendToggleState>::default(),
             ))
             .add_systems(Startup, setup_ui)
-            .add_systems(Update, button_system);
+            .add_systems(Update, (button_system, fps_system, slider_system));
     }
 }
 
@@ -92,6 +108,8 @@ fn setup_ui(mut commands: Commands) {
     if !SHOW_TOGGLE_PANEL {
         return;
     }
+
+    // Top-left corner: Action toggles
     commands
         .spawn((
             Node {
@@ -205,6 +223,133 @@ fn setup_ui(mut commands: Commands) {
                     ActionButton(Action::ToggleSsoA),
                 ))
                 .with_child((Text::new("Bevy SSAO (U)"), TextColor(Color::WHITE)));
+        });
+
+    // Top-right corner: FPS Counter
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(10.0),
+                right: Val::Px(10.0),
+                padding: UiRect::px(10.0, 10.0, 6.0, 6.0),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.65)),
+            Pickable::IGNORE,
+        ))
+        .with_child((
+            Text::new("FPS: --"),
+            TextColor(Color::WHITE),
+            TextFont::from_font_size(15.0),
+            FpsCounter,
+        ));
+
+    // Bottom-right corner: Blur Passes Slider
+    let initial_passes = LOWPASS_BLUR_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_BLUR_PASSES as u32);
+    let initial_pct = (initial_passes.saturating_sub(1)) as f32
+        / (MAX_BLUR_PASSES - 1) as f32
+        * 100.0;
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(12.0),
+                right: Val::Px(12.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                padding: UiRect::all(Val::Px(10.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.85)),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(format!("Blur Passes: {}", initial_passes)),
+                TextColor(Color::WHITE),
+                TextFont::from_font_size(14.0),
+                BlurPassesLabel,
+            ));
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Button,
+                        Node {
+                            width: Val::Px(28.0),
+                            height: Val::Px(24.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                        BlurStepButton(-1),
+                    ))
+                    .with_child((
+                        Text::new("-"),
+                        TextColor(Color::WHITE),
+                        TextFont::from_font_size(16.0),
+                    ));
+
+                    row.spawn((
+                        Button,
+                        Node {
+                            width: Val::Px(160.0),
+                            height: Val::Px(16.0),
+                            border_radius: BorderRadius::all(Val::Px(8.0)),
+                            overflow: Overflow::clip(),
+                            justify_content: JustifyContent::FlexStart,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.2, 0.2, 0.2)),
+                        SliderTrack,
+                    ))
+                    .with_children(|track| {
+                        track.spawn((
+                            Node {
+                                width: Val::Percent(initial_pct),
+                                height: Val::Percent(100.0),
+                                border_radius: BorderRadius::all(Val::Px(8.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
+                            SliderFill,
+                            Pickable::IGNORE,
+                        ));
+                    });
+
+                    row.spawn((
+                        Button,
+                        Node {
+                            width: Val::Px(28.0),
+                            height: Val::Px(24.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border_radius: BorderRadius::all(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                        BlurStepButton(1),
+                    ))
+                    .with_child((
+                        Text::new("+"),
+                        TextColor(Color::WHITE),
+                        TextFont::from_font_size(16.0),
+                    ));
+                });
         });
 }
 
@@ -329,5 +474,118 @@ fn button_system(
     if toggle_ssao {
         lighting_state.bevy_ssao_enabled = !lighting_state.bevy_ssao_enabled;
         bevy::log::info!("Bevy SSAO: {}", lighting_state.bevy_ssao_enabled);
+    }
+}
+
+#[derive(Default)]
+struct FpsTracker {
+    frames: u32,
+    accum_time: f32,
+}
+
+fn fps_system(
+    time: Res<Time>,
+    mut query: Query<&mut Text, With<FpsCounter>>,
+    mut tracker: Local<FpsTracker>,
+) {
+    tracker.frames += 1;
+    tracker.accum_time += time.delta_secs();
+    if tracker.accum_time >= 0.25 {
+        let fps = tracker.frames as f32 / tracker.accum_time.max(0.0001);
+        let ms = (tracker.accum_time / tracker.frames as f32) * 1000.0;
+        for mut text in &mut query {
+            text.0 = format!("{:.0} FPS ({:.1} ms)", fps, ms);
+        }
+        tracker.frames = 0;
+        tracker.accum_time = 0.0;
+    }
+}
+
+fn slider_system(
+    mut step_buttons: Query<(&Interaction, &BlurStepButton), (With<Button>, Changed<Interaction>)>,
+    track_query: Query<(&Interaction, &ComputedNode, &GlobalTransform), With<SliderTrack>>,
+    windows: Query<&Window>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut blend_toggle: ResMut<BlendToggleState>,
+    mut label_query: Query<&mut Text, With<BlurPassesLabel>>,
+    mut fill_query: Query<&mut Node, With<SliderFill>>,
+    mut is_dragging: Local<bool>,
+) {
+    let current_passes = LOWPASS_BLUR_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_BLUR_PASSES as u32);
+    let mut delta: i32 = 0;
+
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let step_size = if shift { 5 } else { 1 };
+
+    // Step buttons [-] and [+]
+    for (interaction, step) in &mut step_buttons {
+        if *interaction == Interaction::Pressed {
+            delta += step.0 * step_size;
+        }
+    }
+
+    // Keyboard shortcuts: '[' / '-' to decrement, ']' / '+' / '=' to increment
+    if keys.just_pressed(KeyCode::BracketLeft)
+        || keys.just_pressed(KeyCode::Minus)
+        || keys.just_pressed(KeyCode::NumpadSubtract)
+    {
+        delta -= step_size;
+    }
+    if keys.just_pressed(KeyCode::BracketRight)
+        || keys.just_pressed(KeyCode::Equal)
+        || keys.just_pressed(KeyCode::NumpadAdd)
+    {
+        delta += step_size;
+    }
+
+    let mut direct_target: Option<u32> = None;
+
+    // Track interaction / dragging
+    if let Ok((track_interaction, node, transform)) = track_query.single() {
+        if *track_interaction == Interaction::Pressed {
+            *is_dragging = true;
+        }
+        if mouse_button.just_released(MouseButton::Left) {
+            *is_dragging = false;
+        }
+
+        if *is_dragging {
+            if let Ok(window) = windows.single() {
+                if let Some(cursor_pos) = window.cursor_position() {
+                    let width = node.size().x;
+                    if width > 0.0 {
+                        let left = transform.translation().x - width * 0.5;
+                        let ratio = ((cursor_pos.x - left) / width).clamp(0.0, 1.0);
+                        let target = 1 + (ratio * (MAX_BLUR_PASSES - 1) as f32).round() as u32;
+                        direct_target = Some(target);
+                    }
+                }
+            }
+        }
+    }
+
+    let new_passes = if let Some(target) = direct_target {
+        target.clamp(1, MAX_BLUR_PASSES as u32)
+    } else if delta != 0 {
+        ((current_passes as i32) + delta).clamp(1, MAX_BLUR_PASSES as i32) as u32
+    } else {
+        current_passes
+    };
+
+    if new_passes != current_passes || blend_toggle.blur_passes != new_passes {
+        LOWPASS_BLUR_PASSES.store(new_passes, Ordering::Relaxed);
+        blend_toggle.blur_passes = new_passes;
+
+        for mut text in &mut label_query {
+            text.0 = format!("Blur Passes: {}", new_passes);
+        }
+
+        let pct = (new_passes.saturating_sub(1)) as f32 / (MAX_BLUR_PASSES - 1) as f32 * 100.0;
+        for mut fill_node in &mut fill_query {
+            fill_node.width = Val::Percent(pct);
+        }
     }
 }

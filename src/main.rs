@@ -206,9 +206,10 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
-            left: Val::Px(8.0),
+            bottom: Val::Px(12.0),
+            left: Val::Px(12.0),
             padding: UiRect::px(6.0, 6.0, 6.0, 6.0),
+            border_radius: BorderRadius::all(Val::Px(4.0)),
             ..default()
         },
         Text::new(""),
