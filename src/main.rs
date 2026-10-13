@@ -2,6 +2,7 @@ use crate::bake_camera_readback::BakeCameraReadbackPlugin;
 use crate::cascades2_5d::Cascades2_5dPlugin;
 mod bake_camera_readback;
 mod cascades2_5d;
+mod gtao_ssgi;
 mod heightmap;
 mod heightmap_bake;
 mod heightmap_verify;
@@ -44,7 +45,7 @@ fn main() {
             HeightmapViewPlugin,
             ui::UiPlugin,
             Cascades2_5dPlugin,
-            shade::ShadePlugin,
+            (shade::ShadePlugin, gtao_ssgi::GtaoSsgiPlugin),
             probe_overlay::ProbeOverlayPlugin,
             screenshot::ScreenshotPlugin,
             bevy::render::diagnostic::RenderDiagnosticsPlugin,

@@ -574,6 +574,45 @@ fn is_solid(texel: vec2<i32>) -> bool {
     return abs(textureLoad(winding, t, 0).x) > WINDING_SOLID;
 }
 
+// Fast 6-tap visibility check between surface point p and probe center.
+// Tests against the 2D winding map for vertical walls and the dual heightmap
+// (floor / ceiling) for vertical occluders (floors, roofs, steps, overhangs).
+fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
+    let start_pos = p + n * 0.04;
+    let to_probe = center - start_pos;
+    let dist_xz = length(to_probe.xz);
+    if dist_xz <= 1e-4 {
+        let t_end = texel_at(center.xz);
+        if is_solid(t_end) {
+            return false;
+        }
+        let h = textureLoad(heightmap, vec2<u32>(t_end), 0).xy;
+        return center.y > h.y && center.y < h.x;
+    }
+    let t_center = texel_at(center.xz);
+    if is_solid(t_center) {
+        return false;
+    }
+    let h_end = textureLoad(heightmap, vec2<u32>(t_center), 0).xy;
+    if center.y <= h_end.y || center.y >= h_end.x {
+        return false;
+    }
+    let steps = 6u;
+    for (var i = 1u; i < steps; i = i + 1u) {
+        let t = f32(i) / f32(steps);
+        let sample_pos = start_pos + to_probe * t;
+        let sample_texel = texel_at(sample_pos.xz);
+        if is_solid(sample_texel) {
+            return false;
+        }
+        let h = textureLoad(heightmap, vec2<u32>(sample_texel), 0).xy;
+        if sample_pos.y <= h.y || sample_pos.y >= h.x {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Whether `t` is an open column a probe can be lifted from at all.
 //
 // Not solid, and with both stored surfaces, so there is a real interval to sit

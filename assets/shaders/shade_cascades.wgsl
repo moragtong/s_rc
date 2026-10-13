@@ -22,7 +22,7 @@
 // instead - the cell in front of the surface - and `probe_visible` is skipped.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
-#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal}
+#import s_rc::heightmap_trace::{uniforms, sh_basis, oct_decode, trace, MISS, PI, SH_STRIDE, height_agreement, PROBES_PER_CELL, probe_normal, is_solid, texel_at, probe_visible}
 
 @group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(1) var gbuffer: texture_2d<u32>;
@@ -31,6 +31,10 @@
 // costs one storage read rather than two. Probe positions and parallax radii
 // are the same in both relights, so they survive the mix unchanged.
 @group(1) @binding(2) var<storage, read> sh_probes: array<vec4<f32>>;
+// GTAO-SSGI per-pixel irradiance (xyz), written at EarlyPostProcess. Read only
+// when `view_info.gtao_enabled`; xyz is multiplied by albedo/pi like the
+// probe path, so the branch replaces the whole indirect term.
+@group(1) @binding(4) var<storage, read> gtao_buf: array<vec4<f32>>;
 
 struct ShadeUniforms {
     view_from_clip: mat4x4<f32>,
@@ -40,6 +44,9 @@ struct ShadeUniforms {
     bilateral_enabled: u32,
     normal_bias_enabled: u32,
     bsp_recon_enabled: u32,
+    gtao_enabled: u32,
+    gtao_stride: u32,
+    two_closest_layers: u32,
 }
 @group(1) @binding(3) var<uniform> view_info: ShadeUniforms;
 
@@ -112,41 +119,6 @@ fn hash12(seed: vec2<f32>) -> f32 {
     return fract(sin(dot(seed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
-// Whether a probe is reachable from `p`. The heightmap records one floor and
-// one ceiling per column, so it cannot represent a wall: without this test a
-// probe on the far side of a wall, or a ground-floor probe under a second
-// floor, bleeds straight through. `trace` returns MISS for a segment that
-// stays in open space over its whole length.
-fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
-    let to_probe = center - p;
-    let dist = length(to_probe);
-    if dist <= 1e-4 {
-        return true;
-    }
-    let o = p + n * PROBE_BIAS;
-    let t_end = max(dist - PROBE_BIAS, PROBE_BIAS);
-    let hit = trace(o, to_probe / dist, PROBE_BIAS, t_end);
-    return hit.t == MISS;
-
-    // It was off for a while; when the build that turned it on (interior
-    // camera, pinned sun, mean luminance 0.2040 without) was A/B:
-    //
-    //   occlusion on, is_solid = normals || winding : mean|d| 0.0362, 31.9% of
-    //     px past 0.05, 4.01% brighter / 9.86% darker, luminance 0.2044
-    //   occlusion on, is_solid = winding only       : mean|d| 0.0509, 64.7%
-    //     px past 0.05, 33.91% brighter / 0.06% darker, luminance 0.2417
-    //
-    // The rule change is the bigger half of that, not the occlusion, and it
-    // goes bright rather than dark - 0.0593 mean|d| between the two occluded
-    // builds, max 0.92 - because `is_solid` is shared with `trace`, so it also
-    // moves where the cascade rays stop and what the probes gather. Turning
-    // occlusion on on top of it was worth 0.0362, and left 10% of pixels
-    // darker, which is the wall rejection doing its job.
-}
-
-// The SH coefficients are radiance, and `sh_probes` is already the cross-fade
-// between two relights (see blend_sh.wgsl), so this is a plain read: the blend
-// is done once over 18k words instead of once per coefficient per pixel.
 fn sh_coeff(base: u32, i: u32) -> vec3<f32> {
     return sh_probes[base + i].xyz;
 }
@@ -308,6 +280,15 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let base_color = pow(unpack4x8unorm(g.r).rgb, vec3<f32>(2.2));
     let metallic = unpack4x8unorm(g.b).g;
     let n = oct_decode(vec2<f32>(f32(g.a & 0xFFFu), f32((g.a >> 12u) & 0xFFFu)) / 4095.0);
+
+    // GTAO-SSGI: the screen-space pass already produced this pixel's indirect
+    // irradiance (with its own world-GI fallback for off-screen directions), so
+    // there is nothing to gather here.
+    if view_info.gtao_enabled != 0u {
+        let gi = u32(pixel.y) * view_info.gtao_stride + u32(pixel.x);
+        let e = gtao_buf[gi].xyz;
+        return vec4<f32>(base_color / PI * e, 0.0);
+    }
 
     let info = uniforms.cascades[0];
     // Probe-grid read, currently unjittered. The original form jitters by up
@@ -545,117 +526,83 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         e = mix(mix(e_floor, e_mid, t_floor), mix(e_mid, e_ceil, t_ceil), 0.5);
         return vec4<f32>(base_color / PI * e, 0.0);
     } else if view_info.trilinear_enabled != 0u {
-        // Trilinear over three real probe layers: floor (0), mid-air (1), ceiling (2).
-        // Each of the 4 XZ neighbours holds probes at three heights. Each layer
-        // is gathered bilinearly in XZ, then the three are faded by where `p`
-        // sits between the bilinearly interpolated heights.
-        var cf_floor: array<vec3<f32>, 9>;
-        var cf_mid: array<vec3<f32>, 9>;
-        var cf_ceil: array<vec3<f32>, 9>;
-        var e_floor = vec3<f32>(0.0);
-        var e_mid = vec3<f32>(0.0);
-        var e_ceil = vec3<f32>(0.0);
-        var w_floor = 0.0;
-        var w_mid = 0.0;
-        var w_ceil = 0.0;
-        var h_floor = 0.0;
-        var h_mid = 0.0;
-        var h_ceil = 0.0;
+        // Hybrid bilinear-horizontal + inverse-square-vertical blend over three probe layers:
+        // floor (0), mid-air (1), ceiling (2). Matches the world GI gather used in GTAO-SSGI.
+        var cf_blend: array<vec3<f32>, 9>;
+        for (var i = 0u; i < 9u; i++) {
+            cf_blend[i] = vec3<f32>(0.0);
+        }
+        var e_blend = vec3<f32>(0.0);
+        var w_sum = 0.0;
         for (var k = 0u; k < 4u; k++) {
             let corner = vec2<u32>(k & 1u, k >> 1u);
             let q = vec2<u32>(clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(info.size) - 1));
             let wxy = mix(1.0 - frac, frac, vec2<f32>(corner));
-            let w = wxy.x * wxy.y;
+            let w_corner = wxy.x * wxy.y;
             let base_cell = info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL;
+
+            var layer_dy: array<f32, 3>;
             for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                let c = sh_probes[(base_cell + layer) * SH_STRIDE + 9u].xyz;
+                layer_dy[layer] = abs(c.y - fetch.y);
+            }
+            var farthest = 999u;
+            if view_info.two_closest_layers != 0u {
+                // Select the two closest layers out of the three (drop the farthest).
+                farthest = 0u;
+                var max_dy = layer_dy[0];
+                if layer_dy[1] > max_dy {
+                    farthest = 1u;
+                    max_dy = layer_dy[1];
+                }
+                if layer_dy[2] > max_dy {
+                    farthest = 2u;
+                }
+            }
+
+            var layer_w: array<f32, 3>;
+            var layer_sum = 0.0;
+            for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                if layer == farthest {
+                    layer_w[layer] = 0.0;
+                } else {
+                    let dy = layer_dy[layer];
+                    layer_w[layer] = 1.0 / (1e-3 + dy * dy);
+                    layer_sum += layer_w[layer];
+                }
+            }
+            if layer_sum <= 0.0 {
+                continue;
+            }
+
+            for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                if layer == farthest {
+                    continue;
+                }
                 let base = (base_cell + layer) * SH_STRIDE;
                 let center = sh_probes[base + 9u].xyz;
-                // The three layer heights, bilinearly merged, define the
-                // vertical axis of the trilinear read.
-                if (layer == 0u) {
-                    h_floor += w * center.y;
-                } else if (layer == 1u) {
-                    h_mid += w * center.y;
-                } else {
-                    h_ceil += w * center.y;
-                }
-                if w > 0.0
-                    && (view_info.normal_bias_enabled != 0u || probe_visible(p, n, center))
-                {
-                    // PREVIOUS (scalar order, keep for the SH_MIX_COEFFS=0
-                    // build): the per-probe irradiance was clamped by
-                    // `sh_irradiance` before blending, so a negative SH lobe
-                    // along `n` was zeroed in place.
-                    if !SH_MIX_COEFFS {
-                        let read = sh_irradiance(base, n);
-                        if (layer == 0u) {
-                            e_floor += w * read;
-                        } else if (layer == 1u) {
-                            e_mid += w * read;
-                        } else {
-                            e_ceil += w * read;
-                        }
-                    }
-                    // Blend the 9 coefficient vectors by `w`; the clamped
-                    // cosine kernel is applied once to the field (see the
-                    // `SH_MIX_COEFFS` comment at the top).
+                if view_info.normal_bias_enabled != 0u || probe_visible(p, n, center) {
+                    let w = w_corner * (layer_w[layer] / layer_sum);
                     if SH_MIX_COEFFS {
                         for (var i = 0u; i < 9u; i++) {
-                            let c = sh_coeff(base, i) * w;
-                            if (layer == 0u) {
-                                cf_floor[i] += c;
-                            } else if (layer == 1u) {
-                                cf_mid[i] += c;
-                            } else {
-                                cf_ceil[i] += c;
-                            }
+                            cf_blend[i] += sh_coeff(base, i) * w;
                         }
-                    }
-                    if (layer == 0u) {
-                        w_floor += w;
-                    } else if (layer == 1u) {
-                        w_mid += w;
                     } else {
-                        w_ceil += w;
+                        e_blend += w * sh_irradiance(base, n);
                     }
+                    w_sum += w;
                 }
             }
         }
-        // Renormalise each layer over the probes that survived, so an occluded
-        // probe hands its share to the visible ones instead of subtracting
-        // light. Without this the footprint sums to less than 1 and every
-        // occlusion reads as a straight loss of energy rather than a
-        // redistribution. In the coefficient order the same division is
-        // applied to the evaluated field, which is equivalent because the
-        // kernel is linear.
         if SH_MIX_COEFFS {
-            e_floor = select(
-                sh_irradiance_v(cf_floor, n),
-                sh_irradiance_v(cf_floor, n) / w_floor,
-                w_floor > WEIGHT_EPS,
-            );
-            e_mid = select(
-                sh_irradiance_v(cf_mid, n),
-                sh_irradiance_v(cf_mid, n) / w_mid,
-                w_mid > WEIGHT_EPS,
-            );
-            e_ceil = select(
-                sh_irradiance_v(cf_ceil, n),
-                sh_irradiance_v(cf_ceil, n) / w_ceil,
-                w_ceil > WEIGHT_EPS,
+            e = select(
+                sh_irradiance_v(cf_blend, n),
+                sh_irradiance_v(cf_blend, n) / w_sum,
+                w_sum > WEIGHT_EPS,
             );
         } else {
-            e_floor = select(e_floor, e_floor / w_floor, w_floor > WEIGHT_EPS);
-            e_mid = select(e_mid, e_mid / w_mid, w_mid > WEIGHT_EPS);
-            e_ceil = select(e_ceil, e_ceil / w_ceil, w_ceil > WEIGHT_EPS);
+            e = select(e_blend, e_blend / w_sum, w_sum > WEIGHT_EPS);
         }
-        // Blend only the nearest 2 layers: floor+mid or mid+ceiling
-        var t_mid = saturate((fetch.y - h_floor) / max(h_ceil - h_floor, 1e-4));
-        var e_mid_ceil = mix(e_mid, e_ceil, t_mid);
-        var e_floor_mid = mix(e_floor, e_mid, t_mid);
-        // Use mid as pivot: below mid blends floor+mid, above mid blends mid+ceiling
-        var t_pivot = saturate((fetch.y - h_mid) / max(h_ceil - h_floor, 1e-4));
-        e = mix(e_floor_mid, e_mid_ceil, t_pivot);
         return vec4<f32>(base_color / PI * e, 0.0);
     } else {
         // Legacy single-layer reference, for A/B: just the floor layer of the
