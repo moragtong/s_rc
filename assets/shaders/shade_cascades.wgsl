@@ -46,6 +46,7 @@ struct ShadeUniforms {
     bsp_recon_enabled: u32,
     gtao_enabled: u32,
     gtao_stride: u32,
+    two_closest_layers: u32,
 }
 @group(1) @binding(3) var<uniform> view_info: ShadeUniforms;
 
@@ -540,19 +541,44 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
             let w_corner = wxy.x * wxy.y;
             let base_cell = info.probe_base + (q.y * info.size.x + q.x) * PROBES_PER_CELL;
 
+            var layer_dy: array<f32, 3>;
+            for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                let c = sh_probes[(base_cell + layer) * SH_STRIDE + 9u].xyz;
+                layer_dy[layer] = abs(c.y - fetch.y);
+            }
+            var farthest = 999u;
+            if view_info.two_closest_layers != 0u {
+                // Select the two closest layers out of the three (drop the farthest).
+                farthest = 0u;
+                var max_dy = layer_dy[0];
+                if layer_dy[1] > max_dy {
+                    farthest = 1u;
+                    max_dy = layer_dy[1];
+                }
+                if layer_dy[2] > max_dy {
+                    farthest = 2u;
+                }
+            }
+
             var layer_w: array<f32, 3>;
             var layer_sum = 0.0;
             for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
-                let c = sh_probes[(base_cell + layer) * SH_STRIDE + 9u].xyz;
-                let dy = abs(c.y - fetch.y);
-                layer_w[layer] = 1.0 / (1e-3 + dy * dy);
-                layer_sum += layer_w[layer];
+                if layer == farthest {
+                    layer_w[layer] = 0.0;
+                } else {
+                    let dy = layer_dy[layer];
+                    layer_w[layer] = 1.0 / (1e-3 + dy * dy);
+                    layer_sum += layer_w[layer];
+                }
             }
             if layer_sum <= 0.0 {
                 continue;
             }
 
             for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
+                if layer == farthest {
+                    continue;
+                }
                 let base = (base_cell + layer) * SH_STRIDE;
                 let center = sh_probes[base + 9u].xyz;
                 if view_info.normal_bias_enabled != 0u || probe_visible(p, n, center) {

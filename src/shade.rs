@@ -40,6 +40,7 @@ struct ShadeUniforms {
     bsp_recon_enabled: u32,
     gtao_enabled: u32,
     gtao_stride: u32,
+    two_closest_layers: u32,
 }
 
 /// The composite half of the shade split: writes the indirect term (times the
@@ -244,6 +245,7 @@ fn draw_shade(
         bsp_recon_enabled: lighting_state.bsp_recon_enabled as u32,
         gtao_enabled: (lighting_state.gtao_ssgi_enabled && bake.is_verified()) as u32,
         gtao_stride: GTAO_STRIDE,
+        two_closest_layers: lighting_state.two_closest_layers as u32,
     });
     uniforms.write_buffer(&render_device, &render_queue);
 

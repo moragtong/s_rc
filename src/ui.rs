@@ -11,6 +11,7 @@ pub struct LightingState {
     pub normal_bias_enabled: bool,
     pub bsp_recon_enabled: bool,
     pub gtao_ssgi_enabled: bool,
+    pub two_closest_layers: bool,
     // Bevy's built-in SSAO (the XeGTAO-derivative VBAO), applied to the
     // *isolated indirect term* in the composite pass (see AGENTS.md). Flipping
     // this off stops the multiply but leaves the component on the camera, so
@@ -46,6 +47,7 @@ impl Default for LightingState {
             // screen cannot answer. Supersedes the world gather for the whole
             // term when on.
             gtao_ssgi_enabled: false,
+            two_closest_layers: true,
             bevy_ssao_enabled: true,
         }
     }
@@ -112,6 +114,7 @@ pub enum Action {
     ToggleLowPass,
     ToggleBspRecon,
     ToggleGtaoSsgi,
+    ToggleTwoClosestLayers,
     ToggleSsoA,
 }
 
@@ -340,6 +343,22 @@ fn setup_ui(mut commands: Commands) {
                         align_items: AlignItems::Center,
                         ..default()
                     },
+                    BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
+                    ActionButton(Action::ToggleTwoClosestLayers),
+                ))
+                .with_child((
+                    Text::new("Two Closest Layers (V)"),
+                    TextColor(Color::WHITE),
+                ));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
                     BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleSsoA),
                 ))
@@ -370,6 +389,7 @@ fn button_system(
     let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
     let mut toggle_bsp = keys.just_pressed(KeyCode::KeyC);
     let mut toggle_gtao = keys.just_pressed(KeyCode::KeyG);
+    let mut toggle_two = keys.just_pressed(KeyCode::KeyV);
     let mut toggle_ssao = keys.just_pressed(KeyCode::KeyU);
 
     for (interaction, mut color, action) in &mut interaction_query {
@@ -388,6 +408,7 @@ fn button_system(
                     Action::ToggleLowPass => toggle_lp = true,
                     Action::ToggleBspRecon => toggle_bsp = true,
                     Action::ToggleGtaoSsgi => toggle_gtao = true,
+                    Action::ToggleTwoClosestLayers => toggle_two = true,
                     Action::ToggleSsoA => toggle_ssao = true,
                 }
             }
@@ -468,6 +489,11 @@ fn button_system(
         bevy::log::info!("Smooth Probe GI: {}", lighting_state.gtao_ssgi_enabled);
     }
 
+    if toggle_two {
+        lighting_state.two_closest_layers = !lighting_state.two_closest_layers;
+        bevy::log::info!("Two Closest Layers: {}", lighting_state.two_closest_layers);
+    }
+
     if toggle_ssao {
         lighting_state.bevy_ssao_enabled = !lighting_state.bevy_ssao_enabled;
         bevy::log::info!("Bevy SSAO: {}", lighting_state.bevy_ssao_enabled);
@@ -528,6 +554,13 @@ fn button_system(
             }
             Action::ToggleGtaoSsgi => {
                 *color = BackgroundColor(if lighting_state.gtao_ssgi_enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                });
+            }
+            Action::ToggleTwoClosestLayers => {
+                *color = BackgroundColor(if lighting_state.two_closest_layers {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)
