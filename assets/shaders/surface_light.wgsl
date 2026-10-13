@@ -1,8 +1,9 @@
 // Sunlit outgoing radiance of every heightmap texel's floor and ceiling,
-// shadowed by tracing toward the sun through the heightmap. Cascade rays
-// read it at their hits.
+// shadowed by marching toward the sun using the Aaltonen / Quilez (2018)
+// soft shadow estimator against the dual heightmap and winding map.
+// Cascade rays read it at their hits.
 
-#import s_rc::heightmap_trace::{heightmap, uniforms, trace, cell_size, MISS, PI}
+#import s_rc::heightmap_trace::{heightmap, uniforms, cell_size, PI, sun_visibility}
 
 @group(1) @binding(0) var normal_min: texture_2d<f32>;
 @group(1) @binding(1) var normal_max: texture_2d<f32>;
@@ -20,10 +21,8 @@ fn sunlit(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>) -> vec3<f32> {
     if cos_l <= 0.0 {
         return vec3<f32>(0.0);
     }
-    if trace(p + n * SHADOW_BIAS, uniforms.sun_toward, 0.0, 1.0e4).t != MISS {
-        return vec3<f32>(0.0);
-    }
-    return albedo / PI * uniforms.sun_irradiance * cos_l;
+    let vis = sun_visibility(p + n * SHADOW_BIAS, uniforms.sun_toward);
+    return albedo / PI * uniforms.sun_irradiance * cos_l * vis;
 }
 
 @compute @workgroup_size(8, 8, 1)

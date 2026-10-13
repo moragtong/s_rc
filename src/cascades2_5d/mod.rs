@@ -131,6 +131,8 @@ pub struct SunParams {
     /// Irradiance times the camera exposure, so cascade radiance matches the
     /// main pass's output.
     pub irradiance: Vec3,
+    /// Soft shadow cone factor k = 1 / tan(angular_radius).
+    pub k: f32,
 }
 
 #[derive(ShaderType, Clone, Copy, Default)]
@@ -155,6 +157,7 @@ pub struct CascadesUniforms {
     pub cascade_count: u32,
     pub hmap_top: f32,
     pub split: f32,
+    pub sun_k: f32,
     pub sun_toward: Vec3,
     pub sun_irradiance: Vec3,
     pub sky_color: Vec4,
@@ -292,11 +295,24 @@ fn update_sun(
         .unwrap_or_default()
         .exposure();
     let color = light.color.to_linear();
+    // Real sun angular radius is ~0.27 degrees (~0.004712 rad) -> k = 1 / tan(theta) ~ 212.2.
+    // Configurable via S_RC_SUN_K or S_RC_SUN_W (w = tan(theta) -> k = 1 / w).
+    let k = std::env::var("S_RC_SUN_K")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .or_else(|| {
+            std::env::var("S_RC_SUN_W")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|w| if w > 0.0 { 1.0 / w } else { 212.2 })
+        })
+        .unwrap_or(212.2);
     let new = SunParams {
         toward: -transform.forward().as_vec3(),
         irradiance: Vec3::new(color.red, color.green, color.blue) * light.illuminance * exposure,
+        k,
     };
-    if new.toward != sun.toward || new.irradiance != sun.irradiance {
+    if new.toward != sun.toward || new.irradiance != sun.irradiance || new.k != sun.k {
         *sun = new;
     }
 }
@@ -549,6 +565,7 @@ fn prepare_buffers(
         cascade_count: layout.cascades.len() as u32,
         hmap_top: heightmap.top,
         split: crate::heightmap::SPLIT,
+        sun_k: sun.k,
         sun_toward: sun.toward,
         sun_irradiance: sun.irradiance,
         sky_color,

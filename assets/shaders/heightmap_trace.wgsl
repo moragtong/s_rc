@@ -31,6 +31,8 @@ struct Uniforms {
     // The bake plane (SPLIT): the height probes sit at now that the lift is
     // disabled.
     split: f32,
+    // Cone factor 1 / tan(angular_radius) for soft shadow marching.
+    sun_k: f32,
     // Unit vector toward the sun.
     sun_toward: vec3<f32>,
     // Sun irradiance, already multiplied by the camera exposure, so every
@@ -839,4 +841,131 @@ fn trace(o: vec3<f32>, d: vec3<f32>, t_start: f32, t_end: f32) -> Hit {
     }
     hit.t = MISS;
     return hit;
+}
+
+fn dist_to_box(p: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> f32 {
+    let clamped = clamp(p, bmin, bmax);
+    return length(p - clamped);
+}
+
+// 3D clearance from point p to scene occluder geometry on the dual heightmap
+// and winding map. Returns 0.0 if inside solid geometry.
+fn scene_clearance(p: vec3<f32>) -> f32 {
+    let cell = cell_size();
+    let dims = vec2<i32>(uniforms.hmap_res);
+    let t_center = texel_at(p.xz);
+    if (t_center.x < 0 || t_center.y < 0 || t_center.x >= dims.x || t_center.y >= dims.y) {
+        return 100.0;
+    }
+    if (p.y > uniforms.hmap_top) {
+        return 100.0;
+    }
+
+    if (is_solid(t_center)) {
+        return 0.0;
+    }
+
+    let h_center = textureLoad(heightmap, vec2<u32>(t_center), 0).xy;
+    if (h_center.x < 5000.0 && p.y >= h_center.x) {
+        return 0.0;
+    }
+    if (h_center.y > uniforms.split - 9.0 && p.y <= h_center.y) {
+        return 0.0;
+    }
+
+    var d = 100.0;
+    if (h_center.x < 5000.0) {
+        d = min(d, h_center.x - p.y);
+    }
+    if (h_center.y > uniforms.split - 9.0) {
+        d = min(d, p.y - h_center.y);
+    }
+
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            if (dx == 0 && dz == 0) {
+                continue;
+            }
+            let nb = t_center + vec2<i32>(dx, dz);
+            if (nb.x < 0 || nb.y < 0 || nb.x >= dims.x || nb.y >= dims.y) {
+                continue;
+            }
+            let a = uniforms.hmap_min + vec2<f32>(nb) * cell;
+            let b = a + cell;
+            let h_nb = textureLoad(heightmap, vec2<u32>(nb), 0).xy;
+
+            if (is_solid(nb)) {
+                let top_y = select(h_nb.x, uniforms.hmap_top, h_nb.x >= 5000.0);
+                let bot_y = select(h_nb.y, uniforms.split - 9.0, h_nb.y <= uniforms.split - 9.0);
+                let bmin = vec3<f32>(a.x, bot_y, a.y);
+                let bmax = vec3<f32>(b.x, top_y, b.y);
+                d = min(d, dist_to_box(p, bmin, bmax));
+            } else {
+                if (h_nb.x < 5000.0 && h_nb.x < h_center.x) {
+                    let bmin = vec3<f32>(a.x, h_nb.x, a.y);
+                    let bmax = vec3<f32>(b.x, uniforms.hmap_top, b.y);
+                    d = min(d, dist_to_box(p, bmin, bmax));
+                }
+                if (h_nb.y > uniforms.split - 9.0 && h_nb.y > h_center.y) {
+                    let bmin = vec3<f32>(a.x, uniforms.split - 10.0, a.y);
+                    let bmax = vec3<f32>(b.x, h_nb.y, b.y);
+                    d = min(d, dist_to_box(p, bmin, bmax));
+                }
+            }
+        }
+    }
+    return d;
+}
+
+// Aaltonen / Quilez (2018) soft shadow ray marcher against the analytical sun.
+// Marches from `start` along unit `dir` (uniforms.sun_toward) evaluating 3D distance
+// against heightmaps and winding map. Triangulates continuous minimum clearance
+// between consecutive steps to eliminate discrete step banding.
+fn sun_visibility(start: vec3<f32>, dir: vec3<f32>) -> f32 {
+    const MIN_STEP: f32 = 0.01;
+    const MAX_STEP: f32 = 0.06;
+    const MAX_T: f32 = 60.0;
+    const MAX_STEPS: u32 = 128u;
+
+    var res = 1.0;
+    var t = 0.02;
+    var prev_d = 1e20;
+    var prev_step = 0.02;
+
+    for (var i = 0u; i < MAX_STEPS; i = i + 1u) {
+        let p = start + dir * t;
+        if (p.y > uniforms.hmap_top && dir.y > 0.0) {
+            break;
+        }
+        if (p.x < uniforms.hmap_min.x || p.x > uniforms.hmap_max.x ||
+            p.z < uniforms.hmap_min.y || p.z > uniforms.hmap_max.y) {
+            break;
+        }
+        if (t >= MAX_T) {
+            break;
+        }
+
+        let d = scene_clearance(p);
+        if (d <= 0.0) {
+            return 0.0;
+        }
+
+        if (i > 0u) {
+            let dt = prev_step;
+            let y = clamp((d * d + dt * dt - prev_d * prev_d) / (2.0 * dt), 0.0, dt);
+            let d_min = sqrt(max(d * d - y * y, 0.0));
+            let t_star = max(t - y, 1e-4);
+            res = min(res, uniforms.sun_k * d_min / t_star);
+        } else {
+            res = min(res, uniforms.sun_k * d / max(t, 1e-4));
+        }
+
+        let step = clamp(d, MIN_STEP, MAX_STEP);
+        prev_d = d;
+        prev_step = step;
+        t = t + step;
+    }
+
+    res = clamp(res, 0.0, 1.0);
+    return res * res * (3.0 - 2.0 * res);
 }

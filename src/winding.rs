@@ -24,11 +24,7 @@
 //! Built once, when `BakeState` reports ready — which is also when
 //! `measure_scene_extent` has seen the mesh set stop changing, so the triangle
 //! list is complete.
-use bevy::{
-    mesh::Indices,
-    prelude::*,
-    render::mesh::VertexAttributeValues,
-};
+use bevy::{mesh::Indices, prelude::*, render::mesh::VertexAttributeValues};
 
 use crate::heightmap::{Heightmap, MAX_BOUNDS, MIN_BOUNDS, RESOLUTION, SPLIT};
 use crate::heightmap_bake::{BakeState, SceneAsset};
@@ -38,7 +34,10 @@ pub struct WindingPlugin;
 
 impl Plugin for WindingPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, build_winding_map.after(crate::heightmap_bake::measure_scene_extent));
+        app.add_systems(
+            Update,
+            build_winding_map.after(crate::heightmap_bake::measure_scene_extent),
+        );
     }
 }
 
@@ -55,7 +54,7 @@ fn build_winding_map(
     scene: Res<SceneAsset>,
     asset_server: Res<AssetServer>,
     meshes: Res<Assets<Mesh>>,
-    query: Query<(&Mesh3d, &GlobalTransform), Without<HeightmapViewMesh>>,
+    query: Query<(&Mesh3d, &GlobalTransform, Option<&Name>), Without<HeightmapViewMesh>>,
     heightmap: Res<Heightmap>,
     mut images: ResMut<Assets<Image>>,
 ) {
@@ -128,14 +127,32 @@ fn build_winding_map(
     );
 }
 
-/// World-space directed segments of every scene triangle cut at [`SPLIT`],
+/// World-space directed segments of every room structure scene triangle cut at [`SPLIT`],
 /// or `None` if any mesh handle has not resolved yet.
+///
+/// Furniture/props inside the room that are not part of the structural walls/shell
+/// (e.g. crate, table, bench, pillar, stool) are excluded from the winding cut so that
+/// only the true building enclosure forms the winding containment boundaries.
 fn slice_scene(
     meshes: &Assets<Mesh>,
-    query: &Query<(&Mesh3d, &GlobalTransform), Without<HeightmapViewMesh>>,
+    query: &Query<(&Mesh3d, &GlobalTransform, Option<&Name>), Without<HeightmapViewMesh>>,
 ) -> Option<Vec<Segment>> {
     let mut segments = Vec::new();
-    for (handle, transform) in query {
+    for (handle, transform, name) in query {
+        if let Some(n) = name {
+            let s = n.as_str().to_lowercase();
+            // Exclude non-structural furniture / interior props
+            if s.contains("crate")
+                || s.contains("table")
+                || s.contains("bench")
+                || s.contains("pillar")
+                || s.contains("stool")
+                || s.contains("prop")
+                || s.contains("furniture")
+            {
+                continue;
+            }
+        }
         let mesh = meshes.get(handle)?;
         let Some(VertexAttributeValues::Float32x3(positions)) =
             mesh.attribute(Mesh::ATTRIBUTE_POSITION)
