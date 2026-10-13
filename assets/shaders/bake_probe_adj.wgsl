@@ -1,5 +1,5 @@
 #import s_rc::heightmap_trace::{
-    uniforms, heightmap, winding, is_solid, texel_at, probe_position, probe_visible, PROBES_PER_CELL
+    uniforms, heightmap, winding, is_solid, texel_at, probe_position, PROBES_PER_CELL
 }
 
 @group(1) @binding(0) var<storage, read_write> probe_adj_out: array<u32>;
@@ -11,15 +11,28 @@ const OFFSETS = array<vec2<i32>, 9>(
 );
 
 fn probe_to_probe_visible(p0: vec3<f32>, p1: vec3<f32>) -> bool {
-    let t0 = texel_at(p0.xz);
-    if is_solid(t0) {
-        return false;
+    let to_probe = p1 - p0;
+    let dist_xz = length(to_probe.xz);
+    if dist_xz <= 1e-4 {
+        return true;
     }
-    let h0 = textureLoad(heightmap, vec2<u32>(t0), 0).xy;
-    if p0.y <= h0.y || p0.y >= h0.x {
-        return false;
+    let steps = 6u;
+    for (var i = 0u; i <= steps; i = i + 1u) {
+        let t = f32(i) / f32(steps);
+        let sample_pos = p0 + to_probe * t;
+        let sample_texel = texel_at(sample_pos.xz);
+        if is_solid(sample_texel) {
+            return false;
+        }
+        let h = textureLoad(heightmap, vec2<u32>(sample_texel), 0).xy;
+        if h.y > uniforms.split - 9.0 && sample_pos.y < h.y - 0.25 {
+            return false;
+        }
+        if h.x < 5000.0 && sample_pos.y > h.x + 0.25 {
+            return false;
+        }
     }
-    return probe_visible(p0, vec3<f32>(0.0), p1);
+    return true;
 }
 
 fn bake_adj_for(c: u32, id: u32) {

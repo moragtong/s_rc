@@ -190,7 +190,8 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var n = 0u; n < 9u; n = n + 1u) {
             // Pre-baked probe-to-probe visibility test:
             // bit n is 1 if neighbor n is visible, 0 if occluded by a wall.
-            if ((adj_mask & (1u << n)) == 0u) {
+            // Center tap (n == 4u) is always visible to itself.
+            if n != 4u && ((adj_mask & (1u << n)) == 0u) {
                 continue;
             }
 
@@ -207,5 +208,9 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
             wsum += wn;
         }
     }
-    sh_probes_out[i] = vec4<f32>(acc / max(wsum, WEIGHT_EPS), 0.0);
+    if wsum <= WEIGHT_EPS {
+        sh_probes_out[i] = input_word(i);
+    } else {
+        sh_probes_out[i] = vec4<f32>(acc / wsum, 0.0);
+    }
 }

@@ -1,4 +1,3 @@
-use crate::bake_camera_readback::BakeCameraReadbackPlugin;
 use crate::cascades2_5d::Cascades2_5dPlugin;
 pub use crate::cascades2_5d::LOWPASS_BLUR_PASSES;
 mod bake_camera_readback;
@@ -27,7 +26,6 @@ use heightmap::{DEBUG_LAYER, HeightmapPlugin, LIGHT_LAYER, SCENE_LAYER};
 use heightmap_bake::HeightmapBakePlugin;
 use heightmap_view::HeightmapViewPlugin;
 use hi_z::{HiZ, HiZPlugin};
-use hi_z_debug::HiZDebugPlugin;
 
 fn main() {
     let measure_fps = std::env::var("S_RC_FPS").is_ok();
@@ -176,19 +174,23 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         RenderLayers::from_layers(&[SCENE_LAYER, LIGHT_LAYER]),
         sun_transform(),
     ));
-}
 
-fn setup_camera(mut commands: Commands) {
     let camera = commands
         .spawn((
             Camera3d::default(),
-            initial_camera_transform(),
-            FreeCamera::default(),
-            HiZ::default(),
-            RenderLayers::layer(SCENE_LAYER),
+            // The indirect pass adds linear light before tonemapping.
+            bevy::camera::Hdr,
+            Msaa::Off,
             DepthPrepass,
             NormalPrepass,
             DeferredPrepass,
+            HiZ::default(),
+            // The main camera sees the scene *and* the heightmap debug overlay;
+            // the bake cameras see only the scene.
+            RenderLayers::from_layers(&[SCENE_LAYER, DEBUG_LAYER, LIGHT_LAYER]),
+            FreeCamera::default(),
+            bevy::ui::IsDefaultUiCamera,
+            initial_camera_transform(),
         ))
         .id();
 

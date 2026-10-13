@@ -657,6 +657,9 @@ fn prepare_buffers(
                 .flat_map(|v| v.to_array())
                 .flat_map(f32::to_ne_bytes)
                 .collect();
+            let initial_adj: Vec<u8> = (0..probes.max(16))
+                .flat_map(|_| 0x1FFu32.to_ne_bytes())
+                .collect();
             let blend_uniform_buffers: [Buffer; MAX_BLUR_PASSES] = std::array::from_fn(|i| {
                 render_device.create_buffer(&BufferDescriptor {
                     label: Some(&format!("cascades_blend_uniforms_{i}")),
@@ -687,11 +690,10 @@ fn prepare_buffers(
                     probes * SH_STRIDE,
                     BufferUsages::STORAGE,
                 ),
-                render_device.create_buffer(&BufferDescriptor {
+                render_device.create_buffer_with_data(&BufferInitDescriptor {
                     label: Some("cascades_probe_adj"),
-                    size: (probes * 4).max(64),
+                    contents: &initial_adj,
                     usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
                 }),
                 render_device.create_buffer_with_data(&BufferInitDescriptor {
                     label: Some("cascades_subsamples"),
