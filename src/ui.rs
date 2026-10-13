@@ -6,17 +6,8 @@ pub struct UiPlugin;
 pub struct LightingState {
     pub indirect_enabled: bool,
     pub probes_enabled: bool,
-    pub trilinear_enabled: bool,
-    pub bilateral_enabled: bool,
     pub normal_bias_enabled: bool,
-    pub bsp_recon_enabled: bool,
-    pub gtao_ssgi_enabled: bool,
-    pub two_closest_layers: bool,
-    // Bevy's built-in SSAO (the XeGTAO-derivative VBAO), applied to the
-    // *isolated indirect term* in the composite pass (see AGENTS.md). Flipping
-    // this off stops the multiply but leaves the component on the camera, so
-    // Bevy's AO compute keeps running each frame; `S_RC_SSAO=0` removes the
-    // component at startup, which also saves that cost.
+    pub use_vis_mask: bool,
     pub bevy_ssao_enabled: bool,
 }
 
@@ -25,58 +16,10 @@ impl Default for LightingState {
         Self {
             indirect_enabled: true,
             probes_enabled: false,
-            trilinear_enabled: true,
-            bilateral_enabled: false,
-            // On: the fetch is pushed along the normal into the cell in front
-            // of the surface and `probe_visible` is skipped (the normal bias is
-            // meant to replace the trace, see `mytodo.md` section 4.3). Off:
-            // the probe grid is read at the shading point and `probe_visible`
-            // does the occlusion rejection. The two are alternatives, hence the
-            // toggle.
             normal_bias_enabled: true,
-            // Off: the trilinear gather reconstructs with smootherstep-weighted
-            // bilinear (a 2x2 read per layer, C^0 across cell boundaries). On:
-            // reconstruct with the cubic B-spline basis (a 4x4 read per layer),
-            // giving the C^2 field the `blend_sh` B-spline pre-filter's control
-            // coefficients describe. Expensive (4x the shade taps), so opt-in.
-            bsp_recon_enabled: false,
-            // Off: the shade gathers the world cascade probes and adds them.
-            // On (G): a GTAO horizon-slice screen-space pass (EarlyPostProcess,
-            // before shade) computes the indirect irradiance per pixel instead,
-            // falling back to the world probe field per direction where the
-            // screen cannot answer. Supersedes the world gather for the whole
-            // term when on.
-            gtao_ssgi_enabled: false,
-            two_closest_layers: true,
+            use_vis_mask: true,
             bevy_ssao_enabled: true,
         }
-    }
-}
-
-#[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
-pub struct ParallaxState {
-    pub enabled: bool,
-}
-
-impl Default for ParallaxState {
-    // Off since the two-layer probe model: the endpoint parallax the toggle
-    // switches was a correction for single-layer mid-room probes, and the
-    // layers removed the need for it. Kept so the old behaviour can be A/B'd.
-    fn default() -> Self {
-        Self { enabled: false }
-    }
-}
-
-#[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
-pub struct CrossLayerState {
-    pub enabled: bool,
-}
-
-impl Default for CrossLayerState {
-    // Off: merges are per-layer. When on, each cascade child merges into the
-    // other layer's parents (floor child -> ceiling parents and vice versa).
-    fn default() -> Self {
-        Self { enabled: false }
     }
 }
 
@@ -106,31 +49,18 @@ pub enum Action {
     ToggleHeightmap,
     ToggleIndirect,
     ToggleProbes,
-    ToggleParallax,
-    ToggleTrilinear,
-    ToggleCrossLayer,
-    ToggleBilateral,
+    ToggleVisMask,
     ToggleNormalBias,
     ToggleLowPass,
-    ToggleBspRecon,
-    ToggleTwoClosestLayers,
     ToggleSsoA,
 }
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LightingState>()
-            .init_resource::<ParallaxState>()
-            .init_resource::<CrossLayerState>()
             .init_resource::<BlendToggleState>()
             .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
                 LightingState,
-            >::default())
-            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
-                ParallaxState,
-            >::default())
-            .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
-                CrossLayerState,
             >::default())
             .add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<
                 BlendToggleState,
@@ -158,7 +88,7 @@ fn setup_ui(mut commands: Commands) {
             top: Val::Px(10.0),
             left: Val::Px(10.0),
             flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(10.0),
+            row_gap: Val::Px(8.0),
             ..default()
         },))
         .with_children(|parent| {
@@ -215,10 +145,10 @@ fn setup_ui(mut commands: Commands) {
                         ..default()
                     },
                     BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
-                    ActionButton(Action::ToggleParallax),
+                    ActionButton(Action::ToggleVisMask),
                 ))
                 .with_child((
-                    Text::new("Parallax Endpoint (O)"),
+                    Text::new("Probe Visibility Mask (T)"),
                     TextColor(Color::WHITE),
                 ));
             parent
@@ -231,54 +161,6 @@ fn setup_ui(mut commands: Commands) {
                         ..default()
                     },
                     BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
-                    ActionButton(Action::ToggleTrilinear),
-                ))
-                .with_child((
-                    Text::new("Hybrid Probe Blend (T)"),
-                    TextColor(Color::WHITE),
-                ));
-            parent
-                .spawn((
-                    Button,
-                    Node {
-                        padding: UiRect::all(Val::Px(10.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
-                    ActionButton(Action::ToggleCrossLayer),
-                ))
-                .with_child((
-                    Text::new("Cross-Layer Merge (L)"),
-                    TextColor(Color::WHITE),
-                ));
-            parent
-                .spawn((
-                    Button,
-                    Node {
-                        padding: UiRect::all(Val::Px(10.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
-                    ActionButton(Action::ToggleBilateral),
-                ))
-                .with_child((
-                    Text::new("Bilateral Filter (B)"),
-                    TextColor(Color::WHITE),
-                ));
-            parent
-                .spawn((
-                    Button,
-                    Node {
-                        padding: UiRect::all(Val::Px(10.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleNormalBias),
                 ))
                 .with_child((
@@ -294,7 +176,7 @@ fn setup_ui(mut commands: Commands) {
                         align_items: AlignItems::Center,
                         ..default()
                     },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                    BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
                     ActionButton(Action::ToggleLowPass),
                 ))
                 .with_child((
@@ -310,39 +192,7 @@ fn setup_ui(mut commands: Commands) {
                         align_items: AlignItems::Center,
                         ..default()
                     },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
-                    ActionButton(Action::ToggleBspRecon),
-                ))
-                .with_child((
-                    Text::new("Cubic B-Spline Recon (C)"),
-                    TextColor(Color::WHITE),
-                ));
-            parent
-                .spawn((
-                    Button,
-                    Node {
-                        padding: UiRect::all(Val::Px(10.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
                     BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
-                    ActionButton(Action::ToggleTwoClosestLayers),
-                ))
-                .with_child((
-                    Text::new("Two Closest Layers (V)"),
-                    TextColor(Color::WHITE),
-                ));
-            parent
-                .spawn((
-                    Button,
-                    Node {
-                        padding: UiRect::all(Val::Px(10.0)),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
                     ActionButton(Action::ToggleSsoA),
                 ))
                 .with_child((Text::new("Bevy SSAO (U)"), TextColor(Color::WHITE)));
@@ -357,21 +207,14 @@ fn button_system(
     keys: Res<ButtonInput<KeyCode>>,
     mut heightmap_query: Query<&mut Visibility, With<crate::heightmap_view::HeightmapViewMesh>>,
     mut lighting_state: ResMut<LightingState>,
-    mut parallax_state: ResMut<ParallaxState>,
-    mut cross_layer_state: ResMut<CrossLayerState>,
     mut blend_toggle: ResMut<BlendToggleState>,
 ) {
     let mut toggle_h = keys.just_pressed(KeyCode::KeyM);
     let mut toggle_i = keys.just_pressed(KeyCode::KeyI);
     let mut toggle_p = keys.just_pressed(KeyCode::KeyP);
-    let mut toggle_par = keys.just_pressed(KeyCode::KeyO);
-    let mut toggle_tri = keys.just_pressed(KeyCode::KeyT);
-    let mut toggle_cross = keys.just_pressed(KeyCode::KeyL);
-    let mut toggle_bi = keys.just_pressed(KeyCode::KeyB);
+    let mut toggle_vis = keys.just_pressed(KeyCode::KeyT);
     let mut toggle_bias = keys.just_pressed(KeyCode::KeyN);
     let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
-    let mut toggle_bsp = keys.just_pressed(KeyCode::KeyC);
-    let mut toggle_two = keys.just_pressed(KeyCode::KeyV);
     let mut toggle_ssao = keys.just_pressed(KeyCode::KeyU);
 
     for (interaction, mut color, action) in &mut interaction_query {
@@ -382,14 +225,9 @@ fn button_system(
                     Action::ToggleHeightmap => toggle_h = true,
                     Action::ToggleIndirect => toggle_i = true,
                     Action::ToggleProbes => toggle_p = true,
-                    Action::ToggleParallax => toggle_par = true,
-                    Action::ToggleTrilinear => toggle_tri = true,
-                    Action::ToggleCrossLayer => toggle_cross = true,
-                    Action::ToggleBilateral => toggle_bi = true,
+                    Action::ToggleVisMask => toggle_vis = true,
                     Action::ToggleNormalBias => toggle_bias = true,
                     Action::ToggleLowPass => toggle_lp = true,
-                    Action::ToggleBspRecon => toggle_bsp = true,
-                    Action::ToggleTwoClosestLayers => toggle_two = true,
                     Action::ToggleSsoA => toggle_ssao = true,
                 }
             }
@@ -420,31 +258,16 @@ fn button_system(
         lighting_state.probes_enabled = !lighting_state.probes_enabled;
     }
 
-    if toggle_par {
-        parallax_state.enabled = !parallax_state.enabled;
-        bevy::log::info!("Parallax endpoint: {}", parallax_state.enabled);
-    }
-
-    if toggle_tri {
-        lighting_state.trilinear_enabled = !lighting_state.trilinear_enabled;
-        bevy::log::info!("Hybrid probe blend: {}", lighting_state.trilinear_enabled);
-    }
-
-    if toggle_cross {
-        cross_layer_state.enabled = !cross_layer_state.enabled;
+    if toggle_vis {
+        lighting_state.use_vis_mask = !lighting_state.use_vis_mask;
         bevy::log::info!(
-            "Cross-layer merge: {}",
-            if cross_layer_state.enabled {
-                "on (the other layer's parents)"
+            "Visibility test mode: {}",
+            if lighting_state.use_vis_mask {
+                "probe_is_visible (precalculated texture mask)"
             } else {
-                "off (per-layer)"
+                "probe_visible (per-tap ray trace)"
             }
         );
-    }
-
-    if toggle_bi {
-        lighting_state.bilateral_enabled = !lighting_state.bilateral_enabled;
-        bevy::log::info!("Bilateral filter: {}", lighting_state.bilateral_enabled);
     }
 
     if toggle_bias {
@@ -457,19 +280,6 @@ fn button_system(
         bevy::log::info!("Low-pass filter: {}", blend_toggle.lowpass);
     }
 
-    if toggle_bsp {
-        lighting_state.bsp_recon_enabled = !lighting_state.bsp_recon_enabled;
-        bevy::log::info!(
-            "Cubic B-spline reconstruction: {}",
-            lighting_state.bsp_recon_enabled
-        );
-    }
-
-    if toggle_two {
-        lighting_state.two_closest_layers = !lighting_state.two_closest_layers;
-        bevy::log::info!("Two Closest Layers: {}", lighting_state.two_closest_layers);
-    }
-
     if toggle_ssao {
         lighting_state.bevy_ssao_enabled = !lighting_state.bevy_ssao_enabled;
         bevy::log::info!("Bevy SSAO: {}", lighting_state.bevy_ssao_enabled);
@@ -479,22 +289,8 @@ fn button_system(
     // enabled, dark grey while it is disabled.
     for (_interaction, mut color, action) in &mut interaction_query {
         match action.0 {
-            Action::ToggleParallax => {
-                *color = BackgroundColor(if parallax_state.enabled {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            Action::ToggleTrilinear => {
-                *color = BackgroundColor(if lighting_state.trilinear_enabled {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            Action::ToggleBilateral => {
-                *color = BackgroundColor(if lighting_state.bilateral_enabled {
+            Action::ToggleVisMask => {
+                *color = BackgroundColor(if lighting_state.use_vis_mask {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)
@@ -507,29 +303,8 @@ fn button_system(
                     Color::srgb(0.15, 0.15, 0.15)
                 });
             }
-            Action::ToggleCrossLayer => {
-                *color = BackgroundColor(if cross_layer_state.enabled {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
             Action::ToggleLowPass => {
                 *color = BackgroundColor(if blend_toggle.lowpass {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            Action::ToggleBspRecon => {
-                *color = BackgroundColor(if lighting_state.bsp_recon_enabled {
-                    Color::srgb(0.35, 0.75, 0.35)
-                } else {
-                    Color::srgb(0.15, 0.15, 0.15)
-                });
-            }
-            Action::ToggleTwoClosestLayers => {
-                *color = BackgroundColor(if lighting_state.two_closest_layers {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)

@@ -22,7 +22,6 @@ use bevy::{
 };
 
 use crate::cascades2_5d::{CascadesRenderData, common_layout};
-use crate::gtao_ssgi::{GTAO_STRIDE, GtaoRenderData};
 use crate::ui::LightingState;
 
 const SHADER_PATH: &str = "shaders/shade_cascades.wgsl";
@@ -34,13 +33,9 @@ struct ShadeUniforms {
     view_from_clip: Mat4,
     world_from_view: Mat4,
     indirect_enabled: u32,
-    trilinear_enabled: u32,
-    bilateral_enabled: u32,
     normal_bias_enabled: u32,
-    bsp_recon_enabled: u32,
-    gtao_enabled: u32,
-    gtao_stride: u32,
-    two_closest_layers: u32,
+    use_vis_mask: u32,
+    pad: u32,
 }
 
 /// The composite half of the shade split: writes the indirect term (times the
@@ -163,8 +158,6 @@ fn init_shade_pipeline(
                     // The blended probe set; `blend_sh` writes it every frame.
                     storage_buffer_read_only::<Vec4>(false),
                     uniform_buffer::<ShadeUniforms>(false),
-                    // GTAO-SSGI per-pixel irradiance; read only when enabled.
-                    storage_buffer_read_only::<Vec4>(false),
                 ),
             ),
         ),
@@ -201,7 +194,6 @@ fn draw_shade(
         Option<&bevy::pbr::ScreenSpaceAmbientOcclusionResources>,
     )>,
     lighting_state: Res<LightingState>,
-    bake: Res<crate::heightmap_bake::BakeState>,
     pipeline: Res<ShadePipeline>,
     mut pipelines: ResMut<SpecializedRenderPipelines<ShadePipeline>>,
     composite: Res<CompositePipeline>,
@@ -212,7 +204,6 @@ fn draw_shade(
     mut texture_cache: ResMut<TextureCache>,
     fallback: Res<bevy::render::texture::FallbackImage>,
     render_data: Option<Res<CascadesRenderData>>,
-    gtao: Option<Res<GtaoRenderData>>,
     mut ctx: RenderContext,
 ) {
     // Probe display moved out to `probe_overlay` (instanced spheres); this
@@ -222,9 +213,6 @@ fn draw_shade(
         return;
     }
     let Some(render_data) = render_data else {
-        return;
-    };
-    let Some(gtao) = gtao else {
         return;
     };
     let (view_target, extracted_view, prepass, ssao_resources) = view.into_inner();
@@ -239,13 +227,9 @@ fn draw_shade(
         view_from_clip: extracted_view.clip_from_view.inverse(),
         world_from_view: extracted_view.world_from_view.to_matrix(),
         indirect_enabled: lighting_state.indirect_enabled as u32,
-        trilinear_enabled: lighting_state.trilinear_enabled as u32,
-        bilateral_enabled: lighting_state.bilateral_enabled as u32,
         normal_bias_enabled: lighting_state.normal_bias_enabled as u32,
-        bsp_recon_enabled: lighting_state.bsp_recon_enabled as u32,
-        gtao_enabled: (lighting_state.gtao_ssgi_enabled && bake.is_verified()) as u32,
-        gtao_stride: GTAO_STRIDE,
-        two_closest_layers: lighting_state.two_closest_layers as u32,
+        use_vis_mask: lighting_state.use_vis_mask as u32,
+        pad: 0,
     });
     uniforms.write_buffer(&render_device, &render_queue);
 
@@ -287,7 +271,6 @@ fn draw_shade(
             &gbuffer.texture.default_view,
             render_data.sh_probes_blend_buffer.as_entire_binding(),
             uniforms.binding().unwrap(),
-            gtao.buffer.as_entire_binding(),
         )),
     );
 

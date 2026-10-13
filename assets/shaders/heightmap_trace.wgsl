@@ -40,21 +40,6 @@ struct Uniforms {
     // the same bilinear merge as surface radiance, no special casing.
     sky_color: vec4<f32>,
     cascades: array<CascadeInfo, 4>,
-    // 1 to end a child trace's segments at the nearest projected parent hit,
-    // 0 to hand over to the old `q + d * parent.interval` endpoint. Only the
-    // segment ends move; everything else in the parent/grid plumbing is the
-    // same either way.
-    parallax_endpoint: u32,
-    parallax_pad: u32,
-    // 1 to merge each child cascade into the *other* probe layer's parents
-    // instead of its own (floor child -> ceiling parents and vice versa), 0
-    // for the default per-layer merge. The crossing happens once per child:
-    // a child merges into the other layer's parents, and those parents then
-    // merge as their own layer does - the layer never oscillates up the
-    // chain. Read at march time, so toggling it re-runs the ray march along
-    // with `parallax_endpoint`.
-    cross_layer: u32,
-    cross_layer_pad: u32,
 }
 
 // x: ceiling (lowest surface above the split), y: floor (highest below).
@@ -460,7 +445,7 @@ fn nudge_out_of_solid(center: vec2<f32>, r: f32) -> Nudge {
 // child onto the other layer's parents instead; the crossing applies once per
 // child, so the crossed parents merge as their own layer does.
 fn parent_layer(layer: u32) -> u32 {
-    return select(layer, 1u - layer, uniforms.cross_layer != 0u);
+    return layer;
 }
 
 // One of the segments `march_hits.wgsl` stored for a ray: where it started and

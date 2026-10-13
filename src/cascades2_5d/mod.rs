@@ -37,8 +37,6 @@ use bevy::{
 use crate::heightmap::Heightmap;
 use crate::heightmap_bake::BakeState;
 use crate::ui::BlendToggleState;
-use crate::ui::CrossLayerState;
-use crate::ui::ParallaxState;
 
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
 const LIGHT_SHADER_PATH: &str = "shaders/surface_light.wgsl";
@@ -160,10 +158,6 @@ pub struct CascadesUniforms {
     pub sun_irradiance: Vec3,
     pub sky_color: Vec4,
     pub cascades: [CascadeInfoUniform; layout::CASCADES as usize],
-    pub parallax_endpoint: u32,
-    pub parallax_pad: u32,
-    pub cross_layer: u32,
-    pub cross_layer_pad: u32,
 }
 
 #[derive(Resource)]
@@ -517,8 +511,6 @@ fn prepare_buffers(
     bake: Option<Res<BakeState>>,
     existing: Option<Res<CascadesRenderData>>,
     gpu_images: Res<RenderAssets<GpuImage>>,
-    parallax: Res<ParallaxState>,
-    cross_layer: Res<CrossLayerState>,
 ) {
     let Some(heightmap) = heightmap else {
         return;
@@ -576,10 +568,6 @@ fn prepare_buffers(
         sun_irradiance: sun.irradiance,
         sky_color,
         cascades,
-        parallax_endpoint: parallax.enabled as u32,
-        parallax_pad: 0,
-        cross_layer: cross_layer.enabled as u32,
-        cross_layer_pad: 0,
     };
     let mut bytes = encase::UniformBuffer::new(Vec::new());
     bytes.write(&uniforms).unwrap();
@@ -852,13 +840,7 @@ fn dispatch_cascades(
     mut render_context: RenderContext,
     mut frame: Local<u32>,
     mut marched: Local<bool>,
-    // The one-shot march records what toggles it ran under; changing either
-    // silently invalidates the hit/march cache, so record both together and
-    // send the march back through when they differ from the uniforms.
-    mut marched_toggles: Local<Option<(bool, bool)>>,
     mut bakes_done: Local<(bool, bool)>,
-    parallax: Res<ParallaxState>,
-    cross_layer: Res<CrossLayerState>,
     blend_toggle: Res<BlendToggleState>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
@@ -907,11 +889,6 @@ fn dispatch_cascades(
     // to retry rewrites the heightmap underneath it, so an unverified map
     // invalidates the stored hits and sends the march back through.
     let verified = bake.as_ref().is_some_and(|b| b.is_verified());
-    let toggles = (parallax.enabled, cross_layer.enabled);
-    if *marched_toggles != Some(toggles) {
-        *marched = false;
-        *marched_toggles = Some(toggles);
-    }
     let need_march = !*marched;
     if need_march && !verified {
         return;

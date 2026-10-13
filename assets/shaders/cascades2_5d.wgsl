@@ -177,30 +177,7 @@ fn cascade(c: u32, id: u32) {
         // `cross_layer` is on.
         let q = probe_position(c + 1u, qi, parent_layer(layer));
 
-        // Same endpoint the march traced: the nearest of the parent's hits
-        // projected onto this ray, falling back to the parent's ray start when
-        // it has none in this direction - which is the case the march stored a
-        // miss for.
-        var end = q + d * parent.interval.x;
-        // Endpoint parallax is off (see `parallax_endpoint`): the old handoff
-        // above stands. Turning the uniform on again computes the parent's hit
-        // candidates and ends the segment where they project onto this ray.
-        var n_dirs = 0u;
-        var nearest = -1.0;
-        if uniforms.parallax_endpoint != 0u {
-            let dirs = parent_dir_hits(c + 1u, qi, ray_cell, p, d, info.interval.x, parent_layer(layer));
-            for (var j = 0u; j < 4u; j++) {
-                if dirs[j].x >= 0.0 {
-                    n_dirs += 1u;
-                    if nearest < 0.0 || dirs[j].x < nearest {
-                        nearest = dirs[j].x;
-                    }
-                }
-            }
-            if n_dirs > 0u {
-                end = p + d * nearest;
-            }
-        }
+        let end = q + d * parent.interval.x;
         let seg = end - a;
         let len = length(seg);
         // Too short to have been traced: the march stored a miss, so this

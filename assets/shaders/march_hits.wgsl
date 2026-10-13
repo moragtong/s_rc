@@ -143,30 +143,7 @@ fn march(c: u32, id: u32) {
             clamp(cell + vec2<i32>(corner), vec2<i32>(0), vec2<i32>(parent.size) - 1),
         );
         let q = probe_position(c + 1u, qi, parent_layer(layer));
-        var end = q + d * parent.interval.x;
-        // Endpoint parallax is off (see `parallax_endpoint`): the old handoff
-        // above stands. Turning the uniform on again computes the parent's hit
-        // candidates and ends the segment where they project onto this ray.
-        var nearest = -1.0;
-        if uniforms.parallax_endpoint != 0u {
-            let dirs = parent_dir_hits(
-                c + 1u,
-                qi,
-                ray_cell,
-                p,
-                d,
-                info.interval.x,
-                parent_layer(layer),
-            );
-            for (var j = 0u; j < 4u; j++) {
-                if dirs[j].x >= 0.0 && (nearest < 0.0 || dirs[j].x < nearest) {
-                    nearest = dirs[j].x;
-                }
-            }
-            if nearest >= 0.0 {
-                end = p + d * nearest;
-            }
-        }
+        let end = q + d * parent.interval.x;
         let seg = end - a;
         let len = length(seg);
         if len <= 1e-5 {

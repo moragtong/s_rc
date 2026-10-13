@@ -32,7 +32,6 @@ fn take_screenshot(
     mut commands: Commands,
     mut frames: Local<u32>,
     mut lighting: ResMut<crate::ui::LightingState>,
-    mut cross_layer: ResMut<crate::ui::CrossLayerState>,
     mut blend_toggle: ResMut<crate::ui::BlendToggleState>,
     mut overlay: Query<&mut Visibility, With<crate::heightmap_view::HeightmapViewMesh>>,
     mut exit: MessageWriter<AppExit>,
@@ -41,13 +40,9 @@ fn take_screenshot(
     if *frames == 2 {
         lighting.indirect_enabled = std::env::var("S_RC_INDIRECT").as_deref() != Ok("0");
         lighting.probes_enabled = std::env::var("S_RC_PROBES").as_deref() == Ok("1");
-        lighting.trilinear_enabled = std::env::var("S_RC_TRILINEAR").as_deref() != Ok("0");
-        lighting.bilateral_enabled = std::env::var("S_RC_BILATERAL").as_deref() == Ok("1");
         lighting.normal_bias_enabled = std::env::var("S_RC_NORMAL_BIAS").as_deref() != Ok("0");
-        cross_layer.enabled = std::env::var("S_RC_CROSS_LAYER").as_deref() == Ok("1");
+        lighting.use_vis_mask = std::env::var("S_RC_VIS_MASK").as_deref() != Ok("0");
         blend_toggle.lowpass = std::env::var("S_RC_LOWPASS").as_deref() != Ok("0");
-        lighting.bsp_recon_enabled = std::env::var("S_RC_BSPLINE_RECON").as_deref() == Ok("1");
-        lighting.gtao_ssgi_enabled = std::env::var("S_RC_GTAO_SSGI").as_deref() == Ok("1");
         lighting.bevy_ssao_enabled = std::env::var("S_RC_SSAO").as_deref() != Ok("0");
         // S_RC_DIRECT_ONLY=1 disables indirect lighting
         if std::env::var("S_RC_DIRECT_ONLY").as_deref() == Ok("1") {
