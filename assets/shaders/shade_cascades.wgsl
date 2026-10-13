@@ -321,8 +321,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // Raw in-cell fraction for the cubic B-spline reconstruction; the bilinear
     // shapes smooth it (below) so their tent hits zero slope at the cell edge.
     let ft = gu - vec2<f32>(cell);
-    var frac = gu - vec2<f32>(cell);
-    frac = frac * frac * frac * (frac * (frac * 6.0 - 15.0) + 10.0);
+    let frac = gu - vec2<f32>(cell);
     let vis_mask = probe_visibility_mask(p, n);
     var e = vec3<f32>(0.0);
     if view_info.bilateral_enabled != 0u {
