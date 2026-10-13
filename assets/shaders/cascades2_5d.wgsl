@@ -10,23 +10,21 @@
 // schedule.
 
 #import s_rc::heightmap_trace::{
-    uniforms, probe_position, cell_direction, stored_segment, parent_layer, MISS, PROBES_PER_CELL,
+    uniforms, probe_position, cell_direction, stored_segment, parent_layer, MISS, PROBES_PER_CELL, PI,
 }
 
-@group(1) @binding(0) var radiance_min: texture_2d<f32>;
-@group(1) @binding(1) var radiance_max: texture_2d<f32>;
+@group(1) @binding(0) var normal_min: texture_2d<f32>;
+@group(1) @binding(1) var normal_max: texture_2d<f32>;
+@group(1) @binding(2) var albedo_min: texture_2d<f32>;
+@group(1) @binding(3) var albedo_max: texture_2d<f32>;
 // Per ray: rgb = radiance, a = distance from the probe to where it came
 // from (MISS if nothing was hit).
-@group(1) @binding(2) var<storage, read_write> rays: array<vec4<f32>>;
-// Per ray: texel, ceiling flag and distance, as recorded by the one-shot
-// march. Read-only — nothing here writes geometry back.
-@group(1) @binding(3) var<storage, read> hits: array<vec4<u32>>;
+@group(1) @binding(4) var<storage, read_write> rays: array<vec4<f32>>;
+// Per ray: texel, ceiling flag, cached horizon angles, and distance, as recorded by march_hits.
+@group(1) @binding(5) var<storage, read> hits: array<vec4<u32>>;
 
 const HITS_PER_RAY: u32 = 4u;
 
-// A stored hit, left exactly as the march wrote it: (texel.x, texel.y,
-// ceiling, t). naga will not build a `Hit` literal out of an imported type,
-// so the encoding stays packed and is unpacked field by field instead.
 fn hit_at(base: u32, slot: u32) -> vec4<u32> {
     return hits[base * HITS_PER_RAY + slot];
 }
@@ -35,12 +33,63 @@ fn hit_t(e: vec4<u32>) -> f32 {
     return bitcast<f32>(e.w);
 }
 
+// Evaluates surface radiance on-the-fly from albedo, normal, and the cached
+// Aaltonen / Quilez directional horizon profile stored in the hit:
 fn surface_radiance(e: vec4<u32>) -> vec3<f32> {
     let texel = vec2<i32>(e.xy);
-    if e.z != 0u {
-        return textureLoad(radiance_min, texel, 0).rgb;
+    let is_ceiling = (e.z & 1u) != 0u;
+
+    let n = select(
+        textureLoad(normal_max, texel, 0).xyz,
+        textureLoad(normal_min, texel, 0).xyz,
+        is_ceiling,
+    );
+    if dot(n, n) <= 0.01 {
+        return vec3<f32>(0.0);
     }
-    return textureLoad(radiance_max, texel, 0).rgb;
+    let n_unit = normalize(n);
+    let cos_l = dot(n_unit, uniforms.sun_toward);
+    if cos_l <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+
+    let albedo = select(
+        textureLoad(albedo_max, texel, 0).rgb,
+        textureLoad(albedo_min, texel, 0).rgb,
+        is_ceiling,
+    );
+
+    // Unpack cached directional horizons (+X, -X, +Z, -Z):
+    let packed_h = e.z >> 1u;
+    let h_px = f32(packed_h & 255u) / 255.0 * (PI * 0.5);
+    let h_nx = f32((packed_h >> 8u) & 255u) / 255.0 * (PI * 0.5);
+    let h_pz = f32((packed_h >> 16u) & 255u) / 255.0 * (PI * 0.5);
+    let h_nz = f32((packed_h >> 24u) & 255u) / 255.0 * (PI * 0.5);
+
+    // Interpolate horizon elevation along the sun azimuth:
+    let sun_xz = uniforms.sun_toward.xz;
+    let len_xz = length(sun_xz);
+    var horizon_elev = 0.0;
+    if len_xz > 1e-4 {
+        let dir_xz = sun_xz / len_xz;
+        let wx = abs(dir_xz.x);
+        let wz = abs(dir_xz.y);
+        let hx = select(h_nx, h_px, dir_xz.x >= 0.0);
+        let hz = select(h_nz, h_pz, dir_xz.y >= 0.0);
+        horizon_elev = (wx * hx + wz * hz) / max(wx + wz, 1e-4);
+    }
+
+    // Sun elevation angle above horizontal plane:
+    let sun_elev = asin(clamp(uniforms.sun_toward.y, -1.0, 1.0));
+
+    // Aaltonen soft shadow penumbra factor from angular horizon clearance:
+    // delta_angle in radians; theta_sun = 0.27 deg (~0.0047 rad)
+    let theta_sun = max(1.0 / uniforms.sun_k, 0.002);
+    let delta = sun_elev - horizon_elev;
+    let res = clamp((delta + theta_sun) / (2.0 * theta_sun), 0.0, 1.0);
+    let vis = res * res * (3.0 - 2.0 * res);
+
+    return albedo / PI * uniforms.sun_irradiance * cos_l * vis;
 }
 
 // Distance along this ray at which the parent probe's nearest stored surface

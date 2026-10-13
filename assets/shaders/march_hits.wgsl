@@ -8,8 +8,9 @@
 
 #import s_rc::heightmap_trace::{
     uniforms, trace, Hit, probe_position, cell_direction, stored_segment, parent_layer, MISS,
-    PROBES_PER_CELL,
+    PROBES_PER_CELL, cell_size, aaltonen_horizon, floor_normal, ceiling_normal,
 }
+
 
 // Per ray: the top cascade's own trace, or the four bilinear-parent segments
 // the cascades below it trace instead. The two are mutually exclusive, so four
@@ -20,13 +21,35 @@ const HITS_PER_RAY: u32 = 4u;
 
 // texel.x, texel.y, ceiling (0 or 1), and the distance bitcast to u32. MISS
 // keeps its own bits, so a slot that was never traced reads back as a miss.
-fn store(base: u32, slot: u32, hit: Hit) {
+fn store(base: u32, slot: u32, hit: Hit, ray_origin: vec3<f32>, ray_dir: vec3<f32>) {
     var e = vec4<u32>(0u, 0u, 0u, bitcast<u32>(MISS));
     if hit.t != MISS {
+        let hit_pos = ray_origin + ray_dir * hit.t;
+        let n = select(
+            textureLoad(floor_normal, vec2<u32>(hit.texel), 0).xyz,
+            textureLoad(ceiling_normal, vec2<u32>(hit.texel), 0).xyz,
+            hit.ceiling,
+        );
+        let n_unit = select(vec3<f32>(0.0, 1.0, 0.0), normalize(n), dot(n, n) > 0.01);
+        let start = hit_pos + n_unit * 0.04;
+
+        // Measure horizon angles along +X, -X, +Z, -Z using Aaltonen / Quilez marcher
+        let h_px = aaltonen_horizon(start, n_unit, vec3<f32>(1.0, 0.0, 0.0));
+        let h_nx = aaltonen_horizon(start, n_unit, vec3<f32>(-1.0, 0.0, 0.0));
+        let h_pz = aaltonen_horizon(start, n_unit, vec3<f32>(0.0, 0.0, 1.0));
+        let h_nz = aaltonen_horizon(start, n_unit, vec3<f32>(0.0, 0.0, -1.0));
+
+        let u_px = u32(clamp(h_px / (3.14159265 * 0.5) * 255.0, 0.0, 255.0));
+        let u_nx = u32(clamp(h_nx / (3.14159265 * 0.5) * 255.0, 0.0, 255.0));
+        let u_pz = u32(clamp(h_pz / (3.14159265 * 0.5) * 255.0, 0.0, 255.0));
+        let u_nz = u32(clamp(h_nz / (3.14159265 * 0.5) * 255.0, 0.0, 255.0));
+
+        let packed_horizons = u_px | (u_nx << 8u) | (u_pz << 16u) | (u_nz << 24u);
+
         e = vec4<u32>(
             u32(hit.texel.x),
             u32(hit.texel.y),
-            select(0u, 1u, hit.ceiling),
+            (select(0u, 1u, hit.ceiling) & 1u) | (packed_horizons << 1u),
             bitcast<u32>(hit.t),
         );
     }
@@ -120,7 +143,7 @@ fn march(c: u32, id: u32) {
     let base = info.ray_base + id;
 
     if c + 1u >= uniforms.cascade_count {
-        store(base, 0u, trace(p, d, info.interval.x, info.interval.y));
+        store(base, 0u, trace(p, d, info.interval.x, info.interval.y), p, d);
         return;
     }
 
@@ -175,7 +198,7 @@ fn march(c: u32, id: u32) {
             store_miss(base, k);
             continue;
         }
-        store(base, k, trace(a, seg / len, 0.0, len));
+        store(base, k, trace(a, seg / len, 0.0, len), a, seg / len);
     }
 }
 
