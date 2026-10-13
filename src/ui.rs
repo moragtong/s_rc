@@ -1,7 +1,8 @@
 use std::sync::atomic::Ordering;
 use bevy::prelude::*;
 use crate::cascades2_5d::{
-    CROSS_LAYER_RADIUS_TENTHS, LOWPASS_BLUR_PASSES, MAX_BLUR_PASSES, MAX_CROSS_LAYER_TENTHS,
+    BOUNCE_COUNT, CROSS_LAYER_RADIUS_TENTHS, LOWPASS_BLUR_PASSES, MAX_BLUR_PASSES,
+    MAX_BOUNCE_COUNT, MAX_CROSS_LAYER_TENTHS,
 };
 
 /// Shading pass configuration, extracted to the render app.
@@ -45,14 +46,17 @@ pub struct BlendToggleState {
     pub blur_passes: u32,
     /// Vertical cross-layer blur radius in meters.
     pub cross_layer_radius: f32,
+    /// Number of diffuse bounces (1 to 4).
+    pub bounces: u32,
 }
 
 impl Default for BlendToggleState {
     fn default() -> Self {
         Self {
             lowpass: true,
-            blur_passes: 40,
-            cross_layer_radius: 4.0,
+            blur_passes: 30,
+            cross_layer_radius: 2.0,
+            bounces: 2,
         }
     }
 }
@@ -97,6 +101,18 @@ pub struct CrossLayerFill;
 
 #[derive(Component)]
 pub struct CrossLayerStepButton(pub i32);
+
+#[derive(Component)]
+pub struct BouncesLabel;
+
+#[derive(Component)]
+pub struct BouncesTrack;
+
+#[derive(Component)]
+pub struct BouncesFill;
+
+#[derive(Component)]
+pub struct BouncesStepButton(pub i32);
 
 pub struct UiPlugin;
 
@@ -263,7 +279,7 @@ fn setup_ui(mut commands: Commands) {
             FpsCounter,
         ));
 
-    // Bottom-right corner: Dual sliders panel (Blur Passes & Cross-Layer Radius)
+    // Bottom-right corner: Controls panel (Blur Passes, Cross-Layer Radius, Bounces)
     let initial_passes = LOWPASS_BLUR_PASSES
         .load(Ordering::Relaxed)
         .clamp(1, MAX_BLUR_PASSES as u32);
@@ -277,6 +293,13 @@ fn setup_ui(mut commands: Commands) {
     let radius_pct = (initial_radius_tenths as f32 / MAX_CROSS_LAYER_TENTHS as f32) * 100.0;
     let radius_m = initial_radius_tenths as f32 / 10.0;
 
+    let initial_bounces = BOUNCE_COUNT
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_BOUNCE_COUNT);
+    let bounces_pct = (initial_bounces.saturating_sub(1)) as f32
+        / (MAX_BOUNCE_COUNT - 1) as f32
+        * 100.0;
+
     commands
         .spawn((
             Node {
@@ -284,7 +307,7 @@ fn setup_ui(mut commands: Commands) {
                 bottom: Val::Px(12.0),
                 right: Val::Px(12.0),
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(10.0),
+                row_gap: Val::Px(8.0),
                 padding: UiRect::all(Val::Px(12.0)),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
                 align_items: AlignItems::Center,
@@ -293,11 +316,101 @@ fn setup_ui(mut commands: Commands) {
             BackgroundColor(Color::srgba(0.08, 0.08, 0.08, 0.88)),
         ))
         .with_children(|parent| {
-            // --- Section 1: Blur Passes ---
+            // --- Section 1: Diffuse Bounces ---
             parent
                 .spawn(Node {
                     flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(5.0),
+                    row_gap: Val::Px(4.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|sec| {
+                    sec.spawn((
+                        Text::new(format!("GI Bounces: {}", initial_bounces)),
+                        TextColor(Color::srgb(1.0, 0.8, 0.4)),
+                        TextFont::from_font_size(13.5),
+                        BouncesLabel,
+                    ));
+                    sec.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            BouncesStepButton(-1),
+                        ))
+                        .with_child((
+                            Text::new("-"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(160.0),
+                                height: Val::Px(14.0),
+                                border_radius: BorderRadius::all(Val::Px(7.0)),
+                                overflow: Overflow::clip(),
+                                justify_content: JustifyContent::FlexStart,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.2, 0.2)),
+                            BouncesTrack,
+                        ))
+                        .with_children(|track| {
+                            track.spawn((
+                                Node {
+                                    width: Val::Percent(bounces_pct),
+                                    height: Val::Percent(100.0),
+                                    border_radius: BorderRadius::all(Val::Px(7.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(1.0, 0.7, 0.2)),
+                                BouncesFill,
+                                Pickable::IGNORE,
+                            ));
+                        });
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            BouncesStepButton(1),
+                        ))
+                        .with_child((
+                            Text::new("+"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+                    });
+                });
+
+            // --- Section 2: Blur Passes ---
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(4.0),
                     align_items: AlignItems::Center,
                     ..default()
                 })
@@ -383,11 +496,11 @@ fn setup_ui(mut commands: Commands) {
                     });
                 });
 
-            // --- Section 2: Cross-Layer Radius ---
+            // --- Section 3: Cross-Layer Radius ---
             parent
                 .spawn(Node {
                     flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(5.0),
+                    row_gap: Val::Px(4.0),
                     align_items: AlignItems::Center,
                     ..default()
                 })
@@ -627,35 +740,107 @@ fn fps_system(
     }
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+struct SliderQueries<'w, 's> {
+    passes_buttons: Query<'w, 's, (&'static Interaction, &'static PassesStepButton), (With<Button>, Changed<Interaction>)>,
+    layer_buttons: Query<'w, 's, (&'static Interaction, &'static CrossLayerStepButton), (With<Button>, Changed<Interaction>)>,
+    bounce_buttons: Query<'w, 's, (&'static Interaction, &'static BouncesStepButton), (With<Button>, Changed<Interaction>)>,
+    passes_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<PassesTrack>>,
+    layer_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<CrossLayerTrack>>,
+    bounce_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<BouncesTrack>>,
+    passes_label: Query<'w, 's, &'static mut Text, (With<BlurPassesLabel>, Without<CrossLayerLabel>, Without<BouncesLabel>)>,
+    layer_label: Query<'w, 's, &'static mut Text, (With<CrossLayerLabel>, Without<BlurPassesLabel>, Without<BouncesLabel>)>,
+    bounce_label: Query<'w, 's, &'static mut Text, (With<BouncesLabel>, Without<BlurPassesLabel>, Without<CrossLayerLabel>)>,
+    passes_fill: Query<'w, 's, &'static mut Node, (With<PassesFill>, Without<CrossLayerFill>, Without<BouncesFill>)>,
+    layer_fill: Query<'w, 's, &'static mut Node, (With<CrossLayerFill>, Without<PassesFill>, Without<BouncesFill>)>,
+    bounce_fill: Query<'w, 's, &'static mut Node, (With<BouncesFill>, Without<PassesFill>, Without<CrossLayerFill>)>,
+}
 fn slider_system(
-    mut passes_buttons: Query<(&Interaction, &PassesStepButton), (With<Button>, Changed<Interaction>)>,
-    mut layer_buttons: Query<(&Interaction, &CrossLayerStepButton), (With<Button>, Changed<Interaction>)>,
-    passes_track_query: Query<(&Interaction, &ComputedNode, &GlobalTransform), With<PassesTrack>>,
-    layer_track_query: Query<(&Interaction, &ComputedNode, &GlobalTransform), With<CrossLayerTrack>>,
+    mut q: SliderQueries,
     windows: Query<&Window>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
     mut blend_toggle: ResMut<BlendToggleState>,
-    mut passes_label: Query<&mut Text, (With<BlurPassesLabel>, Without<CrossLayerLabel>)>,
-    mut layer_label: Query<&mut Text, (With<CrossLayerLabel>, Without<BlurPassesLabel>)>,
-    mut passes_fill: Query<&mut Node, (With<PassesFill>, Without<CrossLayerFill>)>,
-    mut layer_fill: Query<&mut Node, (With<CrossLayerFill>, Without<PassesFill>)>,
     mut is_dragging_passes: Local<bool>,
     mut is_dragging_layer: Local<bool>,
+    mut is_dragging_bounce: Local<bool>,
 ) {
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let passes_step_size = if shift { 5 } else { 1 };
     let layer_step_size = if shift { 10 } else { 5 }; // 0.5m default, 1.0m with shift
 
     // -------------------------------------------------------------
-    // 1. Passes Slider
+    // 1. Diffuse Bounces Slider
+    // -------------------------------------------------------------
+    let current_bounces = BOUNCE_COUNT.load(Ordering::Relaxed).clamp(1, MAX_BOUNCE_COUNT);
+    let mut bounce_delta: i32 = 0;
+
+    for (interaction, step) in &mut q.bounce_buttons {
+        if *interaction == Interaction::Pressed {
+            bounce_delta += step.0;
+        }
+    }
+
+    if keys.just_pressed(KeyCode::Digit1) { bounce_delta = 1 - current_bounces as i32; }
+    if keys.just_pressed(KeyCode::Digit2) { bounce_delta = 2 - current_bounces as i32; }
+    if keys.just_pressed(KeyCode::Digit3) { bounce_delta = 3 - current_bounces as i32; }
+    if keys.just_pressed(KeyCode::Digit4) { bounce_delta = 4 - current_bounces as i32; }
+
+    let mut direct_target_bounces: Option<u32> = None;
+    if let Ok((interaction, node, transform)) = q.bounce_track.single() {
+        if *interaction == Interaction::Pressed {
+            *is_dragging_bounce = true;
+        }
+        if mouse_button.just_released(MouseButton::Left) {
+            *is_dragging_bounce = false;
+        }
+
+        if *is_dragging_bounce {
+            if let Ok(window) = windows.single() {
+                if let Some(cursor_pos) = window.cursor_position() {
+                    let width = node.size().x;
+                    if width > 0.0 {
+                        let left = transform.translation().x - width * 0.5;
+                        let ratio = ((cursor_pos.x - left) / width).clamp(0.0, 1.0);
+                        let target = 1 + (ratio * (MAX_BOUNCE_COUNT - 1) as f32).round() as u32;
+                        direct_target_bounces = Some(target);
+                    }
+                }
+            }
+        }
+    }
+
+    let new_bounces = if let Some(target) = direct_target_bounces {
+        target.clamp(1, MAX_BOUNCE_COUNT)
+    } else if bounce_delta != 0 {
+        ((current_bounces as i32) + bounce_delta).clamp(1, MAX_BOUNCE_COUNT as i32) as u32
+    } else {
+        current_bounces
+    };
+
+    if new_bounces != current_bounces || blend_toggle.bounces != new_bounces {
+        BOUNCE_COUNT.store(new_bounces, Ordering::Relaxed);
+        blend_toggle.bounces = new_bounces;
+
+        for mut text in &mut q.bounce_label {
+            text.0 = format!("GI Bounces: {}", new_bounces);
+        }
+
+        let pct = (new_bounces.saturating_sub(1)) as f32 / (MAX_BOUNCE_COUNT - 1) as f32 * 100.0;
+        for mut fill in &mut q.bounce_fill {
+            fill.width = Val::Percent(pct);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 2. Passes Slider
     // -------------------------------------------------------------
     let current_passes = LOWPASS_BLUR_PASSES
         .load(Ordering::Relaxed)
         .clamp(1, MAX_BLUR_PASSES as u32);
     let mut passes_delta: i32 = 0;
 
-    for (interaction, step) in &mut passes_buttons {
+    for (interaction, step) in &mut q.passes_buttons {
         if *interaction == Interaction::Pressed {
             passes_delta += step.0 * passes_step_size;
         }
@@ -675,7 +860,7 @@ fn slider_system(
     }
 
     let mut direct_target_passes: Option<u32> = None;
-    if let Ok((interaction, node, transform)) = passes_track_query.single() {
+    if let Ok((interaction, node, transform)) = q.passes_track.single() {
         if *interaction == Interaction::Pressed {
             *is_dragging_passes = true;
         }
@@ -710,25 +895,25 @@ fn slider_system(
         LOWPASS_BLUR_PASSES.store(new_passes, Ordering::Relaxed);
         blend_toggle.blur_passes = new_passes;
 
-        for mut text in &mut passes_label {
+        for mut text in &mut q.passes_label {
             text.0 = format!("Blur Passes: {}", new_passes);
         }
 
         let pct = (new_passes.saturating_sub(1)) as f32 / (MAX_BLUR_PASSES - 1) as f32 * 100.0;
-        for mut fill in &mut passes_fill {
+        for mut fill in &mut q.passes_fill {
             fill.width = Val::Percent(pct);
         }
     }
 
     // -------------------------------------------------------------
-    // 2. Cross-Layer Radius Slider
+    // 3. Cross-Layer Radius Slider
     // -------------------------------------------------------------
     let current_radius_tenths = CROSS_LAYER_RADIUS_TENTHS
         .load(Ordering::Relaxed)
         .clamp(0, MAX_CROSS_LAYER_TENTHS);
     let mut radius_delta: i32 = 0;
 
-    for (interaction, step) in &mut layer_buttons {
+    for (interaction, step) in &mut q.layer_buttons {
         if *interaction == Interaction::Pressed {
             radius_delta += step.0 * layer_step_size;
         }
@@ -742,7 +927,7 @@ fn slider_system(
     }
 
     let mut direct_target_radius: Option<u32> = None;
-    if let Ok((interaction, node, transform)) = layer_track_query.single() {
+    if let Ok((interaction, node, transform)) = q.layer_track.single() {
         if *interaction == Interaction::Pressed {
             *is_dragging_layer = true;
         }
@@ -778,7 +963,7 @@ fn slider_system(
         CROSS_LAYER_RADIUS_TENTHS.store(new_radius_tenths, Ordering::Relaxed);
         blend_toggle.cross_layer_radius = new_radius_m;
 
-        for mut text in &mut layer_label {
+        for mut text in &mut q.layer_label {
             text.0 = if new_radius_m <= 0.001 {
                 "Cross-Layer: 0.0 m (isolated)".to_string()
             } else {
@@ -787,7 +972,7 @@ fn slider_system(
         }
 
         let pct = (new_radius_tenths as f32 / MAX_CROSS_LAYER_TENTHS as f32) * 100.0;
-        for mut fill in &mut layer_fill {
+        for mut fill in &mut q.layer_fill {
             fill.width = Val::Percent(pct);
         }
     }

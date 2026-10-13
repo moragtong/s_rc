@@ -48,6 +48,18 @@ pub const MAX_BLUR_PASSES: usize = 50;
 pub static CROSS_LAYER_RADIUS_TENTHS: AtomicU32 = AtomicU32::new(20);
 pub const MAX_CROSS_LAYER_TENTHS: u32 = 80;
 
+/// Global variable controlling the number of diffuse GI bounces (1 to 4).
+pub static BOUNCE_COUNT: AtomicU32 = AtomicU32::new(2);
+pub const MAX_BOUNCE_COUNT: u32 = 4;
+
+#[derive(ShaderType, Clone, Copy, Default)]
+struct LightUniforms {
+    pub bounce_index: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
+}
+
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
 const LIGHT_SHADER_PATH: &str = "shaders/surface_light.wgsl";
 const TRACE_SHADER_PATH: &str = "shaders/cascades2_5d.wgsl";
@@ -227,6 +239,8 @@ pub struct CascadesRenderData {
     /// Persistent so a moving sun rewrites its contents instead of allocating
     /// a new buffer every frame.
     pub uniform_buffer: Buffer,
+    /// `LightUniforms` buffer per bounce.
+    light_uniform_buffers: [Buffer; MAX_BOUNCE_COUNT as usize],
     /// `BlendUniforms`, rewritten every frame per pass.
     blend_uniform_buffers: [Buffer; MAX_BLUR_PASSES],
     subsamples_buffer: Buffer,
@@ -240,7 +254,8 @@ pub struct CascadesRenderData {
     pub probe_vis_pass_bind_group: BindGroup,
     pub probe_vis_bind_group: BindGroup,
     pub probe_adj_bind_group: BindGroup,
-    light_bind_group: BindGroup,
+    /// Light bind group per bounce index and phase.
+    light_bind_groups: [[BindGroup; 3]; MAX_BOUNCE_COUNT as usize],
     trace_bind_group: BindGroup,
     /// One per rotation phase, writing into the phase's gather target.
     gather_bind_groups: [BindGroup; 3],
@@ -348,6 +363,8 @@ fn setup_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: false }), // albedo_max
                 texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
                 texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
+                storage_buffer_read_only::<Vec4>(false),                    // sh_probes
+                uniform_buffer::<LightUniforms>(false),                     // light_info
             ),
         ),
     );
@@ -639,6 +656,7 @@ fn prepare_buffers(
         subsamples_buffer,
         hits_buffer,
         uniform_buffer,
+        light_uniform_buffers,
         blend_uniform_buffers,
     ) = match &existing {
         Some(e) => (
@@ -651,6 +669,7 @@ fn prepare_buffers(
             e.subsamples_buffer.clone(),
             e.hits_buffer.clone(),
             e.uniform_buffer.clone(),
+            e.light_uniform_buffers.clone(),
             e.blend_uniform_buffers.clone(),
         ),
         None => {
@@ -672,6 +691,14 @@ fn prepare_buffers(
             let initial_adj: Vec<u8> = (0..probes.max(16))
                 .flat_map(|_| 0x1FFu32.to_ne_bytes())
                 .collect();
+            let light_uniform_buffers: [Buffer; MAX_BOUNCE_COUNT as usize] = std::array::from_fn(|i| {
+                render_device.create_buffer(&BufferDescriptor {
+                    label: Some(&format!("cascades_light_uniforms_{i}")),
+                    size: LightUniforms::min_size().get(),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
             let blend_uniform_buffers: [Buffer; MAX_BLUR_PASSES] = std::array::from_fn(|i| {
                 render_device.create_buffer(&BufferDescriptor {
                     label: Some(&format!("cascades_blend_uniforms_{i}")),
@@ -719,6 +746,7 @@ fn prepare_buffers(
                     usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 }),
+                light_uniform_buffers,
                 blend_uniform_buffers,
             )
         }
@@ -738,7 +766,7 @@ fn prepare_buffers(
     }
 
     let bind_group =
-        |label: &'static str, layout: &BindGroupLayoutDescriptor, entries: &[BindGroupEntry]| {
+        |label: &str, layout: &BindGroupLayoutDescriptor, entries: &[BindGroupEntry]| {
             render_device.create_bind_group(
                 label,
                 &pipeline_cache.get_bind_group_layout(layout),
@@ -806,18 +834,25 @@ fn prepare_buffers(
             &probe_vis_dummy_view,
         )),
     );
-    let light_bind_group = bind_group(
-        "cascades_light",
-        &pipeline.light_layout,
-        &BindGroupEntries::sequential((
-            normal_min,
-            normal_max,
-            albedo_min,
-            albedo_max,
-            radiance_min,
-            radiance_max,
-        )),
-    );
+    let light_bind_groups: [[BindGroup; 3]; MAX_BOUNCE_COUNT as usize] = std::array::from_fn(|b| {
+        [0, 1, 2].map(|p| {
+            bind_group(
+                &format!("cascades_light_b{b}_p{p}"),
+                &pipeline.light_layout,
+                &BindGroupEntries::sequential((
+                    normal_min,
+                    normal_max,
+                    albedo_min,
+                    albedo_max,
+                    radiance_min,
+                    radiance_max,
+                    // Bounces read the fresh gather target of phase p
+                    sh_probes[G_OF_PHASE[p]].as_entire_binding(),
+                    light_uniform_buffers[b].as_entire_binding(),
+                )),
+            )
+        })
+    });
     let trace_bind_group = bind_group(
         "cascades_trace",
         &pipeline.trace_layout,
@@ -937,6 +972,7 @@ fn prepare_buffers(
         probe_adj_buffer,
         hits_buffer,
         uniform_buffer,
+        light_uniform_buffers,
         blend_uniform_buffers,
         subsamples_buffer,
         common_bind_group,
@@ -945,7 +981,7 @@ fn prepare_buffers(
         probe_vis_pass_bind_group,
         probe_vis_bind_group,
         probe_adj_bind_group,
-        light_bind_group,
+        light_bind_groups,
         trace_bind_group,
         gather_bind_groups,
         march_bind_group,
@@ -1162,28 +1198,47 @@ fn dispatch_cascades(
 
         if relight_now {
             let phase = (relight.phase % 3) as usize;
-            pass.set_pipeline(light);
-            pass.set_bind_group(1, &render_data.light_bind_group, &[]);
-            pass.dispatch_workgroups(
-                heightmap.resolution.x.div_ceil(LIGHT_WORKGROUP),
-                heightmap.resolution.y.div_ceil(LIGHT_WORKGROUP),
-                1,
-            );
+            let bounces = BOUNCE_COUNT.load(Ordering::Relaxed).clamp(1, MAX_BOUNCE_COUNT);
 
-            pass.set_bind_group(1, &render_data.trace_bind_group, &[]);
-            for (c, trace) in layout.layout.cascades.iter().zip(&traces).rev() {
-                pass.set_pipeline(trace);
-                pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
-            }
+            for b in 0..bounces {
+                let mut light_bytes = encase::UniformBuffer::new(Vec::new());
+                light_bytes
+                    .write(&LightUniforms {
+                        bounce_index: b,
+                        pad0: 0,
+                        pad1: 0,
+                        pad2: 0,
+                    })
+                    .unwrap();
+                render_queue.write_buffer(
+                    &render_data.light_uniform_buffers[b as usize],
+                    0,
+                    light_bytes.as_ref(),
+                );
 
-            pass.set_bind_group(1, &render_data.gather_bind_groups[phase], &[]);
-            for (c, gather) in layout.layout.cascades.iter().zip(&gathers) {
-                pass.set_pipeline(gather);
+                pass.set_pipeline(light);
+                pass.set_bind_group(1, &render_data.light_bind_groups[b as usize][phase], &[]);
                 pass.dispatch_workgroups(
-                    (c.size.x * c.size.y * layout::LAYERS).div_ceil(WORKGROUP),
-                    1,
+                    heightmap.resolution.x.div_ceil(LIGHT_WORKGROUP),
+                    heightmap.resolution.y.div_ceil(LIGHT_WORKGROUP),
                     1,
                 );
+
+                pass.set_bind_group(1, &render_data.trace_bind_group, &[]);
+                for (c, trace) in layout.layout.cascades.iter().zip(&traces).rev() {
+                    pass.set_pipeline(trace);
+                    pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
+                }
+
+                pass.set_bind_group(1, &render_data.gather_bind_groups[phase], &[]);
+                for (c, gather) in layout.layout.cascades.iter().zip(&gathers) {
+                    pass.set_pipeline(gather);
+                    pass.dispatch_workgroups(
+                        (c.size.x * c.size.y * layout::LAYERS).div_ceil(WORKGROUP),
+                        1,
+                        1,
+                    );
+                }
             }
 
             relight.phase = (relight.phase + 1).rem_euclid(3);
