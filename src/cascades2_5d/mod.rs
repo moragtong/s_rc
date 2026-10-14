@@ -75,7 +75,7 @@ const LIGHT_WORKGROUP: u32 = 8;
 const WORKGROUP: u32 = 64;
 const BLEND_WORKGROUP: u32 = 128;
 /// SH probe stride in vec4s: 9 coefficients, then (position, radius).
-pub const SH_STRIDE: u64 = 10;
+pub const SH_STRIDE: u64 = 5;
 /// Slots per ray in the one-shot hit cache: the top cascade's own trace, or
 /// the four segment traces the cascades below it use instead.
 const HITS_PER_RAY: u64 = 4;

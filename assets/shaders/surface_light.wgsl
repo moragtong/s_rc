@@ -46,10 +46,10 @@ fn sh_coeff(base: u32, i: u32) -> vec3<f32> {
 
 fn sh_irradiance(base: u32, n: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(n);
-    let band = array<f32, 3>(PI, 1.5707963, 0.1963495);
+    let band = array<f32, 2>(PI, 1.5707963);
     var e = vec3<f32>(0.0);
-    for (var i = 0u; i < 9u; i++) {
-        let l = select(select(2u, 1u, i < 4u), 0u, i == 0u);
+    for (var i = 0u; i < 4u; i++) {
+        let l = select(1u, 0u, i == 0u);
         e += sh_coeff(base, i) * (basis[i] * band[l]);
     }
     return max(e, vec3<f32>(0.0));
@@ -75,7 +75,7 @@ fn evaluate_probe_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
         var layer_dy: array<f32, 3>;
         for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
-            let c = sh_probes[(base_cell + layer) * SH_STRIDE + 9u].xyz;
+            let c = sh_probes[(base_cell + layer) * SH_STRIDE + 4u].xyz;
             layer_dy[layer] = abs(c.y - fetch.y);
         }
 

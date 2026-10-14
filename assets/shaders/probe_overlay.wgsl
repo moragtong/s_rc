@@ -61,10 +61,10 @@ fn cascade_for(instance: u32) -> u32 {
 // `shade_cascades.wgsl::sh_irradiance`), along the sphere's world normal.
 fn probe_irradiance(base: u32, n: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(n);
-    let band = array<f32, 3>(PI, 2.094395, 0.785398);
+    let band = array<f32, 2>(PI, 2.094395);
     var e = vec3<f32>(0.0);
-    for (var i = 0u; i < 9u; i++) {
-        let l = select(select(2u, 1u, i < 4u), 0u, i == 0u);
+    for (var i = 0u; i < 4u; i++) {
+        let l = select(1u, 0u, i == 0u);
         e += sh_probes[base + i].xyz * (basis[i] * band[l]);
     }
     return max(e, vec3<f32>(0.0));

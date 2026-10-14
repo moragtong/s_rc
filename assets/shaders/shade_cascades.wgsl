@@ -32,14 +32,14 @@ fn sh_coeff(base: u32, i: u32) -> vec3<f32> {
     return sh_probes[base + i].xyz;
 }
 
-// Analytic cosine-convolved SH irradiance with Hanning windowing to eliminate
-// negative ringing lobes.
+// Analytic cosine-convolved L1 SH irradiance.
+// Band 0: A_0 = PI, Band 1: A_1 = 2*PI/3 ~= 2.094395 (windowed to 1.5707963)
 fn sh_irradiance(base: u32, n: vec3<f32>) -> vec3<f32> {
     var basis = sh_basis(n);
-    let band = array<f32, 3>(PI, 1.5707963, 0.1963495);
+    let band = array<f32, 2>(PI, 1.5707963);
     var e = vec3<f32>(0.0);
-    for (var i = 0u; i < 9u; i++) {
-        let l = select(select(2u, 1u, i < 4u), 0u, i == 0u);
+    for (var i = 0u; i < 4u; i++) {
+        let l = select(1u, 0u, i == 0u);
         e += sh_coeff(base, i) * (basis[i] * band[l]);
     }
     return max(e, vec3<f32>(0.0));
@@ -94,7 +94,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
 
         var layer_dy: array<f32, 3>;
         for (var layer = 0u; layer < PROBES_PER_CELL; layer++) {
-            let c = sh_probes[(base_cell + layer) * SH_STRIDE + 9u].xyz;
+            let c = sh_probes[(base_cell + layer) * SH_STRIDE + 4u].xyz;
             layer_dy[layer] = abs(c.y - fetch.y);
         }
 
@@ -129,7 +129,7 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
                 continue;
             }
             let base = (base_cell + layer) * SH_STRIDE;
-            let center = sh_probes[base + 9u].xyz;
+            let center = sh_probes[base + 4u].xyz;
 
             var is_vis: bool;
             if view_info.use_vis_mask != 0u {

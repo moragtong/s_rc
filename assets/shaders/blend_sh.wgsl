@@ -131,7 +131,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
     let probe = i / SH_STRIDE;
     // The (position, radius) word is geometry, not light: positions differ
     // between probes, so it must not enter the spatial average.
-    if coeff >= 9u || blend.lowpass == 0u {
+    if coeff >= 4u || blend.lowpass == 0u {
         sh_probes_out[i] = input_word(i);
         return;
     }
@@ -155,7 +155,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // The gate compares heights, so the center probe's position has to be
     // read too; it lives in the stride-10 word like every probe's does.
-    let center_pos = input_word(probe * SH_STRIDE + 9u).xyz;
+    let center_pos = input_word(probe * SH_STRIDE + 4u).xyz;
 
     var acc = vec3<f32>(0.0);
     // Renormalise: a neighbour that fails agreement or visibility is dropped and the
@@ -216,7 +216,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
             } else {
                 for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
                     let q_probe = cell_base + l;
-                    let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
+                    let q_pos = input_word(q_probe * SH_STRIDE + 4u).xyz;
                     let dy = abs(q_pos.y - center_pos.y);
                     if dy >= r_y {
                         continue;
@@ -311,7 +311,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
 
                 for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
                     let q_probe = cell_base + l;
-                    let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
+                    let q_pos = input_word(q_probe * SH_STRIDE + 4u).xyz;
                     let dy = abs(q_pos.y - center_pos.y);
                     if dy >= r_y {
                         continue;

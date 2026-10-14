@@ -20,7 +20,7 @@ fn gather(c: u32, id: u32) {
     let rays_per_probe = info.octa_side * info.octa_side;
     let per_cell = info.sub * info.sub;
 
-    var sh: array<vec3<f32>, 9>;
+    var sh: array<vec3<f32>, 4>;
     var radius = 0.0;
     for (var r = 0u; r < rays_per_probe; r++) {
         let ray = rays[info.ray_base + id * rays_per_probe + r];
@@ -30,17 +30,17 @@ fn gather(c: u32, id: u32) {
         for (var s = 0u; s < per_cell; s++) {
             let sub_sample = subsamples[info.sub_base + r * per_cell + s];
             var basis = sh_basis(sub_sample.xyz);
-            for (var i = 0u; i < 9u; i++) {
+            for (var i = 0u; i < 4u; i++) {
                 sh[i] += ray.rgb * (basis[i] * sub_sample.w);
             }
         }
     }
 
     let base = (info.probe_base + id) * SH_STRIDE;
-    for (var i = 0u; i < 9u; i++) {
+    for (var i = 0u; i < 4u; i++) {
         sh_probes[base + i] = vec4<f32>(sh[i], 0.0);
     }
-    sh_probes[base + 9u] = vec4<f32>(probe_position(c, probe, layer), radius);
+    sh_probes[base + 4u] = vec4<f32>(probe_position(c, probe, layer), radius);
 }
 
 @compute @workgroup_size(64, 1, 1) fn gather_0(@builtin(global_invocation_id) id: vec3<u32>) { gather(0u, id.x); }

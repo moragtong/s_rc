@@ -69,7 +69,7 @@ const PI: f32 = 3.14159265;
 // Stored instead of a distance for rays that hit nothing.
 const MISS: f32 = -1.0;
 // SH probes: 9 coefficients, then (position, parallax radius).
-const SH_STRIDE: u32 = 10u;
+const SH_STRIDE: u32 = 5u;
 // Two probe layers per XZ cell: the floor layer sits a constant distance
 // above the column's stored floor surface, the ceiling layer the same
 // distance below its stored ceiling. Lives in the shared module so every
