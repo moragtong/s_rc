@@ -53,11 +53,11 @@ pub static BOUNCE_COUNT: AtomicU32 = AtomicU32::new(1);
 pub const MAX_BOUNCE_COUNT: u32 = 4;
 
 /// Global variable controlling the number of temporal blur passes / relight interval (1 to 16 frames).
-pub static TEMPORAL_BLUR_PASSES: AtomicU32 = AtomicU32::new(2);
+pub static TEMPORAL_BLUR_PASSES: AtomicU32 = AtomicU32::new(16);
 pub const MAX_TEMPORAL_PASSES: u32 = 16;
 
 /// Global variable controlling the number of temporal bounce frames for EMA accumulation (1 to 16 frames).
-pub static TEMPORAL_BOUNCE_PASSES: AtomicU32 = AtomicU32::new(1);
+pub static TEMPORAL_BOUNCE_PASSES: AtomicU32 = AtomicU32::new(4);
 pub const MAX_TEMPORAL_BOUNCE_PASSES: u32 = 16;
 
 #[derive(ShaderType, Clone, Copy, Default)]
@@ -1296,7 +1296,11 @@ fn dispatch_cascades(
                 light_bytes
                     .write(&LightUniforms {
                         bounce_index: b,
-                        temporal_bounce: if b == 0 && use_temporal && n_bounce > 1 { 1 } else { 0 },
+                        temporal_bounce: if b == 0 && use_temporal && n_bounce > 1 {
+                            1
+                        } else {
+                            0
+                        },
                         temporal_weight,
                         pad0: 0,
                     })
@@ -1374,11 +1378,7 @@ fn dispatch_cascades(
     };
     locals.history_valid = true;
 
-    let blend_alpha = if interval > 1 {
-        relight.alpha
-    } else {
-        lambda
-    };
+    let blend_alpha = if interval > 1 { relight.alpha } else { lambda };
 
     // Pass 0 uniform: strictly per-probe temporal EMA accumulation (lowpass = 0, alpha = blend_alpha)
     let mut bytes0 = encase::UniformBuffer::new(Vec::new());

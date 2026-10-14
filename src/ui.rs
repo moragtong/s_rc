@@ -65,14 +65,18 @@ impl Default for BlendToggleState {
         let temporal_bounce_passes = std::env::var("S_RC_TEMPORAL_BOUNCE_PASSES")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(1);
+            .unwrap_or(4);
+        let temporal_passes = std::env::var("S_RC_TEMPORAL_PASSES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(16);
         Self {
             lowpass: true,
             blur_passes: 7,
             cross_layer_radius: 2.0,
             bounces: 1,
             temporal_bounce,
-            temporal_passes: 2,
+            temporal_passes,
             temporal_bounce_passes,
         }
     }
