@@ -37,8 +37,6 @@ pub struct Heightmap {
     /// Precalculated visibility of Cascade 0 probes for floor and ceiling
     /// surfaces. R32Uint storing 12 bits for floor and 12 bits for ceiling.
     pub probe_vis: Handle<Image>,
-    /// Resolution of the precalculated probe visibility buffer.
-    pub probe_vis_resolution: UVec2,
     /// Highest ceiling or floor in the map; above it rays can't hit.
     pub top: f32,
 }
@@ -59,8 +57,6 @@ pub const BAKE_NEAR: f32 = 0.3;
 /// Resolution along each axis. The map need not be square; it covers
 /// `MIN_BOUNDS`..`MAX_BOUNDS`, so its texels need not be either.
 pub const RESOLUTION: UVec2 = UVec2::new(512, 512);
-/// Resolution of the precalculated probe visibility buffer (4x higher per axis than the heightmap).
-pub const PROBE_VIS_RESOLUTION: UVec2 = UVec2::new(2048, 2048);
 /// World extent the map covers, and therefore the metres per texel: 512² over
 /// 40x32 m is 0.078 m by 0.0625 m.
 ///
@@ -152,13 +148,12 @@ fn setup_heightmap(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
     let winding = images.add(winding);
 
-    let probe_vis = images.add(create_empty_image(PROBE_VIS_RESOLUTION, TextureFormat::R32Uint, 1));
+    let probe_vis = images.add(create_empty_image(RESOLUTION, TextureFormat::R32Uint, 1));
 
     commands.insert_resource(Heightmap {
         min_bounds: MIN_BOUNDS,
         max_bounds: MAX_BOUNDS,
         resolution: RESOLUTION,
-        probe_vis_resolution: PROBE_VIS_RESOLUTION,
         texture: images.add(create_empty_image(RESOLUTION, TextureFormat::Rg32Float, 2)),
         metadata_min,
         metadata_max,

@@ -599,9 +599,7 @@ fn probe_visible(p: vec3<f32>, n: vec3<f32>, center: vec3<f32>) -> bool {
 // Returns a 12-bit mask where bit `k * 3u + layer` is 1 if probe (k, layer) is visible.
 fn probe_visibility_mask(p: vec3<f32>, n: vec3<f32>) -> u32 {
     let sample_p = p + n * 0.04;
-    let dims = vec2<f32>(textureDimensions(probe_vis));
-    let uv = (sample_p.xz - uniforms.hmap_min) / (uniforms.hmap_max - uniforms.hmap_min);
-    let t = clamp(vec2<i32>(floor(uv * dims)), vec2<i32>(0), vec2<i32>(dims) - 1);
+    let t = clamp(texel_at(sample_p.xz), vec2<i32>(0), vec2<i32>(uniforms.hmap_res) - 1);
     let packed_mask = textureLoad(probe_vis, vec2<u32>(t), 0).x;
     let is_ceiling = n.y < -0.1 || (abs(n.y) <= 0.1 && p.y >= uniforms.split);
     return select(packed_mask & 0xFFFu, (packed_mask >> 16u) & 0xFFFu, is_ceiling);
