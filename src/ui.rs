@@ -59,9 +59,9 @@ impl Default for BlendToggleState {
             .unwrap_or(true);
         Self {
             lowpass: true,
-            blur_passes: 30,
+            blur_passes: 7,
             cross_layer_radius: 2.0,
-            bounces: 2,
+            bounces: 1,
             temporal_bounce,
         }
     }
