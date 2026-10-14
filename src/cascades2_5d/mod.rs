@@ -94,6 +94,7 @@ pub const RELIGHT_INTERVAL: u32 = 2;
 /// `alpha` through the interval, and hits weight 1 "by itself" on the next
 /// sync, when the swap turns it into `B`.
 const A_OF_PHASE: [usize; 3] = [0, 2, 1];
+#[allow(dead_code)]
 const B_OF_PHASE: [usize; 3] = [1, 0, 2];
 const G_OF_PHASE: [usize; 3] = [2, 1, 0];
 
@@ -265,10 +266,13 @@ pub struct CascadesRenderData {
     /// One per rotation phase, writing into the phase's gather target.
     gather_bind_groups: [BindGroup; 3],
     march_bind_group: BindGroup,
-    /// Pass 0 writing directly into `sh_probes_blend_buffer`.
-    blend_pass0_to_blend: [BindGroup; 3],
-    /// Pass 0 writing into `sh_probes_scratch_buffer` for even pass counts.
-    blend_pass0_to_scratch: [BindGroup; 3],
+    pub sh_probes_history: [Buffer; 2],
+    /// Pass 0 Temporal Accumulation: reads history[h] and fresh gather[p], writes history[1 - h].
+    blend_temporal_bind_groups: [[BindGroup; 3]; 2],
+    /// Pass 1 Spatial Blur reading history[h_curr], writing to scratch.
+    blend_spatial_p1_to_scratch: [BindGroup; 2],
+    /// Pass 1 Spatial Blur reading history[h_curr], writing to blend.
+    blend_spatial_p1_to_blend: [BindGroup; 2],
     /// Successive ping pass: scratch -> blend.
     blend_ping: [BindGroup; MAX_BLUR_PASSES],
     /// Successive pong pass: blend -> scratch.
@@ -657,6 +661,7 @@ fn prepare_buffers(
         sh_probes,
         sh_probes_blend_buffer,
         sh_probes_scratch_buffer,
+        sh_probes_history,
         probe_adj_buffer,
         subsamples_buffer,
         hits_buffer,
@@ -670,6 +675,7 @@ fn prepare_buffers(
             e.sh_probes.clone(),
             e.sh_probes_blend_buffer.clone(),
             e.sh_probes_scratch_buffer.clone(),
+            e.sh_probes_history.clone(),
             e.probe_adj_buffer.clone(),
             e.subsamples_buffer.clone(),
             e.hits_buffer.clone(),
@@ -728,13 +734,25 @@ fn prepare_buffers(
                 storage(
                     "cascades_sh_probes_blend",
                     probes * SH_STRIDE,
-                    BufferUsages::STORAGE,
+                    BufferUsages::STORAGE | BufferUsages::COPY_DST,
                 ),
                 storage(
                     "cascades_sh_probes_scratch",
                     probes * SH_STRIDE,
                     BufferUsages::STORAGE,
                 ),
+                [
+                    storage(
+                        "cascades_sh_probes_hist_0",
+                        probes * SH_STRIDE,
+                        BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                    ),
+                    storage(
+                        "cascades_sh_probes_hist_1",
+                        probes * SH_STRIDE,
+                        BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                    ),
+                ],
                 render_device.create_buffer_with_data(&BufferInitDescriptor {
                     label: Some("cascades_probe_adj"),
                     contents: &initial_adj,
@@ -914,36 +932,43 @@ fn prepare_buffers(
         &pipeline.bake_probe_adj_layout,
         &BindGroupEntries::sequential((probe_adj_buffer.as_entire_binding(),)),
     );
-    let blend_pass0_to_blend = [0, 1, 2].map(|p| {
+    let blend_temporal_bind_groups = [0, 1].map(|h| {
+        [0, 1, 2].map(|p| {
+            bind_group(
+                &format!("cascades_blend_temporal_h{h}_p{p}"),
+                &pipeline.blend_layout,
+                &BindGroupEntries::sequential((
+                    sh_probes_history[h].as_entire_binding(),
+                    sh_probes[A_OF_PHASE[p]].as_entire_binding(),
+                    sh_probes_history[1 - h].as_entire_binding(),
+                    blend_uniform_buffers[0].as_entire_binding(),
+                    probe_adj_buffer.as_entire_binding(),
+                )),
+            )
+        })
+    });
+    let blend_spatial_p1_to_scratch = [0, 1].map(|h_curr| {
         bind_group(
-            [
-                "cascades_blend_p0_b",
-                "cascades_blend_p1_b",
-                "cascades_blend_p2_b",
-            ][p],
+            &format!("cascades_spatial_p1_s_h{h_curr}"),
             &pipeline.blend_layout,
             &BindGroupEntries::sequential((
-                sh_probes[B_OF_PHASE[p]].as_entire_binding(),
-                sh_probes[A_OF_PHASE[p]].as_entire_binding(),
-                sh_probes_blend_buffer.as_entire_binding(),
-                blend_uniform_buffers[0].as_entire_binding(),
+                sh_probes_history[h_curr].as_entire_binding(),
+                sh_probes_history[h_curr].as_entire_binding(),
+                sh_probes_scratch_buffer.as_entire_binding(),
+                blend_uniform_buffers[1].as_entire_binding(),
                 probe_adj_buffer.as_entire_binding(),
             )),
         )
     });
-    let blend_pass0_to_scratch = [0, 1, 2].map(|p| {
+    let blend_spatial_p1_to_blend = [0, 1].map(|h_curr| {
         bind_group(
-            [
-                "cascades_blend_p0_s",
-                "cascades_blend_p1_s",
-                "cascades_blend_p2_s",
-            ][p],
+            &format!("cascades_spatial_p1_b_h{h_curr}"),
             &pipeline.blend_layout,
             &BindGroupEntries::sequential((
-                sh_probes[B_OF_PHASE[p]].as_entire_binding(),
-                sh_probes[A_OF_PHASE[p]].as_entire_binding(),
-                sh_probes_scratch_buffer.as_entire_binding(),
-                blend_uniform_buffers[0].as_entire_binding(),
+                sh_probes_history[h_curr].as_entire_binding(),
+                sh_probes_history[h_curr].as_entire_binding(),
+                sh_probes_blend_buffer.as_entire_binding(),
+                blend_uniform_buffers[1].as_entire_binding(),
                 probe_adj_buffer.as_entire_binding(),
             )),
         )
@@ -981,6 +1006,7 @@ fn prepare_buffers(
         sh_probes,
         sh_probes_blend_buffer,
         sh_probes_scratch_buffer,
+        sh_probes_history,
         probe_adj_buffer,
         hits_buffer,
         uniform_buffer,
@@ -997,11 +1023,22 @@ fn prepare_buffers(
         trace_bind_group,
         gather_bind_groups,
         march_bind_group,
-        blend_pass0_to_blend,
-        blend_pass0_to_scratch,
+        blend_temporal_bind_groups,
+        blend_spatial_p1_to_scratch,
+        blend_spatial_p1_to_blend,
         blend_ping,
         blend_pong,
     });
+}
+
+#[derive(Default)]
+struct CascadeLocals {
+    frame: u32,
+    marched: bool,
+    bakes_done: (bool, bool, bool),
+    was_indirect: bool,
+    hist_index: usize,
+    history_valid: bool,
 }
 
 fn dispatch_cascades(
@@ -1014,10 +1051,7 @@ fn dispatch_cascades(
     mut relight: ResMut<Relight>,
     render_queue: Res<RenderQueue>,
     mut render_context: RenderContext,
-    mut frame: Local<u32>,
-    mut marched: Local<bool>,
-    mut bakes_done: Local<(bool, bool, bool)>,
-    mut was_indirect: Local<bool>,
+    mut locals: Local<CascadeLocals>,
     blend_toggle: Res<BlendToggleState>,
     lighting_state: Option<Res<LightingState>>,
 ) {
@@ -1074,35 +1108,27 @@ fn dispatch_cascades(
     // to retry rewrites the heightmap underneath it, so an unverified map
     // invalidates the stored hits and sends the march back through.
     let verified = bake.as_ref().is_some_and(|b| b.is_verified());
-    let need_march = !*marched;
+    let need_march = !locals.marched;
     if need_march && !verified {
         return;
     }
 
     let indirect_enabled = lighting_state.as_ref().map_or(true, |l| l.indirect_enabled);
-    if *marched && !indirect_enabled {
-        *was_indirect = false;
+    if locals.marched && !indirect_enabled {
+        locals.was_indirect = false;
         return;
     }
 
-    // Which frame of the relight interval this is, counted from 0 on the frame
-    // the probes are rewritten. The march counts as one: it is the first write
-    // after verification, and relighting before it has anywhere to land would
-    // gather against an empty hit cache.
-    relight.interval = TEMPORAL_BLUR_PASSES.load(Ordering::Relaxed).max(1);
-    let interval = relight.interval;
-    let since = *frame % interval;
-    *frame = frame.wrapping_add(1);
-    relight.alpha = if interval == 1 {
-        1.0
-    } else {
-        since as f32 / interval as f32
-    };
-    let re_enabled = indirect_enabled && !*was_indirect;
-    *was_indirect = indirect_enabled;
+    // Relight continuously every frame so fresh radiance feeds the temporal accumulator (EMA).
+    relight.interval = 1;
+    let since = 0;
+    locals.frame = locals.frame.wrapping_add(1);
+    relight.alpha = 1.0;
+    let re_enabled = indirect_enabled && !locals.was_indirect;
+    locals.was_indirect = indirect_enabled;
     let relight_now = need_march || since == 0 || re_enabled;
 
-    if verified && !bakes_done.0 {
+    if verified && !locals.bakes_done.0 {
         let mut pos_pass =
             render_context
                 .command_encoder()
@@ -1120,10 +1146,10 @@ fn dispatch_cascades(
                 1,
             );
         }
-        bakes_done.0 = true;
+        locals.bakes_done.0 = true;
     }
 
-    if verified && bakes_done.0 && !bakes_done.1 {
+    if verified && locals.bakes_done.0 && !locals.bakes_done.1 {
         let mut vis_pass =
             render_context
                 .command_encoder()
@@ -1139,10 +1165,10 @@ fn dispatch_cascades(
             heightmap.resolution.y.div_ceil(16),
             1,
         );
-        bakes_done.1 = true;
+        locals.bakes_done.1 = true;
     }
 
-    if verified && bakes_done.0 && !bakes_done.2 {
+    if verified && locals.bakes_done.0 && !locals.bakes_done.2 {
         let mut adj_pass =
             render_context
                 .command_encoder()
@@ -1160,7 +1186,7 @@ fn dispatch_cascades(
                 1,
             );
         }
-        bakes_done.2 = true;
+        locals.bakes_done.2 = true;
     }
 
     {
@@ -1179,7 +1205,7 @@ fn dispatch_cascades(
                 pass.set_pipeline(march);
                 pass.dispatch_workgroups((c.rays() as u32).div_ceil(WORKGROUP), 1, 1);
             }
-            *marched = true;
+            locals.marched = true;
         }
 
         if !indirect_enabled {
@@ -1257,11 +1283,26 @@ fn dispatch_cascades(
 
     let cross_layer_radius = CROSS_LAYER_RADIUS_TENTHS.load(Ordering::Relaxed) as f32 / 10.0;
 
-    // Pass 0 uniform: strictly temporal mix across t and t-1 per probe (lowpass = 0)
+    let hist_prev = locals.hist_index;
+    let hist_curr = 1 - hist_prev;
+    locals.hist_index = hist_curr;
+
+    let n_temporal = TEMPORAL_BLUR_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_TEMPORAL_PASSES);
+    let is_first_frame = need_march || re_enabled || !locals.history_valid;
+    let lambda = if is_first_frame {
+        1.0
+    } else {
+        1.0 / (n_temporal as f32)
+    };
+    locals.history_valid = true;
+
+    // Pass 0 uniform: strictly per-probe temporal EMA accumulation (lowpass = 0, alpha = lambda)
     let mut bytes0 = encase::UniformBuffer::new(Vec::new());
     bytes0
         .write(&BlendUniforms {
-            alpha: relight.alpha,
+            alpha: lambda,
             probe_words: probe_words as u32,
             lowpass: 0,
             pass_index: 0,
@@ -1292,9 +1333,8 @@ fn dispatch_cascades(
     }
 
     let phase = (relight.phase % 3) as usize;
-    let pass0_writes_to_blend = spatial_passes % 2 == 0;
 
-    // Pass 0: Pure temporal blend across t and t-1 per probe (zero spatial neighbor reads)
+    // --- Pass 0: Pure temporal EMA accumulation across frames (t and t-1, per probe, zero spatial neighbor reads) ---
     {
         let mut blend_pass = render_context
             .command_encoder()
@@ -1304,11 +1344,11 @@ fn dispatch_cascades(
             });
         blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
         blend_pass.set_pipeline(blend);
-        if pass0_writes_to_blend {
-            blend_pass.set_bind_group(1, &render_data.blend_pass0_to_blend[phase], &[]);
-        } else {
-            blend_pass.set_bind_group(1, &render_data.blend_pass0_to_scratch[phase], &[]);
-        }
+        blend_pass.set_bind_group(
+            1,
+            &render_data.blend_temporal_bind_groups[hist_prev][phase],
+            &[],
+        );
         blend_pass.dispatch_workgroups(
             probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
             1,
@@ -1316,28 +1356,69 @@ fn dispatch_cascades(
         );
     }
 
-    // Passes 1..=spatial_passes: Successive spatial blur passes ping-ponging
-    // between scratch and blend, landing on sh_probes_blend_buffer.
-    let mut writing_to_blend = pass0_writes_to_blend;
-    for k in 1..=spatial_passes as usize {
-        writing_to_blend = !writing_to_blend;
-        let mut blend_pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cascades_blend_sh_spatial"),
-                ..default()
-            });
-        blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
-        blend_pass.set_pipeline(blend);
-        if writing_to_blend {
-            blend_pass.set_bind_group(1, &render_data.blend_ping[k], &[]);
-        } else {
-            blend_pass.set_bind_group(1, &render_data.blend_pong[k], &[]);
-        }
-        blend_pass.dispatch_workgroups(
-            probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
-            1,
-            1,
+    if spatial_passes == 0 {
+        // Pure temporal EMA: copy history_curr directly to sh_probes_blend_buffer
+        let probe_bytes = probe_words * 16;
+        render_context.command_encoder().copy_buffer_to_buffer(
+            &render_data.sh_probes_history[hist_curr],
+            0,
+            &render_data.sh_probes_blend_buffer,
+            0,
+            probe_bytes,
         );
+    } else {
+        // Spatial blur passes 1..=spatial_passes
+        let p1_writes_to_blend = spatial_passes % 2 != 0;
+        {
+            let mut blend_pass = render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cascades_blend_sh_spatial_p1"),
+                    ..default()
+                });
+            blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+            blend_pass.set_pipeline(blend);
+            if p1_writes_to_blend {
+                blend_pass.set_bind_group(
+                    1,
+                    &render_data.blend_spatial_p1_to_blend[hist_curr],
+                    &[],
+                );
+            } else {
+                blend_pass.set_bind_group(
+                    1,
+                    &render_data.blend_spatial_p1_to_scratch[hist_curr],
+                    &[],
+                );
+            }
+            blend_pass.dispatch_workgroups(
+                probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
+                1,
+                1,
+            );
+        }
+
+        let mut writing_to_blend = p1_writes_to_blend;
+        for k in 2..=spatial_passes as usize {
+            writing_to_blend = !writing_to_blend;
+            let mut blend_pass = render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cascades_blend_sh_spatial_pn"),
+                    ..default()
+                });
+            blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+            blend_pass.set_pipeline(blend);
+            if writing_to_blend {
+                blend_pass.set_bind_group(1, &render_data.blend_ping[k], &[]);
+            } else {
+                blend_pass.set_bind_group(1, &render_data.blend_pong[k], &[]);
+            }
+            blend_pass.dispatch_workgroups(
+                probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
+                1,
+                1,
+            );
+        }
     }
 }

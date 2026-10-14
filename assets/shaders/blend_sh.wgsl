@@ -132,7 +132,11 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
     // The (position, radius) word is geometry, not light: positions differ
     // between probes, so it must not enter the spatial average.
     if coeff >= 4u || blend.lowpass == 0u {
-        sh_probes_out[i] = input_word(i);
+        if coeff >= 4u {
+            sh_probes_out[i] = sh_probes_cur[i];
+        } else {
+            sh_probes_out[i] = input_word(i);
+        }
         return;
     }
 
