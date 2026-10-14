@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use bevy::prelude::*;
 use crate::cascades2_5d::{
     BOUNCE_COUNT, CROSS_LAYER_RADIUS_TENTHS, LOWPASS_BLUR_PASSES, MAX_BLUR_PASSES,
-    MAX_BOUNCE_COUNT, MAX_CROSS_LAYER_TENTHS,
+    MAX_BOUNCE_COUNT, MAX_CROSS_LAYER_TENTHS, MAX_TEMPORAL_PASSES, TEMPORAL_BLUR_PASSES,
 };
 
 /// Shading pass configuration, extracted to the render app.
@@ -50,6 +50,8 @@ pub struct BlendToggleState {
     pub bounces: u32,
     /// Temporal bounce accumulation across relight intervals.
     pub temporal_bounce: bool,
+    /// Number of temporal blur passes / frames across the relight interval.
+    pub temporal_passes: u32,
 }
 
 impl Default for BlendToggleState {
@@ -63,6 +65,7 @@ impl Default for BlendToggleState {
             cross_layer_radius: 2.0,
             bounces: 1,
             temporal_bounce,
+            temporal_passes: 2,
         }
     }
 }
@@ -108,6 +111,18 @@ pub struct CrossLayerFill;
 
 #[derive(Component)]
 pub struct CrossLayerStepButton(pub i32);
+
+#[derive(Component)]
+pub struct TemporalPassesLabel;
+
+#[derive(Component)]
+pub struct TemporalPassesTrack;
+
+#[derive(Component)]
+pub struct TemporalPassesFill;
+
+#[derive(Component)]
+pub struct TemporalPassesStepButton(pub i32);
 
 #[derive(Component)]
 pub struct BouncesLabel;
@@ -318,6 +333,13 @@ fn setup_ui(mut commands: Commands) {
         .clamp(1, MAX_BOUNCE_COUNT);
     let bounces_pct = (initial_bounces.saturating_sub(1)) as f32
         / (MAX_BOUNCE_COUNT - 1) as f32
+        * 100.0;
+
+    let initial_temporal = TEMPORAL_BLUR_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_TEMPORAL_PASSES);
+    let temporal_pct = (initial_temporal.saturating_sub(1)) as f32
+        / (MAX_TEMPORAL_PASSES - 1) as f32
         * 100.0;
 
     commands
@@ -609,6 +631,96 @@ fn setup_ui(mut commands: Commands) {
                         ));
                     });
                 });
+
+            // --- Section 4: Temporal Blur ---
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(4.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|sec| {
+                    sec.spawn((
+                        Text::new(format!("Temporal Blur: {} frames", initial_temporal)),
+                        TextColor(Color::srgb(0.85, 0.55, 0.85)),
+                        TextFont::from_font_size(13.5),
+                        TemporalPassesLabel,
+                    ));
+                    sec.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            TemporalPassesStepButton(-1),
+                        ))
+                        .with_child((
+                            Text::new("-"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(160.0),
+                                height: Val::Px(14.0),
+                                border_radius: BorderRadius::all(Val::Px(7.0)),
+                                overflow: Overflow::clip(),
+                                justify_content: JustifyContent::FlexStart,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.2, 0.2)),
+                            TemporalPassesTrack,
+                        ))
+                        .with_children(|track| {
+                            track.spawn((
+                                Node {
+                                    width: Val::Percent(temporal_pct),
+                                    height: Val::Percent(100.0),
+                                    border_radius: BorderRadius::all(Val::Px(7.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.85, 0.45, 0.85)),
+                                TemporalPassesFill,
+                                Pickable::IGNORE,
+                            ));
+                        });
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            TemporalPassesStepButton(1),
+                        ))
+                        .with_child((
+                            Text::new("+"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+                    });
+                });
         });
 }
 
@@ -779,15 +891,19 @@ struct SliderQueries<'w, 's> {
     passes_buttons: Query<'w, 's, (&'static Interaction, &'static PassesStepButton), (With<Button>, Changed<Interaction>)>,
     layer_buttons: Query<'w, 's, (&'static Interaction, &'static CrossLayerStepButton), (With<Button>, Changed<Interaction>)>,
     bounce_buttons: Query<'w, 's, (&'static Interaction, &'static BouncesStepButton), (With<Button>, Changed<Interaction>)>,
+    temporal_buttons: Query<'w, 's, (&'static Interaction, &'static TemporalPassesStepButton), (With<Button>, Changed<Interaction>)>,
     passes_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<PassesTrack>>,
     layer_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<CrossLayerTrack>>,
     bounce_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<BouncesTrack>>,
-    passes_label: Query<'w, 's, &'static mut Text, (With<BlurPassesLabel>, Without<CrossLayerLabel>, Without<BouncesLabel>)>,
-    layer_label: Query<'w, 's, &'static mut Text, (With<CrossLayerLabel>, Without<BlurPassesLabel>, Without<BouncesLabel>)>,
-    bounce_label: Query<'w, 's, &'static mut Text, (With<BouncesLabel>, Without<BlurPassesLabel>, Without<CrossLayerLabel>)>,
-    passes_fill: Query<'w, 's, &'static mut Node, (With<PassesFill>, Without<CrossLayerFill>, Without<BouncesFill>)>,
-    layer_fill: Query<'w, 's, &'static mut Node, (With<CrossLayerFill>, Without<PassesFill>, Without<BouncesFill>)>,
-    bounce_fill: Query<'w, 's, &'static mut Node, (With<BouncesFill>, Without<PassesFill>, Without<CrossLayerFill>)>,
+    temporal_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<TemporalPassesTrack>>,
+    passes_label: Query<'w, 's, &'static mut Text, (With<BlurPassesLabel>, Without<CrossLayerLabel>, Without<BouncesLabel>, Without<TemporalPassesLabel>)>,
+    layer_label: Query<'w, 's, &'static mut Text, (With<CrossLayerLabel>, Without<BlurPassesLabel>, Without<BouncesLabel>, Without<TemporalPassesLabel>)>,
+    bounce_label: Query<'w, 's, &'static mut Text, (With<BouncesLabel>, Without<BlurPassesLabel>, Without<CrossLayerLabel>, Without<TemporalPassesLabel>)>,
+    temporal_label: Query<'w, 's, &'static mut Text, (With<TemporalPassesLabel>, Without<BlurPassesLabel>, Without<CrossLayerLabel>, Without<BouncesLabel>)>,
+    passes_fill: Query<'w, 's, &'static mut Node, (With<PassesFill>, Without<CrossLayerFill>, Without<BouncesFill>, Without<TemporalPassesFill>)>,
+    layer_fill: Query<'w, 's, &'static mut Node, (With<CrossLayerFill>, Without<PassesFill>, Without<BouncesFill>, Without<TemporalPassesFill>)>,
+    bounce_fill: Query<'w, 's, &'static mut Node, (With<BouncesFill>, Without<PassesFill>, Without<CrossLayerFill>, Without<TemporalPassesFill>)>,
+    temporal_fill: Query<'w, 's, &'static mut Node, (With<TemporalPassesFill>, Without<PassesFill>, Without<CrossLayerFill>, Without<BouncesFill>)>,
 }
 fn slider_system(
     mut q: SliderQueries,
@@ -798,6 +914,7 @@ fn slider_system(
     mut is_dragging_passes: Local<bool>,
     mut is_dragging_layer: Local<bool>,
     mut is_dragging_bounce: Local<bool>,
+    mut is_dragging_temporal: Local<bool>,
 ) {
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let passes_step_size = if shift { 5 } else { 1 };
@@ -1007,6 +1124,66 @@ fn slider_system(
 
         let pct = (new_radius_tenths as f32 / MAX_CROSS_LAYER_TENTHS as f32) * 100.0;
         for mut fill in &mut q.layer_fill {
+            fill.width = Val::Percent(pct);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 4. Temporal Blur Slider
+    // -------------------------------------------------------------
+    let current_temporal = TEMPORAL_BLUR_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_TEMPORAL_PASSES);
+    let mut temporal_delta: i32 = 0;
+
+    for (interaction, step) in &mut q.temporal_buttons {
+        if *interaction == Interaction::Pressed {
+            temporal_delta += step.0;
+        }
+    }
+
+    let mut direct_target_temporal: Option<u32> = None;
+    if let Ok((interaction, node, transform)) = q.temporal_track.single() {
+        if *interaction == Interaction::Pressed {
+            *is_dragging_temporal = true;
+        }
+        if mouse_button.just_released(MouseButton::Left) {
+            *is_dragging_temporal = false;
+        }
+
+        if *is_dragging_temporal {
+            if let Ok(window) = windows.single() {
+                if let Some(cursor_pos) = window.cursor_position() {
+                    let width = node.size().x;
+                    if width > 0.0 {
+                        let left = transform.translation().x - width * 0.5;
+                        let ratio = ((cursor_pos.x - left) / width).clamp(0.0, 1.0);
+                        let target = 1 + (ratio * (MAX_TEMPORAL_PASSES - 1) as f32).round() as u32;
+                        direct_target_temporal = Some(target);
+                    }
+                }
+            }
+        }
+    }
+
+    let new_temporal = if let Some(target) = direct_target_temporal {
+        target.clamp(1, MAX_TEMPORAL_PASSES)
+    } else if temporal_delta != 0 {
+        ((current_temporal as i32) + temporal_delta).clamp(1, MAX_TEMPORAL_PASSES as i32) as u32
+    } else {
+        current_temporal
+    };
+
+    if new_temporal != current_temporal || blend_toggle.temporal_passes != new_temporal {
+        TEMPORAL_BLUR_PASSES.store(new_temporal, Ordering::Relaxed);
+        blend_toggle.temporal_passes = new_temporal;
+
+        for mut text in &mut q.temporal_label {
+            text.0 = format!("Temporal Blur: {} frames", new_temporal);
+        }
+
+        let pct = (new_temporal.saturating_sub(1)) as f32 / (MAX_TEMPORAL_PASSES - 1) as f32 * 100.0;
+        for mut fill in &mut q.temporal_fill {
             fill.width = Val::Percent(pct);
         }
     }

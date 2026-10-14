@@ -42,7 +42,7 @@ use crate::ui::{BlendToggleState, LightingState};
 
 /// Global variable controlling the number of times the spatial low-pass blur is applied.
 pub static LOWPASS_BLUR_PASSES: AtomicU32 = AtomicU32::new(7);
-pub const MAX_BLUR_PASSES: usize = 50;
+pub const MAX_BLUR_PASSES: usize = 64;
 
 /// Global variable controlling the cross-layer blur radius in tenths of a meter (40 = 4.0m).
 pub static CROSS_LAYER_RADIUS_TENTHS: AtomicU32 = AtomicU32::new(20);
@@ -51,6 +51,10 @@ pub const MAX_CROSS_LAYER_TENTHS: u32 = 80;
 /// Global variable controlling the number of diffuse GI bounces (1 to 4).
 pub static BOUNCE_COUNT: AtomicU32 = AtomicU32::new(1);
 pub const MAX_BOUNCE_COUNT: u32 = 4;
+
+/// Global variable controlling the number of temporal blur passes / relight interval (1 to 16 frames).
+pub static TEMPORAL_BLUR_PASSES: AtomicU32 = AtomicU32::new(2);
+pub const MAX_TEMPORAL_PASSES: u32 = 16;
 
 #[derive(ShaderType, Clone, Copy, Default)]
 struct LightUniforms {
@@ -81,7 +85,7 @@ pub const SH_STRIDE: u64 = 5;
 const HITS_PER_RAY: u64 = 4;
 /// Frames between two relights. The sun moves every frame, so this is the
 /// period the indirect light lags behind the direct light by.
-pub const RELIGHT_INTERVAL: u32 = 1;
+pub const RELIGHT_INTERVAL: u32 = 2;
 /// Which of the three rotating probe buffers plays each role, per
 /// [`Relight::phase`]. `A` is `blend_sh`'s `cur` operand (weight `alpha`, the
 /// freshest relight), `B` its `prev` operand (weight `1 - alpha`), and `G`
@@ -1085,7 +1089,8 @@ fn dispatch_cascades(
     // the probes are rewritten. The march counts as one: it is the first write
     // after verification, and relighting before it has anywhere to land would
     // gather against an empty hit cache.
-    let interval = relight.interval.max(1);
+    relight.interval = TEMPORAL_BLUR_PASSES.load(Ordering::Relaxed).max(1);
+    let interval = relight.interval;
     let since = *frame % interval;
     *frame = frame.wrapping_add(1);
     relight.alpha = if interval == 1 {
@@ -1233,12 +1238,11 @@ fn dispatch_cascades(
         }
     }
 
-    // Number of spatial blur iterations applied.
-    let passes = if blend_toggle.lowpass {
+    // Number of spatial blur iterations applied (0 if lowpass is disabled).
+    let spatial_passes = if blend_toggle.lowpass {
         LOWPASS_BLUR_PASSES
             .load(Ordering::Relaxed)
-            .max(1)
-            .min(MAX_BLUR_PASSES as u32)
+            .min((MAX_BLUR_PASSES - 1) as u32)
     } else {
         0
     };
@@ -1252,14 +1256,31 @@ fn dispatch_cascades(
         * SH_STRIDE;
 
     let cross_layer_radius = CROSS_LAYER_RADIUS_TENTHS.load(Ordering::Relaxed) as f32 / 10.0;
-    let num_dispatches = if passes <= 1 { 1 } else { passes as usize };
-    for k in 0..num_dispatches {
+
+    // Pass 0 uniform: strictly temporal mix across t and t-1 per probe (lowpass = 0)
+    let mut bytes0 = encase::UniformBuffer::new(Vec::new());
+    bytes0
+        .write(&BlendUniforms {
+            alpha: relight.alpha,
+            probe_words: probe_words as u32,
+            lowpass: 0,
+            pass_index: 0,
+            cross_layer_radius: 0.0,
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        })
+        .unwrap();
+    render_queue.write_buffer(&render_data.blend_uniform_buffers[0], 0, bytes0.as_ref());
+
+    // Uniforms for spatial blur passes 1..=spatial_passes (lowpass = 1)
+    for k in 1..=spatial_passes as usize {
         let mut bytes = encase::UniformBuffer::new(Vec::new());
         bytes
             .write(&BlendUniforms {
-                alpha: relight.alpha,
+                alpha: 0.0,
                 probe_words: probe_words as u32,
-                lowpass: (passes > 0) as u32,
+                lowpass: 1,
                 pass_index: k as u32,
                 cross_layer_radius,
                 pad0: 0.0,
@@ -1271,63 +1292,52 @@ fn dispatch_cascades(
     }
 
     let phase = (relight.phase % 3) as usize;
-    if passes <= 1 {
-        let mut blend_pass =
-            render_context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("cascades_blend_sh"),
-                    ..default()
-                });
+    let pass0_writes_to_blend = spatial_passes % 2 == 0;
+
+    // Pass 0: Pure temporal blend across t and t-1 per probe (zero spatial neighbor reads)
+    {
+        let mut blend_pass = render_context
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some("cascades_blend_sh_temporal"),
+                ..default()
+            });
         blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
         blend_pass.set_pipeline(blend);
-        blend_pass.set_bind_group(1, &render_data.blend_pass0_to_blend[phase], &[]);
-        blend_pass.dispatch_workgroups(probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32, 1, 1);
-    } else {
-        let mut writing_to_blend = passes % 2 != 0;
-        {
-            let mut blend_pass =
-                render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor {
-                        label: Some("cascades_blend_sh_p0"),
-                        ..default()
-                    });
-            blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
-            blend_pass.set_pipeline(blend);
-            if writing_to_blend {
-                blend_pass.set_bind_group(1, &render_data.blend_pass0_to_blend[phase], &[]);
-            } else {
-                blend_pass.set_bind_group(1, &render_data.blend_pass0_to_scratch[phase], &[]);
-            }
-            blend_pass.dispatch_workgroups(
-                probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
-                1,
-                1,
-            );
+        if pass0_writes_to_blend {
+            blend_pass.set_bind_group(1, &render_data.blend_pass0_to_blend[phase], &[]);
+        } else {
+            blend_pass.set_bind_group(1, &render_data.blend_pass0_to_scratch[phase], &[]);
         }
+        blend_pass.dispatch_workgroups(
+            probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
+            1,
+            1,
+        );
+    }
 
-        for k in 1..passes as usize {
-            writing_to_blend = !writing_to_blend;
-            let mut blend_pass =
-                render_context
-                    .command_encoder()
-                    .begin_compute_pass(&ComputePassDescriptor {
-                        label: Some("cascades_blend_sh_pn"),
-                        ..default()
-                    });
-            blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
-            blend_pass.set_pipeline(blend);
-            if writing_to_blend {
-                blend_pass.set_bind_group(1, &render_data.blend_ping[k], &[]);
-            } else {
-                blend_pass.set_bind_group(1, &render_data.blend_pong[k], &[]);
-            }
-            blend_pass.dispatch_workgroups(
-                probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
-                1,
-                1,
-            );
+    // Passes 1..=spatial_passes: Successive spatial blur passes ping-ponging
+    // between scratch and blend, landing on sh_probes_blend_buffer.
+    let mut writing_to_blend = pass0_writes_to_blend;
+    for k in 1..=spatial_passes as usize {
+        writing_to_blend = !writing_to_blend;
+        let mut blend_pass = render_context
+            .command_encoder()
+            .begin_compute_pass(&ComputePassDescriptor {
+                label: Some("cascades_blend_sh_spatial"),
+                ..default()
+            });
+        blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
+        blend_pass.set_pipeline(blend);
+        if writing_to_blend {
+            blend_pass.set_bind_group(1, &render_data.blend_ping[k], &[]);
+        } else {
+            blend_pass.set_bind_group(1, &render_data.blend_pong[k], &[]);
         }
+        blend_pass.dispatch_workgroups(
+            probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
+            1,
+            1,
+        );
     }
 }
