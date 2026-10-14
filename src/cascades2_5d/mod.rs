@@ -1220,8 +1220,8 @@ fn dispatch_cascades(
         vis_pass.set_bind_group(0, &render_data.probe_vis_pass_bind_group, &[]);
         vis_pass.set_bind_group(1, &render_data.probe_vis_bind_group, &[]);
         vis_pass.dispatch_workgroups(
-            heightmap.resolution.x.div_ceil(16),
-            heightmap.resolution.y.div_ceil(16),
+            heightmap.probe_vis_resolution.x.div_ceil(16),
+            heightmap.probe_vis_resolution.y.div_ceil(16),
             1,
         );
         locals.bakes_done.1 = true;
