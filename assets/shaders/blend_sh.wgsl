@@ -99,7 +99,7 @@ const LOWPASS_HEIGHT_TOL_SPACING: f32 = 1.5;
 
 fn layer_distance_weight(dy: f32, radius: f32) -> f32 {
     let s = max(radius, 1e-3);
-    let u = abs(dy) / s;
+    let u = dy / s;
     if u >= 1.0 {
         return 0.0;
     }
@@ -117,7 +117,7 @@ fn input_word(word: u32) -> vec4<f32> {
     }
 }
 
-@compute @workgroup_size(64, 1, 1)
+@compute @workgroup_size(128, 1, 1)
 fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.x;
     if i >= blend.probe_words {
@@ -139,6 +139,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
         if probe >= info_k.probe_base
             && probe < info_k.probe_base + info_k.size.x * info_k.size.y * PROBES_PER_CELL {
             c = k;
+            break;
         }
     }
     let info = uniforms.cascades[c];
@@ -184,20 +185,26 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
             let cell_base = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL;
-            for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
-                if r_y <= 0.001 && l != layer {
-                    continue;
+            if r_y <= 0.001 {
+                let q_probe = cell_base + layer;
+                acc += input_word(q_probe * SH_STRIDE + coeff).xyz * bw;
+                wsum += bw;
+            } else {
+                for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
+                    let q_probe = cell_base + l;
+                    let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
+                    let dy = abs(q_pos.y - center_pos.y);
+                    if dy >= r_y {
+                        continue;
+                    }
+                    let wy = layer_distance_weight(dy, r_y);
+                    if wy <= 0.0 {
+                        continue;
+                    }
+                    let wn = bw * wy;
+                    acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
+                    wsum += wn;
                 }
-                let q_probe = cell_base + l;
-                let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
-                let dy = abs(q_pos.y - center_pos.y);
-                let wy = select(layer_distance_weight(dy, r_y), 1.0, r_y <= 0.001);
-                if wy <= 0.0 {
-                    continue;
-                }
-                let wn = bw * wy;
-                acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
-                wsum += wn;
             }
         }
     } else {
@@ -226,22 +233,29 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
             let qx = u32(clamp(i32(px) + offs[n].x, 0, i32(info.size.x) - 1));
             let qy = u32(clamp(i32(py) + offs[n].y, 0, i32(info.size.y) - 1));
             let cell_base = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL;
+            let bw = base_w[n];
 
             // Blur across layers within the cascade, respecting physical vertical distance.
-            for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
-                if r_y <= 0.001 && l != layer {
-                    continue;
+            if r_y <= 0.001 {
+                let q_probe = cell_base + layer;
+                acc += input_word(q_probe * SH_STRIDE + coeff).xyz * bw;
+                wsum += bw;
+            } else {
+                for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
+                    let q_probe = cell_base + l;
+                    let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
+                    let dy = abs(q_pos.y - center_pos.y);
+                    if dy >= r_y {
+                        continue;
+                    }
+                    let wy = layer_distance_weight(dy, r_y);
+                    if wy <= 0.0 {
+                        continue;
+                    }
+                    let wn = bw * wy;
+                    acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
+                    wsum += wn;
                 }
-                let q_probe = cell_base + l;
-                let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
-                let dy = abs(q_pos.y - center_pos.y);
-                let wy = select(layer_distance_weight(dy, r_y), 1.0, r_y <= 0.001);
-                if wy <= 0.0 {
-                    continue;
-                }
-                let wn = base_w[n] * wy;
-                acc += input_word(q_probe * SH_STRIDE + coeff).xyz * wn;
-                wsum += wn;
             }
         }
     }

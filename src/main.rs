@@ -6,8 +6,6 @@ mod heightmap;
 mod heightmap_bake;
 mod heightmap_verify;
 mod heightmap_view;
-mod hi_z;
-mod hi_z_debug;
 mod probe_overlay;
 mod screenshot;
 mod shade;
@@ -25,7 +23,6 @@ use bevy::gltf::GltfAssetLabel;
 use heightmap::{DEBUG_LAYER, HeightmapPlugin, LIGHT_LAYER, SCENE_LAYER};
 use heightmap_bake::HeightmapBakePlugin;
 use heightmap_view::HeightmapViewPlugin;
-use hi_z::{HiZ, HiZPlugin};
 
 fn main() {
     let measure_fps = std::env::var("S_RC_FPS").is_ok();
@@ -42,7 +39,6 @@ fn main() {
     .insert_resource(DefaultOpaqueRendererMethod::deferred())
     .add_plugins((
         DefaultPlugins,
-        HiZPlugin,
         FreeCameraPlugin,
         HeightmapPlugin,
         HeightmapBakePlugin,
@@ -184,7 +180,6 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             DepthPrepass,
             NormalPrepass,
             DeferredPrepass,
-            HiZ::default(),
             // The main camera sees the scene *and* the heightmap debug overlay;
             // the bake cameras see only the scene.
             RenderLayers::from_layers(&[SCENE_LAYER, DEBUG_LAYER, LIGHT_LAYER]),
@@ -265,7 +260,7 @@ struct CameraReadout;
 /// same `light.color * illuminance * exposure` as `cascades2_5d::update_sun`
 /// (`S_RC_SKY` overrides both, because both go through `sky_color`).
 fn sync_sky_color(
-    mut cameras: Query<(&mut Camera, Option<&bevy::camera::Exposure>), With<HiZ>>,
+    mut cameras: Query<(&mut Camera, Option<&bevy::camera::Exposure>), With<Camera3d>>,
     lights: Query<(&DirectionalLight, &GlobalTransform)>,
 ) {
     let (mut camera, exposure) = match cameras.single_mut() {

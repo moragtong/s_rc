@@ -38,7 +38,7 @@ use bevy::{
 
 use crate::heightmap::Heightmap;
 use crate::heightmap_bake::BakeState;
-use crate::ui::BlendToggleState;
+use crate::ui::{BlendToggleState, LightingState};
 
 /// Global variable controlling the number of times the spatial low-pass blur is applied.
 pub static LOWPASS_BLUR_PASSES: AtomicU32 = AtomicU32::new(30);
@@ -73,6 +73,7 @@ const BAKE_PROBE_ADJ_SHADER_PATH: &str = "shaders/bake_probe_adj.wgsl";
 /// the others.
 const LIGHT_WORKGROUP: u32 = 8;
 const WORKGROUP: u32 = 64;
+const BLEND_WORKGROUP: u32 = 128;
 /// SH probe stride in vec4s: 9 coefficients, then (position, radius).
 pub const SH_STRIDE: u64 = 10;
 /// Slots per ray in the one-shot hit cache: the top cascade's own trace, or
@@ -1005,7 +1006,9 @@ fn dispatch_cascades(
     mut frame: Local<u32>,
     mut marched: Local<bool>,
     mut bakes_done: Local<(bool, bool, bool)>,
+    mut was_indirect: Local<bool>,
     blend_toggle: Res<BlendToggleState>,
+    lighting_state: Option<Res<LightingState>>,
 ) {
     let (Some(render_data), Some(heightmap)) = (render_data, heightmap) else {
         return;
@@ -1065,6 +1068,12 @@ fn dispatch_cascades(
         return;
     }
 
+    let indirect_enabled = lighting_state.as_ref().map_or(true, |l| l.indirect_enabled);
+    if *marched && !indirect_enabled {
+        *was_indirect = false;
+        return;
+    }
+
     // Which frame of the relight interval this is, counted from 0 on the frame
     // the probes are rewritten. The march counts as one: it is the first write
     // after verification, and relighting before it has anywhere to land would
@@ -1077,44 +1086,9 @@ fn dispatch_cascades(
     } else {
         since as f32 / interval as f32
     };
-    let relight_now = need_march || since == 0;
-
-    // Number of spatial blur iterations applied.
-    let passes = if blend_toggle.lowpass {
-        LOWPASS_BLUR_PASSES
-            .load(Ordering::Relaxed)
-            .max(1)
-            .min(MAX_BLUR_PASSES as u32)
-    } else {
-        0
-    };
-
-    let probe_words = layout
-        .layout
-        .cascades
-        .iter()
-        .map(|c| (c.size.x * c.size.y) as u64 * layout::LAYERS as u64)
-        .sum::<u64>()
-        * SH_STRIDE;
-
-    let cross_layer_radius = CROSS_LAYER_RADIUS_TENTHS.load(Ordering::Relaxed) as f32 / 10.0;
-    let num_dispatches = if passes <= 1 { 1 } else { passes as usize };
-    for k in 0..num_dispatches {
-        let mut bytes = encase::UniformBuffer::new(Vec::new());
-        bytes
-            .write(&BlendUniforms {
-                alpha: relight.alpha,
-                probe_words: probe_words as u32,
-                lowpass: (passes > 0) as u32,
-                pass_index: k as u32,
-                cross_layer_radius,
-                pad0: 0.0,
-                pad1: 0.0,
-                pad2: 0.0,
-            })
-            .unwrap();
-        render_queue.write_buffer(&render_data.blend_uniform_buffers[k], 0, bytes.as_ref());
-    }
+    let re_enabled = indirect_enabled && !*was_indirect;
+    *was_indirect = indirect_enabled;
+    let relight_now = need_march || since == 0 || re_enabled;
 
     if verified && !bakes_done.0 {
         let mut pos_pass =
@@ -1196,6 +1170,10 @@ fn dispatch_cascades(
             *marched = true;
         }
 
+        if !indirect_enabled {
+            return;
+        }
+
         if relight_now {
             let phase = (relight.phase % 3) as usize;
             let bounces = BOUNCE_COUNT.load(Ordering::Relaxed).clamp(1, MAX_BOUNCE_COUNT);
@@ -1245,6 +1223,43 @@ fn dispatch_cascades(
         }
     }
 
+    // Number of spatial blur iterations applied.
+    let passes = if blend_toggle.lowpass {
+        LOWPASS_BLUR_PASSES
+            .load(Ordering::Relaxed)
+            .max(1)
+            .min(MAX_BLUR_PASSES as u32)
+    } else {
+        0
+    };
+
+    let probe_words = layout
+        .layout
+        .cascades
+        .iter()
+        .map(|c| (c.size.x * c.size.y) as u64 * layout::LAYERS as u64)
+        .sum::<u64>()
+        * SH_STRIDE;
+
+    let cross_layer_radius = CROSS_LAYER_RADIUS_TENTHS.load(Ordering::Relaxed) as f32 / 10.0;
+    let num_dispatches = if passes <= 1 { 1 } else { passes as usize };
+    for k in 0..num_dispatches {
+        let mut bytes = encase::UniformBuffer::new(Vec::new());
+        bytes
+            .write(&BlendUniforms {
+                alpha: relight.alpha,
+                probe_words: probe_words as u32,
+                lowpass: (passes > 0) as u32,
+                pass_index: k as u32,
+                cross_layer_radius,
+                pad0: 0.0,
+                pad1: 0.0,
+                pad2: 0.0,
+            })
+            .unwrap();
+        render_queue.write_buffer(&render_data.blend_uniform_buffers[k], 0, bytes.as_ref());
+    }
+
     let phase = (relight.phase % 3) as usize;
     if passes <= 1 {
         let mut blend_pass =
@@ -1257,7 +1272,7 @@ fn dispatch_cascades(
         blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
         blend_pass.set_pipeline(blend);
         blend_pass.set_bind_group(1, &render_data.blend_pass0_to_blend[phase], &[]);
-        blend_pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
+        blend_pass.dispatch_workgroups(probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32, 1, 1);
     } else {
         let mut writing_to_blend = passes % 2 != 0;
         {
@@ -1275,7 +1290,7 @@ fn dispatch_cascades(
             } else {
                 blend_pass.set_bind_group(1, &render_data.blend_pass0_to_scratch[phase], &[]);
             }
-            blend_pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
+            blend_pass.dispatch_workgroups(probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32, 1, 1);
         }
 
         for k in 1..passes as usize {
@@ -1294,7 +1309,7 @@ fn dispatch_cascades(
             } else {
                 blend_pass.set_bind_group(1, &render_data.blend_pong[k], &[]);
             }
-            blend_pass.dispatch_workgroups(probe_words.div_ceil(WORKGROUP as u64) as u32, 1, 1);
+            blend_pass.dispatch_workgroups(probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32, 1, 1);
         }
     }
 }

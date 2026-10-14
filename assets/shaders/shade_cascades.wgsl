@@ -17,9 +17,10 @@ struct ShadeUniforms {
     indirect_enabled: u32,
     normal_bias_enabled: u32,
     use_vis_mask: u32,
-    pad: u32,
+    ao_enabled: u32,
 }
 @group(1) @binding(3) var<uniform> view_info: ShadeUniforms;
+@group(1) @binding(4) var ao_tex: texture_2d<f32>;
 
 // Weight normalization epsilon - prevents division by near-zero when all probes are occluded.
 const WEIGHT_EPS: f32 = 1e-4;
@@ -149,5 +150,6 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     if w_sum > WEIGHT_EPS {
         e = e_blend / w_sum;
     }
-    return vec4<f32>(base_color / PI * e, 0.0);
+    let ao = select(1.0, textureLoad(ao_tex, pixel, 0).r, view_info.ao_enabled != 0u);
+    return vec4<f32>((base_color / PI * e) * ao, 0.0);
 }
