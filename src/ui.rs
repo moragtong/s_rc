@@ -758,7 +758,7 @@ fn setup_ui(mut commands: Commands) {
                 .with_children(|sec| {
                     sec.spawn((
                         Text::new(format!(
-                            "Temporal Bounce: {} frames",
+                            "Temporal Bounce: {}",
                             initial_temporal_bounce
                         )),
                         TextColor(Color::srgb(0.95, 0.65, 0.35)),
@@ -1560,7 +1560,7 @@ fn slider_system(
         blend_toggle.temporal_bounce_passes = new_temporal_bounce;
 
         for mut text in &mut q.temporal_bounce_label {
-            text.0 = format!("Temporal Bounce: {} frames", new_temporal_bounce);
+            text.0 = format!("Temporal Bounce: {}", new_temporal_bounce);
         }
 
         let pct = (new_temporal_bounce.saturating_sub(1)) as f32

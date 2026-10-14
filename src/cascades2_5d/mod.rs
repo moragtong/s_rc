@@ -89,7 +89,7 @@ pub const SH_STRIDE: u64 = 5;
 const HITS_PER_RAY: u64 = 4;
 /// Frames between two relights. The sun moves every frame, so this is the
 /// period the indirect light lags behind the direct light by.
-pub const RELIGHT_INTERVAL: u32 = 2;
+pub const RELIGHT_INTERVAL: u32 = 30;
 /// Which of the three rotating probe buffers plays each role, per
 /// [`Relight::phase`]. `A` is `blend_sh`'s `cur` operand (weight `alpha`, the
 /// freshest relight), `B` its `prev` operand (weight `1 - alpha`), and `G`
@@ -1068,6 +1068,9 @@ struct CascadeLocals {
     history_valid: bool,
     bounce_hist_index: usize,
     bounce_history_valid: bool,
+    prev_temporal_bounce: u32,
+    prev_temporal_blur: u32,
+    prev_in_frame_bounces: u32,
 }
 
 fn dispatch_cascades(
@@ -1148,14 +1151,41 @@ fn dispatch_cascades(
         return;
     }
 
-    // Relight continuously every frame so fresh radiance feeds the temporal accumulator (EMA).
-    relight.interval = 1;
-    let since = 0;
+    let interval = relight.interval.max(1);
+    let since = locals.frame % interval;
     locals.frame = locals.frame.wrapping_add(1);
-    relight.alpha = 1.0;
+    relight.alpha = if interval == 1 {
+        1.0
+    } else {
+        (since as f32 + 1.0) / interval as f32
+    };
     let re_enabled = indirect_enabled && !locals.was_indirect;
     locals.was_indirect = indirect_enabled;
-    let relight_now = need_march || since == 0 || re_enabled;
+
+    let n_bounce = TEMPORAL_BOUNCE_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_TEMPORAL_BOUNCE_PASSES);
+    let bounce_changed = locals.prev_temporal_bounce != n_bounce;
+    locals.prev_temporal_bounce = n_bounce;
+
+    let n_blur = TEMPORAL_BLUR_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_TEMPORAL_PASSES);
+    let blur_changed = locals.prev_temporal_blur != n_blur;
+    locals.prev_temporal_blur = n_blur;
+
+    let in_frame_bounces = BOUNCE_COUNT
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_BOUNCE_COUNT);
+    let in_bounces_changed = locals.prev_in_frame_bounces != in_frame_bounces;
+    locals.prev_in_frame_bounces = in_frame_bounces;
+
+    let relight_now = need_march
+        || since == 0
+        || re_enabled
+        || bounce_changed
+        || blur_changed
+        || in_bounces_changed;
 
     if verified && !locals.bakes_done.0 {
         let mut pos_pass =
@@ -1243,23 +1273,17 @@ fn dispatch_cascades(
 
         if relight_now {
             let phase = (relight.phase % 3) as usize;
-            let bounces = BOUNCE_COUNT
-                .load(Ordering::Relaxed)
-                .clamp(1, MAX_BOUNCE_COUNT);
+            let bounces = in_frame_bounces;
             let use_temporal = blend_toggle.temporal_bounce && !need_march;
 
             let bh_prev = locals.bounce_hist_index;
             let bh_curr = 1 - bh_prev;
             locals.bounce_hist_index = bh_curr;
 
-            let n_bounce = TEMPORAL_BOUNCE_PASSES
-                .load(Ordering::Relaxed)
-                .clamp(1, MAX_TEMPORAL_BOUNCE_PASSES);
-            let is_first_bounce = need_march || re_enabled || !locals.bounce_history_valid;
-            let bounce_lambda = if is_first_bounce {
-                1.0
+            let temporal_weight = if !use_temporal || n_bounce <= 1 {
+                0.0
             } else {
-                1.0 / (n_bounce as f32)
+                ((n_bounce - 1) as f32 / (MAX_TEMPORAL_BOUNCE_PASSES - 1) as f32).powf(0.6)
             };
             if use_temporal {
                 locals.bounce_history_valid = true;
@@ -1272,8 +1296,8 @@ fn dispatch_cascades(
                 light_bytes
                     .write(&LightUniforms {
                         bounce_index: b,
-                        temporal_bounce: if b == 0 && use_temporal { 1 } else { 0 },
-                        temporal_weight: bounce_lambda,
+                        temporal_bounce: if b == 0 && use_temporal && n_bounce > 1 { 1 } else { 0 },
+                        temporal_weight,
                         pad0: 0,
                     })
                     .unwrap();
@@ -1350,11 +1374,17 @@ fn dispatch_cascades(
     };
     locals.history_valid = true;
 
-    // Pass 0 uniform: strictly per-probe temporal EMA accumulation (lowpass = 0, alpha = lambda)
+    let blend_alpha = if interval > 1 {
+        relight.alpha
+    } else {
+        lambda
+    };
+
+    // Pass 0 uniform: strictly per-probe temporal EMA accumulation (lowpass = 0, alpha = blend_alpha)
     let mut bytes0 = encase::UniformBuffer::new(Vec::new());
     bytes0
         .write(&BlendUniforms {
-            alpha: lambda,
+            alpha: blend_alpha,
             probe_words: probe_words as u32,
             lowpass: 0,
             pass_index: 0,

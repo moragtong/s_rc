@@ -153,10 +153,9 @@ fn surface_light(@builtin(global_invocation_id) id: vec3<u32>) {
         vis_c = res_c.visible;
         if light_info.bounce_index > 0u {
             ceiling += (albedo_c / PI) * evaluate_probe_irradiance(pos_c, norm_c);
-        } else if light_info.temporal_bounce > 0u {
-            let new_bounce = (albedo_c / PI) * evaluate_probe_irradiance(pos_c, norm_c);
-            let hist = bounce_history_in[texel_idx * 2u + 0u].rgb;
-            let accum = mix(hist, new_bounce, light_info.temporal_weight);
+        } else if light_info.temporal_bounce > 0u && light_info.temporal_weight > 0.0 {
+            let indirect = (albedo_c / PI) * evaluate_probe_irradiance(pos_c, norm_c);
+            let accum = light_info.temporal_weight * indirect;
             bounce_history_out[texel_idx * 2u + 0u] = vec4<f32>(accum, 0.0);
             ceiling += accum;
         } else {
@@ -178,10 +177,9 @@ fn surface_light(@builtin(global_invocation_id) id: vec3<u32>) {
         vis_f = res_f.visible;
         if light_info.bounce_index > 0u {
             floor_l += (albedo_f / PI) * evaluate_probe_irradiance(pos_f, norm_f);
-        } else if light_info.temporal_bounce > 0u {
-            let new_bounce = (albedo_f / PI) * evaluate_probe_irradiance(pos_f, norm_f);
-            let hist = bounce_history_in[texel_idx * 2u + 1u].rgb;
-            let accum = mix(hist, new_bounce, light_info.temporal_weight);
+        } else if light_info.temporal_bounce > 0u && light_info.temporal_weight > 0.0 {
+            let indirect = (albedo_f / PI) * evaluate_probe_irradiance(pos_f, norm_f);
+            let accum = light_info.temporal_weight * indirect;
             bounce_history_out[texel_idx * 2u + 1u] = vec4<f32>(accum, 0.0);
             floor_l += accum;
         } else {
