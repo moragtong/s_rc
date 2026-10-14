@@ -55,9 +55,9 @@ pub const MAX_BOUNCE_COUNT: u32 = 4;
 #[derive(ShaderType, Clone, Copy, Default)]
 struct LightUniforms {
     pub bounce_index: u32,
+    pub temporal_bounce: u32,
     pub pad0: u32,
     pub pad1: u32,
-    pub pad2: u32,
 }
 
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
@@ -838,6 +838,13 @@ fn prepare_buffers(
     );
     let light_bind_groups: [[BindGroup; 3]; MAX_BOUNCE_COUNT as usize] = std::array::from_fn(|b| {
         [0, 1, 2].map(|p| {
+            // b == 0 reads the converged/blurred probe buffer from the previous frame for temporal bounce.
+            // b > 0 reads the fresh in-frame gather target of phase p.
+            let probe_buf = if b == 0 {
+                &sh_probes_blend_buffer
+            } else {
+                &sh_probes[G_OF_PHASE[p]]
+            };
             bind_group(
                 &format!("cascades_light_b{b}_p{p}"),
                 &pipeline.light_layout,
@@ -848,8 +855,7 @@ fn prepare_buffers(
                     albedo_max,
                     radiance_min,
                     radiance_max,
-                    // Bounces read the fresh gather target of phase p
-                    sh_probes[G_OF_PHASE[p]].as_entire_binding(),
+                    probe_buf.as_entire_binding(),
                     light_uniform_buffers[b].as_entire_binding(),
                 )),
             )
@@ -1180,15 +1186,16 @@ fn dispatch_cascades(
             let bounces = BOUNCE_COUNT
                 .load(Ordering::Relaxed)
                 .clamp(1, MAX_BOUNCE_COUNT);
+            let use_temporal = blend_toggle.temporal_bounce && !need_march;
 
             for b in 0..bounces {
                 let mut light_bytes = encase::UniformBuffer::new(Vec::new());
                 light_bytes
                     .write(&LightUniforms {
                         bounce_index: b,
+                        temporal_bounce: if b == 0 && use_temporal { 1 } else { 0 },
                         pad0: 0,
                         pad1: 0,
-                        pad2: 0,
                     })
                     .unwrap();
                 render_queue.write_buffer(

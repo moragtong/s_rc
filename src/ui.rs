@@ -48,15 +48,21 @@ pub struct BlendToggleState {
     pub cross_layer_radius: f32,
     /// Number of diffuse bounces (1 to 4).
     pub bounces: u32,
+    /// Temporal bounce accumulation across relight intervals.
+    pub temporal_bounce: bool,
 }
 
 impl Default for BlendToggleState {
     fn default() -> Self {
+        let temporal_bounce = std::env::var("S_RC_TEMPORAL_BOUNCE")
+            .map(|s| s != "0" && s != "false" && s != "FALSE")
+            .unwrap_or(true);
         Self {
             lowpass: true,
             blur_passes: 30,
             cross_layer_radius: 2.0,
             bounces: 2,
+            temporal_bounce,
         }
     }
 }
@@ -73,6 +79,7 @@ pub enum Action {
     ToggleNormalBias,
     ToggleLowPass,
     ToggleSsoA,
+    ToggleTemporalBounce,
 }
 
 #[derive(Component)]
@@ -256,6 +263,19 @@ fn setup_ui(mut commands: Commands) {
                     ActionButton(Action::ToggleSsoA),
                 ))
                 .with_child((Text::new("Bevy SSAO (U)"), TextColor(Color::WHITE)));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
+                    ActionButton(Action::ToggleTemporalBounce),
+                ))
+                .with_child((Text::new("Temporal Bounce (B)"), TextColor(Color::WHITE)));
         });
 
     // Top-right corner: FPS Counter
@@ -606,6 +626,7 @@ fn button_system(
     let mut toggle_bias = keys.just_pressed(KeyCode::KeyN);
     let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
     let mut toggle_ssao = keys.just_pressed(KeyCode::KeyU);
+    let mut toggle_tb = keys.just_pressed(KeyCode::KeyB);
 
     for (interaction, mut color, action) in &mut interaction_query {
         if *interaction == Interaction::Pressed {
@@ -617,6 +638,7 @@ fn button_system(
                 Action::ToggleNormalBias => toggle_bias = true,
                 Action::ToggleLowPass => toggle_lp = true,
                 Action::ToggleSsoA => toggle_ssao = true,
+                Action::ToggleTemporalBounce => toggle_tb = true,
             }
         }
         match action.0 {
@@ -657,6 +679,13 @@ fn button_system(
             }
             Action::ToggleSsoA => {
                 color.0 = if lighting_state.bevy_ssao_enabled {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                };
+            }
+            Action::ToggleTemporalBounce => {
+                color.0 = if blend_toggle.temporal_bounce {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)
@@ -713,6 +742,11 @@ fn button_system(
     if toggle_ssao {
         lighting_state.bevy_ssao_enabled = !lighting_state.bevy_ssao_enabled;
         bevy::log::info!("Bevy SSAO: {}", lighting_state.bevy_ssao_enabled);
+    }
+
+    if toggle_tb {
+        blend_toggle.temporal_bounce = !blend_toggle.temporal_bounce;
+        bevy::log::info!("Temporal bounce: {}", blend_toggle.temporal_bounce);
     }
 }
 

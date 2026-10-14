@@ -18,9 +18,9 @@
 
 struct LightUniforms {
     bounce_index: u32,
+    temporal_bounce: u32,
     pad0: u32,
     pad1: u32,
-    pad2: u32,
 }
 @group(1) @binding(7) var<uniform> light_info: LightUniforms;
 
@@ -147,7 +147,7 @@ fn surface_light(@builtin(global_invocation_id) id: vec3<u32>) {
         let res_c = sunlit(pos_c, norm_c, albedo_c);
         ceiling = res_c.radiance;
         vis_c = res_c.visible;
-        if light_info.bounce_index > 0u {
+        if light_info.bounce_index > 0u || light_info.temporal_bounce > 0u {
             ceiling += (albedo_c / PI) * evaluate_probe_irradiance(pos_c, norm_c);
         }
     }
@@ -162,7 +162,7 @@ fn surface_light(@builtin(global_invocation_id) id: vec3<u32>) {
         let res_f = sunlit(pos_f, norm_f, albedo_f);
         floor_l = res_f.radiance;
         vis_f = res_f.visible;
-        if light_info.bounce_index > 0u {
+        if light_info.bounce_index > 0u || light_info.temporal_bounce > 0u {
             floor_l += (albedo_f / PI) * evaluate_probe_irradiance(pos_f, norm_f);
         }
     }
