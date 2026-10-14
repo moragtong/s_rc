@@ -49,6 +49,7 @@ use crate::heightmap::{
     BAKE_LAYER, BAKE_NEAR, EMPTY_FLOOR, Heightmap, NO_CEILING, RESOLUTION, SCENE_LAYER,
 };
 use crate::heightmap_view::HeightmapViewMesh;
+use crate::CameraProbeObject;
 
 const SHADER_PATH: &str = "shaders/heightmap_bake.wgsl";
 const WORKGROUP: u32 = 8;
@@ -336,6 +337,7 @@ fn tag_scene_meshes(
         (
             With<Mesh3d>,
             Without<HeightmapViewMesh>,
+            Without<CameraProbeObject>,
             Without<RenderLayers>,
         ),
     >,
@@ -431,7 +433,7 @@ pub(crate) fn measure_scene_extent(
     scene: Res<SceneAsset>,
     asset_server: Res<AssetServer>,
     meshes: Res<Assets<Mesh>>,
-    query: Query<(&Mesh3d, &GlobalTransform), Without<HeightmapViewMesh>>,
+    query: Query<(&Mesh3d, &GlobalTransform), (Without<HeightmapViewMesh>, Without<CameraProbeObject>)>,
     mut cameras: Query<(&mut Projection, &BakeView, &mut Transform)>,
     mut heightmap: ResMut<Heightmap>,
 ) {

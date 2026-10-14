@@ -148,7 +148,12 @@ fn animate_sun(
     }
 }
 
-fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
+fn setup_scene(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
     use bevy::world_serialization::WorldAssetRoot;
     let scene: Handle<bevy::world_serialization::WorldAsset> =
         asset_server.load(GltfAssetLabel::Scene(0).from_asset("models/room.glb"));
@@ -187,6 +192,21 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
             bevy::ui::IsDefaultUiCamera,
             initial_camera_transform(),
         ))
+        .with_children(|parent| {
+            parent.spawn((
+                Mesh3d(meshes.add(Sphere::new(0.18))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.9, 0.9, 0.9),
+                    perceptual_roughness: 0.35,
+                    metallic: 0.0,
+                    reflectance: 0.5,
+                    ..default()
+                })),
+                Transform::from_xyz(0.28, -0.22, -0.9),
+                RenderLayers::layer(SCENE_LAYER),
+                CameraProbeObject,
+            ));
+        })
         .id();
 
     // SSAO runs in the deferred prepass and multiplies ambient light, but with
@@ -252,6 +272,10 @@ fn camera_readout(
 /// Marks the `S_RC_CAM` readout in the corner.
 #[derive(Component)]
 struct CameraReadout;
+
+/// Marker for the inspection probe object attached to the camera.
+#[derive(Component)]
+pub struct CameraProbeObject;
 
 /// Paints the main camera's backdrop with the same sky the cascade probes
 /// record: `cascades2_5d::sky_color` is the radiance a probe ray stores on

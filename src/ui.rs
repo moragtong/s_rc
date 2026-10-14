@@ -95,6 +95,7 @@ pub enum Action {
     ToggleLowPass,
     ToggleSsoA,
     ToggleTemporalBounce,
+    ToggleCameraObject,
 }
 
 #[derive(Component)]
@@ -316,6 +317,19 @@ fn setup_ui(mut commands: Commands) {
                     ActionButton(Action::ToggleTemporalBounce),
                 ))
                 .with_child((Text::new("Temporal Bounce (B)"), TextColor(Color::WHITE)));
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(10.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.35, 0.75, 0.35)),
+                    ActionButton(Action::ToggleCameraObject),
+                ))
+                .with_child((Text::new("Camera Object (O)"), TextColor(Color::WHITE)));
         });
 
     // Top-right corner: FPS Counter
@@ -849,7 +863,8 @@ fn setup_ui(mut commands: Commands) {
 fn button_system(
     mut interaction_query: Query<(&Interaction, &mut BackgroundColor, &ActionButton), With<Button>>,
     keys: Res<ButtonInput<KeyCode>>,
-    mut heightmap_query: Query<&mut Visibility, With<crate::heightmap_view::HeightmapViewMesh>>,
+    mut heightmap_query: Query<&mut Visibility, (With<crate::heightmap_view::HeightmapViewMesh>, Without<crate::CameraProbeObject>)>,
+    mut cam_obj_query: Query<&mut Visibility, (With<crate::CameraProbeObject>, Without<crate::heightmap_view::HeightmapViewMesh>)>,
     mut lighting_state: ResMut<LightingState>,
     mut blend_toggle: ResMut<BlendToggleState>,
 ) {
@@ -861,6 +876,7 @@ fn button_system(
     let mut toggle_lp = keys.just_pressed(KeyCode::KeyF);
     let mut toggle_ssao = keys.just_pressed(KeyCode::KeyU);
     let mut toggle_tb = keys.just_pressed(KeyCode::KeyB);
+    let mut toggle_obj = keys.just_pressed(KeyCode::KeyO);
 
     for (interaction, mut color, action) in &mut interaction_query {
         if *interaction == Interaction::Pressed {
@@ -873,6 +889,7 @@ fn button_system(
                 Action::ToggleLowPass => toggle_lp = true,
                 Action::ToggleSsoA => toggle_ssao = true,
                 Action::ToggleTemporalBounce => toggle_tb = true,
+                Action::ToggleCameraObject => toggle_obj = true,
             }
         }
         match action.0 {
@@ -920,6 +937,18 @@ fn button_system(
             }
             Action::ToggleTemporalBounce => {
                 color.0 = if blend_toggle.temporal_bounce {
+                    Color::srgb(0.35, 0.75, 0.35)
+                } else {
+                    Color::srgb(0.15, 0.15, 0.15)
+                };
+            }
+            Action::ToggleCameraObject => {
+                let is_vis = cam_obj_query
+                    .iter()
+                    .next()
+                    .map(|v| *v != Visibility::Hidden)
+                    .unwrap_or(true);
+                color.0 = if is_vis {
                     Color::srgb(0.35, 0.75, 0.35)
                 } else {
                     Color::srgb(0.15, 0.15, 0.15)
@@ -981,6 +1010,16 @@ fn button_system(
     if toggle_tb {
         blend_toggle.temporal_bounce = !blend_toggle.temporal_bounce;
         bevy::log::info!("Temporal bounce: {}", blend_toggle.temporal_bounce);
+    }
+
+    if toggle_obj {
+        for mut vis in &mut cam_obj_query {
+            *vis = match *vis {
+                Visibility::Hidden => Visibility::Inherited,
+                _ => Visibility::Hidden,
+            };
+            bevy::log::info!("Camera probe object: {:?}", *vis);
+        }
     }
 }
 

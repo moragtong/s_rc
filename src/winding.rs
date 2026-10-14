@@ -33,6 +33,7 @@ use bevy::{
 use crate::heightmap::{Heightmap, MAX_BOUNDS, MIN_BOUNDS, RESOLUTION, SPLIT};
 use crate::heightmap_bake::{BakeState, SceneAsset};
 use crate::heightmap_view::HeightmapViewMesh;
+use crate::CameraProbeObject;
 
 pub struct WindingPlugin;
 
@@ -55,7 +56,7 @@ fn build_winding_map(
     scene: Res<SceneAsset>,
     asset_server: Res<AssetServer>,
     meshes: Res<Assets<Mesh>>,
-    query: Query<(&Mesh3d, &GlobalTransform), Without<HeightmapViewMesh>>,
+    query: Query<(&Mesh3d, &GlobalTransform), (Without<HeightmapViewMesh>, Without<CameraProbeObject>)>,
     heightmap: Res<Heightmap>,
     mut images: ResMut<Assets<Image>>,
 ) {
@@ -132,7 +133,7 @@ fn build_winding_map(
 /// or `None` if any mesh handle has not resolved yet.
 fn slice_scene(
     meshes: &Assets<Mesh>,
-    query: &Query<(&Mesh3d, &GlobalTransform), Without<HeightmapViewMesh>>,
+    query: &Query<(&Mesh3d, &GlobalTransform), (Without<HeightmapViewMesh>, Without<CameraProbeObject>)>,
 ) -> Option<Vec<Segment>> {
     let mut segments = Vec::new();
     for (handle, transform) in query {
