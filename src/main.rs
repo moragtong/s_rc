@@ -260,7 +260,7 @@ struct CameraReadout;
 /// same `light.color * illuminance * exposure` as `cascades2_5d::update_sun`
 /// (`S_RC_SKY` overrides both, because both go through `sky_color`).
 fn sync_sky_color(
-    mut cameras: Query<(&mut Camera, Option<&bevy::camera::Exposure>), With<Camera3d>>,
+    mut cameras: Query<(&mut Camera, Option<&bevy::camera::Exposure>), With<FreeCamera>>,
     lights: Query<(&DirectionalLight, &GlobalTransform)>,
 ) {
     let (mut camera, exposure) = match cameras.single_mut() {

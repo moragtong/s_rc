@@ -104,7 +104,11 @@ fn layer_distance_weight(dy: f32, radius: f32) -> f32 {
         return 0.0;
     }
     let inv_u2 = 1.0 - u * u;
-    return inv_u2 * inv_u2;
+    let w = inv_u2 * inv_u2;
+    if w <= WEIGHT_EPS {
+        return 0.0;
+    }
+    return w;
 }
 
 const WEIGHT_EPS: f32 = 1e-3;
@@ -162,6 +166,26 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let r_y = blend.cross_layer_radius;
 
+    // Early exit if this probe has no visible horizontal neighbors and vertical blur is disabled:
+    // (adj_mask & ~16u) == 0 means none of the 8 neighbors is visible to the center probe.
+    if ((adj_mask & ~16u) == 0u) && (r_y <= 0.001) {
+        sh_probes_out[i] = input_word(i);
+        return;
+    }
+
+    // Precalculate clamped neighbor indices across X and Y once (hoisted arithmetic)
+    let x_prev = select(px - 1u, 0u, px == 0u);
+    let x_curr = px;
+    let x_next = min(px + 1u, info.size.x - 1u);
+
+    let y_prev = select(py - 1u, 0u, py == 0u);
+    let y_curr = py;
+    let y_next = min(py + 1u, info.size.y - 1u);
+
+    let row_prev = info.probe_base + y_prev * info.size.x * PROBES_PER_CELL;
+    let row_curr = info.probe_base + y_curr * info.size.x * PROBES_PER_CELL;
+    let row_next = info.probe_base + y_next * info.size.x * PROBES_PER_CELL;
+
     if TENT_PREFILTER {
         // PREVIOUS anisotropic 5-tap cross (see the header). Kept for A/B.
         for (var n = 0u; n < 5u; n = n + 1u) {
@@ -175,13 +199,13 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
                 bw = FILTER_NEIGHBOUR;
                 if n == 1u {
-                    if px > 0u { qx = px - 1u; }
+                    qx = x_prev;
                 } else if n == 2u {
-                    if px + 1u < info.size.x { qx = px + 1u; }
+                    qx = x_next;
                 } else if n == 3u {
-                    if py > 0u { qy = py - 1u; }
+                    qy = y_prev;
                 } else {
-                    if py + 1u < info.size.y { qy = py + 1u; }
+                    qy = y_next;
                 }
             }
             let cell_base = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL;
@@ -198,7 +222,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
                         continue;
                     }
                     let wy = layer_distance_weight(dy, r_y);
-                    if wy <= 0.0 {
+                    if wy <= WEIGHT_EPS {
                         continue;
                     }
                     let wn = bw * wy;
@@ -208,39 +232,83 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
     } else {
-        // Cubic B-spline pre-filter: separable [1,4,1]/6 tensor mask across the
-        // 3x3 horizontal footprint, combined with continuous distance weighting
-        // across vertical layers within the cascade.
-        let offs = array<vec2<i32>, 9>(
-            vec2<i32>(-1, -1), vec2<i32>(0, -1), vec2<i32>(1, -1),
-            vec2<i32>(-1,  0), vec2<i32>(0,  0), vec2<i32>(1,  0),
-            vec2<i32>(-1,  1), vec2<i32>(0,  1), vec2<i32>(1,  1),
-        );
-        let base_w = array<f32, 9>(
-            BSPLINE_CORNER, BSPLINE_EDGE, BSPLINE_CORNER,
-            BSPLINE_EDGE, BSPLINE_CENTER, BSPLINE_EDGE,
-            BSPLINE_CORNER, BSPLINE_EDGE, BSPLINE_CORNER,
-        );
-        for (var n = 0u; n < 9u; n = n + 1u) {
-            // Pre-baked probe-to-probe visibility test:
-            // bit n is 1 if neighbor column n is visible, 0 if occluded by a wall.
-            // Center tap (n == 4u) is always visible to itself.
-            if n != 4u && ((adj_mask & (1u << n)) == 0u) {
-                continue;
+        // Cubic B-spline pre-filter: separable [1,4,1]/6 tensor mask across the 3x3 footprint.
+        if r_y <= 0.001 {
+            // Completely unrolled fast path for horizontal smoothing (structured registers, zero stack spills)
+            // Center tap (always visible to itself)
+            let center_probe = row_curr + x_curr * PROBES_PER_CELL + layer;
+            acc += input_word(center_probe * SH_STRIDE + coeff).xyz * BSPLINE_CENTER;
+            wsum += BSPLINE_CENTER;
+
+            // 4 Axis taps (BSPLINE_EDGE = 4/36)
+            if (adj_mask & (1u << 1u)) != 0u {
+                let p1 = row_prev + x_curr * PROBES_PER_CELL + layer;
+                acc += input_word(p1 * SH_STRIDE + coeff).xyz * BSPLINE_EDGE;
+                wsum += BSPLINE_EDGE;
+            }
+            if (adj_mask & (1u << 3u)) != 0u {
+                let p3 = row_curr + x_prev * PROBES_PER_CELL + layer;
+                acc += input_word(p3 * SH_STRIDE + coeff).xyz * BSPLINE_EDGE;
+                wsum += BSPLINE_EDGE;
+            }
+            if (adj_mask & (1u << 5u)) != 0u {
+                let p5 = row_curr + x_next * PROBES_PER_CELL + layer;
+                acc += input_word(p5 * SH_STRIDE + coeff).xyz * BSPLINE_EDGE;
+                wsum += BSPLINE_EDGE;
+            }
+            if (adj_mask & (1u << 7u)) != 0u {
+                let p7 = row_next + x_curr * PROBES_PER_CELL + layer;
+                acc += input_word(p7 * SH_STRIDE + coeff).xyz * BSPLINE_EDGE;
+                wsum += BSPLINE_EDGE;
             }
 
-            // Clamp at the grid edge (replicate).
-            let qx = u32(clamp(i32(px) + offs[n].x, 0, i32(info.size.x) - 1));
-            let qy = u32(clamp(i32(py) + offs[n].y, 0, i32(info.size.y) - 1));
-            let cell_base = info.probe_base + (qy * info.size.x + qx) * PROBES_PER_CELL;
-            let bw = base_w[n];
+            // 4 Corner taps (BSPLINE_CORNER = 1/36)
+            if (adj_mask & (1u << 0u)) != 0u {
+                let p0 = row_prev + x_prev * PROBES_PER_CELL + layer;
+                acc += input_word(p0 * SH_STRIDE + coeff).xyz * BSPLINE_CORNER;
+                wsum += BSPLINE_CORNER;
+            }
+            if (adj_mask & (1u << 2u)) != 0u {
+                let p2 = row_prev + x_next * PROBES_PER_CELL + layer;
+                acc += input_word(p2 * SH_STRIDE + coeff).xyz * BSPLINE_CORNER;
+                wsum += BSPLINE_CORNER;
+            }
+            if (adj_mask & (1u << 6u)) != 0u {
+                let p6 = row_next + x_prev * PROBES_PER_CELL + layer;
+                acc += input_word(p6 * SH_STRIDE + coeff).xyz * BSPLINE_CORNER;
+                wsum += BSPLINE_CORNER;
+            }
+            if (adj_mask & (1u << 8u)) != 0u {
+                let p8 = row_next + x_next * PROBES_PER_CELL + layer;
+                acc += input_word(p8 * SH_STRIDE + coeff).xyz * BSPLINE_CORNER;
+                wsum += BSPLINE_CORNER;
+            }
+        } else {
+            // Continuous cross-layer blur path with precomputed cell bases
+            let cell_bases = array<u32, 9>(
+                row_prev + x_prev * PROBES_PER_CELL,
+                row_prev + x_curr * PROBES_PER_CELL,
+                row_prev + x_next * PROBES_PER_CELL,
+                row_curr + x_prev * PROBES_PER_CELL,
+                row_curr + x_curr * PROBES_PER_CELL,
+                row_curr + x_next * PROBES_PER_CELL,
+                row_next + x_prev * PROBES_PER_CELL,
+                row_next + x_curr * PROBES_PER_CELL,
+                row_next + x_next * PROBES_PER_CELL,
+            );
+            let base_w = array<f32, 9>(
+                BSPLINE_CORNER, BSPLINE_EDGE, BSPLINE_CORNER,
+                BSPLINE_EDGE, BSPLINE_CENTER, BSPLINE_EDGE,
+                BSPLINE_CORNER, BSPLINE_EDGE, BSPLINE_CORNER,
+            );
 
-            // Blur across layers within the cascade, respecting physical vertical distance.
-            if r_y <= 0.001 {
-                let q_probe = cell_base + layer;
-                acc += input_word(q_probe * SH_STRIDE + coeff).xyz * bw;
-                wsum += bw;
-            } else {
+            for (var n = 0u; n < 9u; n = n + 1u) {
+                if n != 4u && ((adj_mask & (1u << n)) == 0u) {
+                    continue;
+                }
+                let cell_base = cell_bases[n];
+                let bw = base_w[n];
+
                 for (var l = 0u; l < PROBES_PER_CELL; l = l + 1u) {
                     let q_probe = cell_base + l;
                     let q_pos = input_word(q_probe * SH_STRIDE + 9u).xyz;
@@ -249,7 +317,7 @@ fn blend_sh(@builtin(global_invocation_id) id: vec3<u32>) {
                         continue;
                     }
                     let wy = layer_distance_weight(dy, r_y);
-                    if wy <= 0.0 {
+                    if wy <= WEIGHT_EPS {
                         continue;
                     }
                     let wn = bw * wy;
