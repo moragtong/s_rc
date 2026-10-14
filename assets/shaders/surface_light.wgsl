@@ -19,10 +19,12 @@
 struct LightUniforms {
     bounce_index: u32,
     temporal_bounce: u32,
+    temporal_weight: f32,
     pad0: u32,
-    pad1: u32,
 }
 @group(1) @binding(7) var<uniform> light_info: LightUniforms;
+@group(1) @binding(8) var<storage, read> bounce_history_in: array<vec4<f32>>;
+@group(1) @binding(9) var<storage, read_write> bounce_history_out: array<vec4<f32>>;
 
 // Shadow rays start this far off the surface, m.
 // Matches SHADOW_RAY_BIAS in heightmap_trace.wgsl.
@@ -137,6 +139,8 @@ fn surface_light(@builtin(global_invocation_id) id: vec3<u32>) {
     let xz = (vec2<f32>(id.xy) + 0.5) * cell_size() + uniforms.hmap_min;
     let h = textureLoad(heightmap, texel, 0).xy;
 
+    let texel_idx = id.y * uniforms.hmap_res.x + id.x;
+
     var ceiling = vec3<f32>(0.0);
     var vis_c = 0.0;
     let n_ceiling = textureLoad(normal_min, texel, 0).xyz;
@@ -147,9 +151,19 @@ fn surface_light(@builtin(global_invocation_id) id: vec3<u32>) {
         let res_c = sunlit(pos_c, norm_c, albedo_c);
         ceiling = res_c.radiance;
         vis_c = res_c.visible;
-        if light_info.bounce_index > 0u || light_info.temporal_bounce > 0u {
+        if light_info.bounce_index > 0u {
             ceiling += (albedo_c / PI) * evaluate_probe_irradiance(pos_c, norm_c);
+        } else if light_info.temporal_bounce > 0u {
+            let new_bounce = (albedo_c / PI) * evaluate_probe_irradiance(pos_c, norm_c);
+            let hist = bounce_history_in[texel_idx * 2u + 0u].rgb;
+            let accum = mix(hist, new_bounce, light_info.temporal_weight);
+            bounce_history_out[texel_idx * 2u + 0u] = vec4<f32>(accum, 0.0);
+            ceiling += accum;
+        } else {
+            bounce_history_out[texel_idx * 2u + 0u] = vec4<f32>(0.0);
         }
+    } else if light_info.bounce_index == 0u {
+        bounce_history_out[texel_idx * 2u + 0u] = vec4<f32>(0.0);
     }
 
     var floor_l = vec3<f32>(0.0);
@@ -162,9 +176,19 @@ fn surface_light(@builtin(global_invocation_id) id: vec3<u32>) {
         let res_f = sunlit(pos_f, norm_f, albedo_f);
         floor_l = res_f.radiance;
         vis_f = res_f.visible;
-        if light_info.bounce_index > 0u || light_info.temporal_bounce > 0u {
+        if light_info.bounce_index > 0u {
             floor_l += (albedo_f / PI) * evaluate_probe_irradiance(pos_f, norm_f);
+        } else if light_info.temporal_bounce > 0u {
+            let new_bounce = (albedo_f / PI) * evaluate_probe_irradiance(pos_f, norm_f);
+            let hist = bounce_history_in[texel_idx * 2u + 1u].rgb;
+            let accum = mix(hist, new_bounce, light_info.temporal_weight);
+            bounce_history_out[texel_idx * 2u + 1u] = vec4<f32>(accum, 0.0);
+            floor_l += accum;
+        } else {
+            bounce_history_out[texel_idx * 2u + 1u] = vec4<f32>(0.0);
         }
+    } else if light_info.bounce_index == 0u {
+        bounce_history_out[texel_idx * 2u + 1u] = vec4<f32>(0.0);
     }
 
     // Alpha channel stores direct sunlight visibility (1.0 = visible to sun, 0.0 = shadowed)

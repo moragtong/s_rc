@@ -56,12 +56,16 @@ pub const MAX_BOUNCE_COUNT: u32 = 4;
 pub static TEMPORAL_BLUR_PASSES: AtomicU32 = AtomicU32::new(2);
 pub const MAX_TEMPORAL_PASSES: u32 = 16;
 
+/// Global variable controlling the number of temporal bounce frames for EMA accumulation (1 to 16 frames).
+pub static TEMPORAL_BOUNCE_PASSES: AtomicU32 = AtomicU32::new(1);
+pub const MAX_TEMPORAL_BOUNCE_PASSES: u32 = 16;
+
 #[derive(ShaderType, Clone, Copy, Default)]
 struct LightUniforms {
     pub bounce_index: u32,
     pub temporal_bounce: u32,
+    pub temporal_weight: f32,
     pub pad0: u32,
-    pub pad1: u32,
 }
 
 const TRACE_LIBRARY_PATH: &str = "shaders/heightmap_trace.wgsl";
@@ -260,13 +264,14 @@ pub struct CascadesRenderData {
     pub probe_vis_pass_bind_group: BindGroup,
     pub probe_vis_bind_group: BindGroup,
     pub probe_adj_bind_group: BindGroup,
-    /// Light bind group per bounce index and phase.
-    light_bind_groups: [[BindGroup; 3]; MAX_BOUNCE_COUNT as usize],
+    pub sh_probes_history: [Buffer; 2],
+    pub bounce_history_buffers: [Buffer; 2],
+    /// Light bind group per bounce history index, bounce index and phase.
+    light_bind_groups: [[[BindGroup; 3]; MAX_BOUNCE_COUNT as usize]; 2],
     trace_bind_group: BindGroup,
     /// One per rotation phase, writing into the phase's gather target.
     gather_bind_groups: [BindGroup; 3],
     march_bind_group: BindGroup,
-    pub sh_probes_history: [Buffer; 2],
     /// Pass 0 Temporal Accumulation: reads history[h] and fresh gather[p], writes history[1 - h].
     blend_temporal_bind_groups: [[BindGroup; 3]; 2],
     /// Pass 1 Spatial Blur reading history[h_curr], writing to scratch.
@@ -374,6 +379,8 @@ fn setup_pipelines(
                 texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
                 storage_buffer_read_only::<Vec4>(false), // sh_probes
                 uniform_buffer::<LightUniforms>(false),  // light_info
+                storage_buffer_read_only::<Vec4>(false), // bounce_history_in
+                storage_buffer::<Vec4>(false),           // bounce_history_out
             ),
         ),
     );
@@ -662,6 +669,7 @@ fn prepare_buffers(
         sh_probes_blend_buffer,
         sh_probes_scratch_buffer,
         sh_probes_history,
+        bounce_history_buffers,
         probe_adj_buffer,
         subsamples_buffer,
         hits_buffer,
@@ -676,6 +684,7 @@ fn prepare_buffers(
             e.sh_probes_blend_buffer.clone(),
             e.sh_probes_scratch_buffer.clone(),
             e.sh_probes_history.clone(),
+            e.bounce_history_buffers.clone(),
             e.probe_adj_buffer.clone(),
             e.subsamples_buffer.clone(),
             e.hits_buffer.clone(),
@@ -750,6 +759,18 @@ fn prepare_buffers(
                     storage(
                         "cascades_sh_probes_hist_1",
                         probes * SH_STRIDE,
+                        BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                    ),
+                ],
+                [
+                    storage(
+                        "cascades_bounce_history_0",
+                        (heightmap.resolution.x * heightmap.resolution.y) as u64 * 2,
+                        BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                    ),
+                    storage(
+                        "cascades_bounce_history_1",
+                        (heightmap.resolution.x * heightmap.resolution.y) as u64 * 2,
                         BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
                     ),
                 ],
@@ -858,31 +879,36 @@ fn prepare_buffers(
             &probe_vis_dummy_view,
         )),
     );
-    let light_bind_groups: [[BindGroup; 3]; MAX_BOUNCE_COUNT as usize] = std::array::from_fn(|b| {
-        [0, 1, 2].map(|p| {
-            // b == 0 reads the converged/blurred probe buffer from the previous frame for temporal bounce.
-            // b > 0 reads the fresh in-frame gather target of phase p.
-            let probe_buf = if b == 0 {
-                &sh_probes_blend_buffer
-            } else {
-                &sh_probes[G_OF_PHASE[p]]
-            };
-            bind_group(
-                &format!("cascades_light_b{b}_p{p}"),
-                &pipeline.light_layout,
-                &BindGroupEntries::sequential((
-                    normal_min,
-                    normal_max,
-                    albedo_min,
-                    albedo_max,
-                    radiance_min,
-                    radiance_max,
-                    probe_buf.as_entire_binding(),
-                    light_uniform_buffers[b].as_entire_binding(),
-                )),
-            )
-        })
-    });
+    let light_bind_groups: [[[BindGroup; 3]; MAX_BOUNCE_COUNT as usize]; 2] =
+        std::array::from_fn(|bh| {
+            std::array::from_fn(|b| {
+                [0, 1, 2].map(|p| {
+                    // b == 0 reads the converged/blurred probe buffer from the previous frame for temporal bounce.
+                    // b > 0 reads the fresh in-frame gather target of phase p.
+                    let probe_buf = if b == 0 {
+                        &sh_probes_blend_buffer
+                    } else {
+                        &sh_probes[G_OF_PHASE[p]]
+                    };
+                    bind_group(
+                        &format!("cascades_light_h{bh}_b{b}_p{p}"),
+                        &pipeline.light_layout,
+                        &BindGroupEntries::sequential((
+                            normal_min,
+                            normal_max,
+                            albedo_min,
+                            albedo_max,
+                            radiance_min,
+                            radiance_max,
+                            probe_buf.as_entire_binding(),
+                            light_uniform_buffers[b].as_entire_binding(),
+                            bounce_history_buffers[bh].as_entire_binding(),
+                            bounce_history_buffers[1 - bh].as_entire_binding(),
+                        )),
+                    )
+                })
+            })
+        });
     let trace_bind_group = bind_group(
         "cascades_trace",
         &pipeline.trace_layout,
@@ -1007,6 +1033,7 @@ fn prepare_buffers(
         sh_probes_blend_buffer,
         sh_probes_scratch_buffer,
         sh_probes_history,
+        bounce_history_buffers,
         probe_adj_buffer,
         hits_buffer,
         uniform_buffer,
@@ -1039,6 +1066,8 @@ struct CascadeLocals {
     was_indirect: bool,
     hist_index: usize,
     history_valid: bool,
+    bounce_hist_index: usize,
+    bounce_history_valid: bool,
 }
 
 fn dispatch_cascades(
@@ -1219,14 +1248,33 @@ fn dispatch_cascades(
                 .clamp(1, MAX_BOUNCE_COUNT);
             let use_temporal = blend_toggle.temporal_bounce && !need_march;
 
+            let bh_prev = locals.bounce_hist_index;
+            let bh_curr = 1 - bh_prev;
+            locals.bounce_hist_index = bh_curr;
+
+            let n_bounce = TEMPORAL_BOUNCE_PASSES
+                .load(Ordering::Relaxed)
+                .clamp(1, MAX_TEMPORAL_BOUNCE_PASSES);
+            let is_first_bounce = need_march || re_enabled || !locals.bounce_history_valid;
+            let bounce_lambda = if is_first_bounce {
+                1.0
+            } else {
+                1.0 / (n_bounce as f32)
+            };
+            if use_temporal {
+                locals.bounce_history_valid = true;
+            } else {
+                locals.bounce_history_valid = false;
+            }
+
             for b in 0..bounces {
                 let mut light_bytes = encase::UniformBuffer::new(Vec::new());
                 light_bytes
                     .write(&LightUniforms {
                         bounce_index: b,
                         temporal_bounce: if b == 0 && use_temporal { 1 } else { 0 },
+                        temporal_weight: bounce_lambda,
                         pad0: 0,
-                        pad1: 0,
                     })
                     .unwrap();
                 render_queue.write_buffer(
@@ -1236,7 +1284,11 @@ fn dispatch_cascades(
                 );
 
                 pass.set_pipeline(light);
-                pass.set_bind_group(1, &render_data.light_bind_groups[b as usize][phase], &[]);
+                pass.set_bind_group(
+                    1,
+                    &render_data.light_bind_groups[bh_prev][b as usize][phase],
+                    &[],
+                );
                 pass.dispatch_workgroups(
                     heightmap.resolution.x.div_ceil(LIGHT_WORKGROUP),
                     heightmap.resolution.y.div_ceil(LIGHT_WORKGROUP),
@@ -1336,12 +1388,13 @@ fn dispatch_cascades(
 
     // --- Pass 0: Pure temporal EMA accumulation across frames (t and t-1, per probe, zero spatial neighbor reads) ---
     {
-        let mut blend_pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor {
-                label: Some("cascades_blend_sh_temporal"),
-                ..default()
-            });
+        let mut blend_pass =
+            render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cascades_blend_sh_temporal"),
+                    ..default()
+                });
         blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
         blend_pass.set_pipeline(blend);
         blend_pass.set_bind_group(
@@ -1349,11 +1402,7 @@ fn dispatch_cascades(
             &render_data.blend_temporal_bind_groups[hist_prev][phase],
             &[],
         );
-        blend_pass.dispatch_workgroups(
-            probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
-            1,
-            1,
-        );
+        blend_pass.dispatch_workgroups(probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32, 1, 1);
     }
 
     if spatial_passes == 0 {
@@ -1370,12 +1419,13 @@ fn dispatch_cascades(
         // Spatial blur passes 1..=spatial_passes
         let p1_writes_to_blend = spatial_passes % 2 != 0;
         {
-            let mut blend_pass = render_context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("cascades_blend_sh_spatial_p1"),
-                    ..default()
-                });
+            let mut blend_pass =
+                render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("cascades_blend_sh_spatial_p1"),
+                        ..default()
+                    });
             blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
             blend_pass.set_pipeline(blend);
             if p1_writes_to_blend {
@@ -1401,12 +1451,13 @@ fn dispatch_cascades(
         let mut writing_to_blend = p1_writes_to_blend;
         for k in 2..=spatial_passes as usize {
             writing_to_blend = !writing_to_blend;
-            let mut blend_pass = render_context
-                .command_encoder()
-                .begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("cascades_blend_sh_spatial_pn"),
-                    ..default()
-                });
+            let mut blend_pass =
+                render_context
+                    .command_encoder()
+                    .begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("cascades_blend_sh_spatial_pn"),
+                        ..default()
+                    });
             blend_pass.set_bind_group(0, &render_data.common_bind_group, &[]);
             blend_pass.set_pipeline(blend);
             if writing_to_blend {

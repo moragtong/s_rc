@@ -1,9 +1,10 @@
-use std::sync::atomic::Ordering;
-use bevy::prelude::*;
 use crate::cascades2_5d::{
     BOUNCE_COUNT, CROSS_LAYER_RADIUS_TENTHS, LOWPASS_BLUR_PASSES, MAX_BLUR_PASSES,
-    MAX_BOUNCE_COUNT, MAX_CROSS_LAYER_TENTHS, MAX_TEMPORAL_PASSES, TEMPORAL_BLUR_PASSES,
+    MAX_BOUNCE_COUNT, MAX_CROSS_LAYER_TENTHS, MAX_TEMPORAL_BOUNCE_PASSES, MAX_TEMPORAL_PASSES,
+    TEMPORAL_BLUR_PASSES, TEMPORAL_BOUNCE_PASSES,
 };
+use bevy::prelude::*;
+use std::sync::atomic::Ordering;
 
 /// Shading pass configuration, extracted to the render app.
 #[derive(Resource, Clone, Copy, bevy::render::extract_resource::ExtractResource)]
@@ -52,6 +53,8 @@ pub struct BlendToggleState {
     pub temporal_bounce: bool,
     /// Number of temporal blur passes / frames across the relight interval.
     pub temporal_passes: u32,
+    /// Number of temporal bounce frames for EMA indirect accumulation.
+    pub temporal_bounce_passes: u32,
 }
 
 impl Default for BlendToggleState {
@@ -59,6 +62,10 @@ impl Default for BlendToggleState {
         let temporal_bounce = std::env::var("S_RC_TEMPORAL_BOUNCE")
             .map(|s| s != "0" && s != "false" && s != "FALSE")
             .unwrap_or(true);
+        let temporal_bounce_passes = std::env::var("S_RC_TEMPORAL_BOUNCE_PASSES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
         Self {
             lowpass: true,
             blur_passes: 7,
@@ -66,6 +73,7 @@ impl Default for BlendToggleState {
             bounces: 1,
             temporal_bounce,
             temporal_passes: 2,
+            temporal_bounce_passes,
         }
     }
 }
@@ -125,6 +133,18 @@ pub struct TemporalPassesFill;
 pub struct TemporalPassesStepButton(pub i32);
 
 #[derive(Component)]
+pub struct TemporalBounceLabel;
+
+#[derive(Component)]
+pub struct TemporalBounceTrack;
+
+#[derive(Component)]
+pub struct TemporalBounceFill;
+
+#[derive(Component)]
+pub struct TemporalBounceStepButton(pub i32);
+
+#[derive(Component)]
 pub struct BouncesLabel;
 
 #[derive(Component)]
@@ -144,7 +164,8 @@ impl Plugin for UiPlugin {
             .init_resource::<BlendToggleState>()
             .add_plugins((
                 bevy::render::extract_resource::ExtractResourcePlugin::<LightingState>::default(),
-                bevy::render::extract_resource::ExtractResourcePlugin::<BlendToggleState>::default(),
+                bevy::render::extract_resource::ExtractResourcePlugin::<BlendToggleState>::default(
+                ),
             ))
             .add_systems(Startup, setup_ui)
             .add_systems(Update, (button_system, fps_system, slider_system));
@@ -318,9 +339,8 @@ fn setup_ui(mut commands: Commands) {
     let initial_passes = LOWPASS_BLUR_PASSES
         .load(Ordering::Relaxed)
         .clamp(1, MAX_BLUR_PASSES as u32);
-    let passes_pct = (initial_passes.saturating_sub(1)) as f32
-        / (MAX_BLUR_PASSES - 1) as f32
-        * 100.0;
+    let passes_pct =
+        (initial_passes.saturating_sub(1)) as f32 / (MAX_BLUR_PASSES - 1) as f32 * 100.0;
 
     let initial_radius_tenths = CROSS_LAYER_RADIUS_TENTHS
         .load(Ordering::Relaxed)
@@ -331,15 +351,20 @@ fn setup_ui(mut commands: Commands) {
     let initial_bounces = BOUNCE_COUNT
         .load(Ordering::Relaxed)
         .clamp(1, MAX_BOUNCE_COUNT);
-    let bounces_pct = (initial_bounces.saturating_sub(1)) as f32
-        / (MAX_BOUNCE_COUNT - 1) as f32
-        * 100.0;
+    let bounces_pct =
+        (initial_bounces.saturating_sub(1)) as f32 / (MAX_BOUNCE_COUNT - 1) as f32 * 100.0;
 
     let initial_temporal = TEMPORAL_BLUR_PASSES
         .load(Ordering::Relaxed)
         .clamp(1, MAX_TEMPORAL_PASSES);
-    let temporal_pct = (initial_temporal.saturating_sub(1)) as f32
-        / (MAX_TEMPORAL_PASSES - 1) as f32
+    let temporal_pct =
+        (initial_temporal.saturating_sub(1)) as f32 / (MAX_TEMPORAL_PASSES - 1) as f32 * 100.0;
+
+    let initial_temporal_bounce = TEMPORAL_BOUNCE_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_TEMPORAL_BOUNCE_PASSES);
+    let temporal_bounce_pct = (initial_temporal_bounce.saturating_sub(1)) as f32
+        / (MAX_TEMPORAL_BOUNCE_PASSES - 1) as f32
         * 100.0;
 
     commands
@@ -721,6 +746,99 @@ fn setup_ui(mut commands: Commands) {
                         ));
                     });
                 });
+
+            // --- Section 5: Temporal Bounce ---
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(4.0),
+                    align_items: AlignItems::Center,
+                    ..default()
+                })
+                .with_children(|sec| {
+                    sec.spawn((
+                        Text::new(format!(
+                            "Temporal Bounce: {} frames",
+                            initial_temporal_bounce
+                        )),
+                        TextColor(Color::srgb(0.95, 0.65, 0.35)),
+                        TextFont::from_font_size(13.5),
+                        TemporalBounceLabel,
+                    ));
+                    sec.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(8.0),
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            TemporalBounceStepButton(-1),
+                        ))
+                        .with_child((
+                            Text::new("-"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(160.0),
+                                height: Val::Px(14.0),
+                                border_radius: BorderRadius::all(Val::Px(7.0)),
+                                overflow: Overflow::clip(),
+                                justify_content: JustifyContent::FlexStart,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.2, 0.2)),
+                            TemporalBounceTrack,
+                        ))
+                        .with_children(|track| {
+                            track.spawn((
+                                Node {
+                                    width: Val::Percent(temporal_bounce_pct),
+                                    height: Val::Percent(100.0),
+                                    border_radius: BorderRadius::all(Val::Px(7.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.95, 0.55, 0.25)),
+                                TemporalBounceFill,
+                                Pickable::IGNORE,
+                            ));
+                        });
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(22.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                border_radius: BorderRadius::all(Val::Px(4.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.25, 0.25, 0.25)),
+                            TemporalBounceStepButton(1),
+                        ))
+                        .with_child((
+                            Text::new("+"),
+                            TextColor(Color::WHITE),
+                            TextFont::from_font_size(15.0),
+                        ));
+                    });
+                });
         });
 }
 
@@ -888,22 +1006,206 @@ fn fps_system(
 
 #[derive(bevy::ecs::system::SystemParam)]
 struct SliderQueries<'w, 's> {
-    passes_buttons: Query<'w, 's, (&'static Interaction, &'static PassesStepButton), (With<Button>, Changed<Interaction>)>,
-    layer_buttons: Query<'w, 's, (&'static Interaction, &'static CrossLayerStepButton), (With<Button>, Changed<Interaction>)>,
-    bounce_buttons: Query<'w, 's, (&'static Interaction, &'static BouncesStepButton), (With<Button>, Changed<Interaction>)>,
-    temporal_buttons: Query<'w, 's, (&'static Interaction, &'static TemporalPassesStepButton), (With<Button>, Changed<Interaction>)>,
-    passes_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<PassesTrack>>,
-    layer_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<CrossLayerTrack>>,
-    bounce_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<BouncesTrack>>,
-    temporal_track: Query<'w, 's, (&'static Interaction, &'static ComputedNode, &'static GlobalTransform), With<TemporalPassesTrack>>,
-    passes_label: Query<'w, 's, &'static mut Text, (With<BlurPassesLabel>, Without<CrossLayerLabel>, Without<BouncesLabel>, Without<TemporalPassesLabel>)>,
-    layer_label: Query<'w, 's, &'static mut Text, (With<CrossLayerLabel>, Without<BlurPassesLabel>, Without<BouncesLabel>, Without<TemporalPassesLabel>)>,
-    bounce_label: Query<'w, 's, &'static mut Text, (With<BouncesLabel>, Without<BlurPassesLabel>, Without<CrossLayerLabel>, Without<TemporalPassesLabel>)>,
-    temporal_label: Query<'w, 's, &'static mut Text, (With<TemporalPassesLabel>, Without<BlurPassesLabel>, Without<CrossLayerLabel>, Without<BouncesLabel>)>,
-    passes_fill: Query<'w, 's, &'static mut Node, (With<PassesFill>, Without<CrossLayerFill>, Without<BouncesFill>, Without<TemporalPassesFill>)>,
-    layer_fill: Query<'w, 's, &'static mut Node, (With<CrossLayerFill>, Without<PassesFill>, Without<BouncesFill>, Without<TemporalPassesFill>)>,
-    bounce_fill: Query<'w, 's, &'static mut Node, (With<BouncesFill>, Without<PassesFill>, Without<CrossLayerFill>, Without<TemporalPassesFill>)>,
-    temporal_fill: Query<'w, 's, &'static mut Node, (With<TemporalPassesFill>, Without<PassesFill>, Without<CrossLayerFill>, Without<BouncesFill>)>,
+    passes_buttons: Query<
+        'w,
+        's,
+        (&'static Interaction, &'static PassesStepButton),
+        (With<Button>, Changed<Interaction>),
+    >,
+    layer_buttons: Query<
+        'w,
+        's,
+        (&'static Interaction, &'static CrossLayerStepButton),
+        (With<Button>, Changed<Interaction>),
+    >,
+    bounce_buttons: Query<
+        'w,
+        's,
+        (&'static Interaction, &'static BouncesStepButton),
+        (With<Button>, Changed<Interaction>),
+    >,
+    temporal_buttons: Query<
+        'w,
+        's,
+        (&'static Interaction, &'static TemporalPassesStepButton),
+        (With<Button>, Changed<Interaction>),
+    >,
+    temporal_bounce_buttons: Query<
+        'w,
+        's,
+        (&'static Interaction, &'static TemporalBounceStepButton),
+        (With<Button>, Changed<Interaction>),
+    >,
+    passes_track: Query<
+        'w,
+        's,
+        (
+            &'static Interaction,
+            &'static ComputedNode,
+            &'static GlobalTransform,
+        ),
+        With<PassesTrack>,
+    >,
+    layer_track: Query<
+        'w,
+        's,
+        (
+            &'static Interaction,
+            &'static ComputedNode,
+            &'static GlobalTransform,
+        ),
+        With<CrossLayerTrack>,
+    >,
+    bounce_track: Query<
+        'w,
+        's,
+        (
+            &'static Interaction,
+            &'static ComputedNode,
+            &'static GlobalTransform,
+        ),
+        With<BouncesTrack>,
+    >,
+    temporal_track: Query<
+        'w,
+        's,
+        (
+            &'static Interaction,
+            &'static ComputedNode,
+            &'static GlobalTransform,
+        ),
+        With<TemporalPassesTrack>,
+    >,
+    temporal_bounce_track: Query<
+        'w,
+        's,
+        (
+            &'static Interaction,
+            &'static ComputedNode,
+            &'static GlobalTransform,
+        ),
+        With<TemporalBounceTrack>,
+    >,
+    passes_label: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<BlurPassesLabel>,
+            Without<CrossLayerLabel>,
+            Without<BouncesLabel>,
+            Without<TemporalPassesLabel>,
+            Without<TemporalBounceLabel>,
+        ),
+    >,
+    layer_label: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<CrossLayerLabel>,
+            Without<BlurPassesLabel>,
+            Without<BouncesLabel>,
+            Without<TemporalPassesLabel>,
+            Without<TemporalBounceLabel>,
+        ),
+    >,
+    bounce_label: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<BouncesLabel>,
+            Without<BlurPassesLabel>,
+            Without<CrossLayerLabel>,
+            Without<TemporalPassesLabel>,
+            Without<TemporalBounceLabel>,
+        ),
+    >,
+    temporal_label: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<TemporalPassesLabel>,
+            Without<BlurPassesLabel>,
+            Without<CrossLayerLabel>,
+            Without<BouncesLabel>,
+            Without<TemporalBounceLabel>,
+        ),
+    >,
+    temporal_bounce_label: Query<
+        'w,
+        's,
+        &'static mut Text,
+        (
+            With<TemporalBounceLabel>,
+            Without<BlurPassesLabel>,
+            Without<CrossLayerLabel>,
+            Without<BouncesLabel>,
+            Without<TemporalPassesLabel>,
+        ),
+    >,
+    passes_fill: Query<
+        'w,
+        's,
+        &'static mut Node,
+        (
+            With<PassesFill>,
+            Without<CrossLayerFill>,
+            Without<BouncesFill>,
+            Without<TemporalPassesFill>,
+            Without<TemporalBounceFill>,
+        ),
+    >,
+    layer_fill: Query<
+        'w,
+        's,
+        &'static mut Node,
+        (
+            With<CrossLayerFill>,
+            Without<PassesFill>,
+            Without<BouncesFill>,
+            Without<TemporalPassesFill>,
+            Without<TemporalBounceFill>,
+        ),
+    >,
+    bounce_fill: Query<
+        'w,
+        's,
+        &'static mut Node,
+        (
+            With<BouncesFill>,
+            Without<PassesFill>,
+            Without<CrossLayerFill>,
+            Without<TemporalPassesFill>,
+            Without<TemporalBounceFill>,
+        ),
+    >,
+    temporal_fill: Query<
+        'w,
+        's,
+        &'static mut Node,
+        (
+            With<TemporalPassesFill>,
+            Without<PassesFill>,
+            Without<CrossLayerFill>,
+            Without<BouncesFill>,
+            Without<TemporalBounceFill>,
+        ),
+    >,
+    temporal_bounce_fill: Query<
+        'w,
+        's,
+        &'static mut Node,
+        (
+            With<TemporalBounceFill>,
+            Without<PassesFill>,
+            Without<CrossLayerFill>,
+            Without<BouncesFill>,
+            Without<TemporalPassesFill>,
+        ),
+    >,
 }
 fn slider_system(
     mut q: SliderQueries,
@@ -915,6 +1217,7 @@ fn slider_system(
     mut is_dragging_layer: Local<bool>,
     mut is_dragging_bounce: Local<bool>,
     mut is_dragging_temporal: Local<bool>,
+    mut is_dragging_temporal_bounce: Local<bool>,
 ) {
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let passes_step_size = if shift { 5 } else { 1 };
@@ -923,7 +1226,9 @@ fn slider_system(
     // -------------------------------------------------------------
     // 1. Diffuse Bounces Slider
     // -------------------------------------------------------------
-    let current_bounces = BOUNCE_COUNT.load(Ordering::Relaxed).clamp(1, MAX_BOUNCE_COUNT);
+    let current_bounces = BOUNCE_COUNT
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_BOUNCE_COUNT);
     let mut bounce_delta: i32 = 0;
 
     for (interaction, step) in &mut q.bounce_buttons {
@@ -932,10 +1237,18 @@ fn slider_system(
         }
     }
 
-    if keys.just_pressed(KeyCode::Digit1) { bounce_delta = 1 - current_bounces as i32; }
-    if keys.just_pressed(KeyCode::Digit2) { bounce_delta = 2 - current_bounces as i32; }
-    if keys.just_pressed(KeyCode::Digit3) { bounce_delta = 3 - current_bounces as i32; }
-    if keys.just_pressed(KeyCode::Digit4) { bounce_delta = 4 - current_bounces as i32; }
+    if keys.just_pressed(KeyCode::Digit1) {
+        bounce_delta = 1 - current_bounces as i32;
+    }
+    if keys.just_pressed(KeyCode::Digit2) {
+        bounce_delta = 2 - current_bounces as i32;
+    }
+    if keys.just_pressed(KeyCode::Digit3) {
+        bounce_delta = 3 - current_bounces as i32;
+    }
+    if keys.just_pressed(KeyCode::Digit4) {
+        bounce_delta = 4 - current_bounces as i32;
+    }
 
     let mut direct_target_bounces: Option<u32> = None;
     if let Ok((interaction, node, transform)) = q.bounce_track.single() {
@@ -1104,13 +1417,16 @@ fn slider_system(
     let new_radius_tenths = if let Some(target) = direct_target_radius {
         target.clamp(0, MAX_CROSS_LAYER_TENTHS)
     } else if radius_delta != 0 {
-        ((current_radius_tenths as i32) + radius_delta).clamp(0, MAX_CROSS_LAYER_TENTHS as i32) as u32
+        ((current_radius_tenths as i32) + radius_delta).clamp(0, MAX_CROSS_LAYER_TENTHS as i32)
+            as u32
     } else {
         current_radius_tenths
     };
 
     let new_radius_m = new_radius_tenths as f32 / 10.0;
-    if new_radius_tenths != current_radius_tenths || (blend_toggle.cross_layer_radius - new_radius_m).abs() > 0.01 {
+    if new_radius_tenths != current_radius_tenths
+        || (blend_toggle.cross_layer_radius - new_radius_m).abs() > 0.01
+    {
         CROSS_LAYER_RADIUS_TENTHS.store(new_radius_tenths, Ordering::Relaxed);
         blend_toggle.cross_layer_radius = new_radius_m;
 
@@ -1182,8 +1498,75 @@ fn slider_system(
             text.0 = format!("Temporal Blur: {} frames", new_temporal);
         }
 
-        let pct = (new_temporal.saturating_sub(1)) as f32 / (MAX_TEMPORAL_PASSES - 1) as f32 * 100.0;
+        let pct =
+            (new_temporal.saturating_sub(1)) as f32 / (MAX_TEMPORAL_PASSES - 1) as f32 * 100.0;
         for mut fill in &mut q.temporal_fill {
+            fill.width = Val::Percent(pct);
+        }
+    }
+
+    // -------------------------------------------------------------
+    // 5. Temporal Bounce Slider
+    // -------------------------------------------------------------
+    let current_temporal_bounce = TEMPORAL_BOUNCE_PASSES
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_TEMPORAL_BOUNCE_PASSES);
+    let mut temporal_bounce_delta: i32 = 0;
+
+    for (interaction, step) in &mut q.temporal_bounce_buttons {
+        if *interaction == Interaction::Pressed {
+            temporal_bounce_delta += step.0;
+        }
+    }
+
+    let mut direct_target_temporal_bounce: Option<u32> = None;
+    if let Ok((interaction, node, transform)) = q.temporal_bounce_track.single() {
+        if *interaction == Interaction::Pressed {
+            *is_dragging_temporal_bounce = true;
+        }
+        if *is_dragging_temporal_bounce {
+            if mouse_button.just_released(MouseButton::Left) {
+                *is_dragging_temporal_bounce = false;
+            } else if let Ok(window) = windows.single() {
+                if let Some(cursor_pos) = window.cursor_position() {
+                    let track_center = transform.translation().truncate();
+                    let track_width = node.size().x;
+                    if track_width > 0.0 {
+                        let track_left = track_center.x - track_width * 0.5;
+                        let rel_x = (cursor_pos.x - track_left).clamp(0.0, track_width);
+                        let fraction = rel_x / track_width;
+                        let target =
+                            1 + (fraction * (MAX_TEMPORAL_BOUNCE_PASSES - 1) as f32).round() as u32;
+                        direct_target_temporal_bounce = Some(target);
+                    }
+                }
+            }
+        }
+    }
+
+    let new_temporal_bounce = if let Some(target) = direct_target_temporal_bounce {
+        target.clamp(1, MAX_TEMPORAL_BOUNCE_PASSES)
+    } else if temporal_bounce_delta != 0 {
+        ((current_temporal_bounce as i32) + temporal_bounce_delta)
+            .clamp(1, MAX_TEMPORAL_BOUNCE_PASSES as i32) as u32
+    } else {
+        current_temporal_bounce
+    };
+
+    if new_temporal_bounce != current_temporal_bounce
+        || blend_toggle.temporal_bounce_passes != new_temporal_bounce
+    {
+        TEMPORAL_BOUNCE_PASSES.store(new_temporal_bounce, Ordering::Relaxed);
+        blend_toggle.temporal_bounce_passes = new_temporal_bounce;
+
+        for mut text in &mut q.temporal_bounce_label {
+            text.0 = format!("Temporal Bounce: {} frames", new_temporal_bounce);
+        }
+
+        let pct = (new_temporal_bounce.saturating_sub(1)) as f32
+            / (MAX_TEMPORAL_BOUNCE_PASSES - 1) as f32
+            * 100.0;
+        for mut fill in &mut q.temporal_bounce_fill {
             fill.width = Val::Percent(pct);
         }
     }
