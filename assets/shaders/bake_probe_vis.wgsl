@@ -69,7 +69,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     ceil_mask = ceil_mask | (1u << bit_idx);
                 }
             } else {
-                if probe_visible(p_ceil, vec3<f32>(0.0, 1.0, 0.0), center) {
+                if probe_visible(p_ceil, vec3<f32>(0.0, -1.0, 0.0), center) {
                     ceil_mask = ceil_mask | (1u << bit_idx);
                 }
             }
