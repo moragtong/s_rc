@@ -56,11 +56,13 @@ impl SpecializedRenderPipeline for ShadePipeline {
                 shader: self.shader.clone(),
                 targets: vec![Some(ColorTargetState {
                     format,
-                    // Add the indirect diffuse (times AO) directly onto the lit HDR image; leave alpha alone.
+                    // Blend the complete lighting (direct sun with heightmap shadows + indirect diffuse)
+                    // over the geometry buffer. For non-sky pixels (alpha = 1.0), it replaces the unshadowed
+                    // direct light. For sky (alpha = 0.0), it preserves the background sky clear color.
                     blend: Some(BlendState {
                         color: BlendComponent {
-                            src_factor: BlendFactor::One,
-                            dst_factor: BlendFactor::One,
+                            src_factor: BlendFactor::SrcAlpha,
+                            dst_factor: BlendFactor::OneMinusSrcAlpha,
                             operation: BlendOperation::Add,
                         },
                         alpha: BlendComponent {

@@ -167,5 +167,6 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let direct_sun = (base_color / PI) * (uniforms.sun_irradiance * (n_dot_l * sun_vis));
 
     let indirect_diffuse = (base_color / PI * e) * ao;
-    return vec4<f32>(direct_sun + indirect_diffuse, 0.0);
+    // Return alpha = 1.0 for solid geometry so it replaces the unshadowed direct light pass
+    return vec4<f32>(direct_sun + indirect_diffuse, 1.0);
 }

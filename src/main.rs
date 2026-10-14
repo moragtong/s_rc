@@ -167,7 +167,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
         // the light's own layers, and the glTF meshes are on the scene layer.
         // Restricting the light to LIGHT_LAYER alone silently empties the
         // shadow map.
-        RenderLayers::from_layers(&[SCENE_LAYER, LIGHT_LAYER]),
+        RenderLayers::layer(LIGHT_LAYER),
         sun_transform(),
     ));
 
