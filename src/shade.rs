@@ -114,6 +114,9 @@ fn init_shade_pipeline(
                     uniform_buffer::<ShadeUniforms>(false),
                     // Bevy's SSAO AO (R16Float, filterable). Gated off by `ao_enabled`.
                     texture_2d(TextureSampleType::Float { filterable: true }),
+                    // Dual heightmap direct shadow visibility: radiance_min & radiance_max
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                    texture_2d(TextureSampleType::Float { filterable: false }),
                 ),
             ),
         ),
@@ -136,6 +139,8 @@ fn draw_shade(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     fallback: Res<bevy::render::texture::FallbackImage>,
+    heightmap: Option<Res<crate::heightmap::Heightmap>>,
+    gpu_images: Res<bevy::render::render_asset::RenderAssets<bevy::render::texture::GpuImage>>,
     render_data: Option<Res<CascadesRenderData>>,
     mut ctx: RenderContext,
 ) {
@@ -180,6 +185,15 @@ fn draw_shade(
         None => &fallback.d2.texture_view,
     };
 
+    let (rad_min_view, rad_max_view) = match heightmap.as_ref().and_then(|h| {
+        let min_img = gpu_images.get(&h.radiance_min)?;
+        let max_img = gpu_images.get(&h.radiance_max)?;
+        Some((&min_img.texture_view, &max_img.texture_view))
+    }) {
+        Some((min_v, max_v)) => (min_v, max_v),
+        None => (&fallback.d2.texture_view, &fallback.d2.texture_view),
+    };
+
     let bind_group = render_device.create_bind_group(
         "shade_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipeline.layout),
@@ -189,6 +203,8 @@ fn draw_shade(
             render_data.sh_probes_blend_buffer.as_entire_binding(),
             uniforms.binding().unwrap(),
             ao_view,
+            rad_min_view,
+            rad_max_view,
         )),
     );
 

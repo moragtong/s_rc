@@ -29,15 +29,20 @@ struct LightUniforms {
 const SHADOW_BIAS: f32 = 0.02;
 const WEIGHT_EPS: f32 = 1e-4;
 
-fn sunlit(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>) -> vec3<f32> {
+struct SunlitResult {
+    radiance: vec3<f32>,
+    visible: f32,
+}
+
+fn sunlit(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>) -> SunlitResult {
     let cos_l = dot(n, uniforms.sun_toward);
     if cos_l <= 0.0 {
-        return vec3<f32>(0.0);
+        return SunlitResult(vec3<f32>(0.0), 0.0);
     }
     if trace(p + n * SHADOW_BIAS, uniforms.sun_toward, 0.0, 1.0e4).t != MISS {
-        return vec3<f32>(0.0);
+        return SunlitResult(vec3<f32>(0.0), 0.0);
     }
-    return albedo / PI * uniforms.sun_irradiance * cos_l;
+    return SunlitResult(albedo / PI * uniforms.sun_irradiance * cos_l, 1.0);
 }
 
 fn sh_coeff(base: u32, i: u32) -> vec3<f32> {
@@ -133,29 +138,36 @@ fn surface_light(@builtin(global_invocation_id) id: vec3<u32>) {
     let h = textureLoad(heightmap, texel, 0).xy;
 
     var ceiling = vec3<f32>(0.0);
+    var vis_c = 0.0;
     let n_ceiling = textureLoad(normal_min, texel, 0).xyz;
     if dot(n_ceiling, n_ceiling) > 0.0 {
         let norm_c = normalize(n_ceiling);
         let albedo_c = textureLoad(albedo_min, texel, 0).rgb;
         let pos_c = vec3<f32>(xz.x, h.x, xz.y);
-        ceiling = sunlit(pos_c, norm_c, albedo_c);
+        let res_c = sunlit(pos_c, norm_c, albedo_c);
+        ceiling = res_c.radiance;
+        vis_c = res_c.visible;
         if light_info.bounce_index > 0u {
             ceiling += (albedo_c / PI) * evaluate_probe_irradiance(pos_c, norm_c);
         }
     }
 
     var floor_l = vec3<f32>(0.0);
+    var vis_f = 0.0;
     let n_floor = textureLoad(normal_max, texel, 0).xyz;
     if dot(n_floor, n_floor) > 0.0 {
         let norm_f = normalize(n_floor);
         let albedo_f = textureLoad(albedo_max, texel, 0).rgb;
         let pos_f = vec3<f32>(xz.x, h.y, xz.y);
-        floor_l = sunlit(pos_f, norm_f, albedo_f);
+        let res_f = sunlit(pos_f, norm_f, albedo_f);
+        floor_l = res_f.radiance;
+        vis_f = res_f.visible;
         if light_info.bounce_index > 0u {
             floor_l += (albedo_f / PI) * evaluate_probe_irradiance(pos_f, norm_f);
         }
     }
 
-    textureStore(radiance_min, texel, vec4<f32>(ceiling, 1.0));
-    textureStore(radiance_max, texel, vec4<f32>(floor_l, 1.0));
+    // Alpha channel stores direct sunlight visibility (1.0 = visible to sun, 0.0 = shadowed)
+    textureStore(radiance_min, texel, vec4<f32>(ceiling, vis_c));
+    textureStore(radiance_max, texel, vec4<f32>(floor_l, vis_f));
 }

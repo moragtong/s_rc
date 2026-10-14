@@ -21,6 +21,8 @@ struct ShadeUniforms {
 }
 @group(1) @binding(3) var<uniform> view_info: ShadeUniforms;
 @group(1) @binding(4) var ao_tex: texture_2d<f32>;
+@group(1) @binding(5) var radiance_min: texture_2d<f32>;
+@group(1) @binding(6) var radiance_max: texture_2d<f32>;
 
 // Weight normalization epsilon - prevents division by near-zero when all probes are occluded.
 const WEIGHT_EPS: f32 = 1e-4;
@@ -151,5 +153,19 @@ fn shade(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         e = e_blend / w_sum;
     }
     let ao = select(1.0, textureLoad(ao_tex, pixel, 0).r, view_info.ao_enabled != 0u);
-    return vec4<f32>((base_color / PI * e) * ao, 0.0);
+
+    // Direct sun evaluation via dual heightmap visibility
+    // Determine whether surface is closer to ceiling or floor layer
+    let is_ceiling = n.y < -0.1 || (abs(n.y) <= 0.1 && p.y >= uniforms.split);
+    let hmap_texel = clamp(texel_at(p.xz), vec2<i32>(0), vec2<i32>(uniforms.hmap_res) - 1);
+    let sun_vis = select(
+        textureLoad(radiance_max, hmap_texel, 0).a,
+        textureLoad(radiance_min, hmap_texel, 0).a,
+        is_ceiling,
+    );
+    let n_dot_l = max(dot(n, uniforms.sun_toward), 0.0);
+    let direct_sun = (base_color / PI) * (uniforms.sun_irradiance * (n_dot_l * sun_vis));
+
+    let indirect_diffuse = (base_color / PI * e) * ao;
+    return vec4<f32>(direct_sun + indirect_diffuse, 0.0);
 }

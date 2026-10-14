@@ -364,8 +364,8 @@ fn setup_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: false }), // albedo_max
                 texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
                 texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
-                storage_buffer_read_only::<Vec4>(false),                    // sh_probes
-                uniform_buffer::<LightUniforms>(false),                     // light_info
+                storage_buffer_read_only::<Vec4>(false), // sh_probes
+                uniform_buffer::<LightUniforms>(false),  // light_info
             ),
         ),
     );
@@ -692,14 +692,15 @@ fn prepare_buffers(
             let initial_adj: Vec<u8> = (0..probes.max(16))
                 .flat_map(|_| 0x1FFu32.to_ne_bytes())
                 .collect();
-            let light_uniform_buffers: [Buffer; MAX_BOUNCE_COUNT as usize] = std::array::from_fn(|i| {
-                render_device.create_buffer(&BufferDescriptor {
-                    label: Some(&format!("cascades_light_uniforms_{i}")),
-                    size: LightUniforms::min_size().get(),
-                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                })
-            });
+            let light_uniform_buffers: [Buffer; MAX_BOUNCE_COUNT as usize] =
+                std::array::from_fn(|i| {
+                    render_device.create_buffer(&BufferDescriptor {
+                        label: Some(&format!("cascades_light_uniforms_{i}")),
+                        size: LightUniforms::min_size().get(),
+                        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                });
             let blend_uniform_buffers: [Buffer; MAX_BLUR_PASSES] = std::array::from_fn(|i| {
                 render_device.create_buffer(&BufferDescriptor {
                     label: Some(&format!("cascades_blend_uniforms_{i}")),
@@ -1176,7 +1177,9 @@ fn dispatch_cascades(
 
         if relight_now {
             let phase = (relight.phase % 3) as usize;
-            let bounces = BOUNCE_COUNT.load(Ordering::Relaxed).clamp(1, MAX_BOUNCE_COUNT);
+            let bounces = BOUNCE_COUNT
+                .load(Ordering::Relaxed)
+                .clamp(1, MAX_BOUNCE_COUNT);
 
             for b in 0..bounces {
                 let mut light_bytes = encase::UniformBuffer::new(Vec::new());
@@ -1290,7 +1293,11 @@ fn dispatch_cascades(
             } else {
                 blend_pass.set_bind_group(1, &render_data.blend_pass0_to_scratch[phase], &[]);
             }
-            blend_pass.dispatch_workgroups(probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32, 1, 1);
+            blend_pass.dispatch_workgroups(
+                probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
+                1,
+                1,
+            );
         }
 
         for k in 1..passes as usize {
@@ -1309,7 +1316,11 @@ fn dispatch_cascades(
             } else {
                 blend_pass.set_bind_group(1, &render_data.blend_pong[k], &[]);
             }
-            blend_pass.dispatch_workgroups(probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32, 1, 1);
+            blend_pass.dispatch_workgroups(
+                probe_words.div_ceil(BLEND_WORKGROUP as u64) as u32,
+                1,
+                1,
+            );
         }
     }
 }

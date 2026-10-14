@@ -160,7 +160,7 @@ fn setup_scene(mut commands: Commands, asset_server: Res<AssetServer>) {
 
     commands.spawn((
         DirectionalLight {
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: false,
             ..default()
         },
         // Must include SCENE_LAYER: the shadow map renders its casters through
