@@ -89,7 +89,7 @@ pub const SH_STRIDE: u64 = 5;
 const HITS_PER_RAY: u64 = 4;
 /// Frames between two relights. The sun moves every frame, so this is the
 /// period the indirect light lags behind the direct light by.
-pub const RELIGHT_INTERVAL: u32 = 30;
+pub const RELIGHT_INTERVAL: u32 = 16;
 /// Which of the three rotating probe buffers plays each role, per
 /// [`Relight::phase`]. `A` is `blend_sh`'s `cur` operand (weight `alpha`, the
 /// freshest relight), `B` its `prev` operand (weight `1 - alpha`), and `G`

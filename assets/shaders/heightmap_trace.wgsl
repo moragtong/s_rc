@@ -230,8 +230,8 @@ fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     const FLAT_GRID_XZ_TEST: bool = false;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
     // Nudge the probe out of any wall its gather sphere reaches into, by the
-    // cascade interval's *start* radius - the near end of what its rays
-    // actually sample. `nudge_out_of_solid` moves it only as far as the overlap
+    // cascade interval's end radius (`info.interval.y`) - what its rays
+    // actually reach. `nudge_out_of_solid` moves it only as far as the overlap
     // needs and reports the XZ direction, which `probe_normal_baked` reuses.
     //
     // The previous nudge is kept commented: it relocated a probe whose *own*
@@ -246,7 +246,7 @@ fn probe_position_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     // let escape = select(origin, escape_texel_xz(origin), !FLAT_GRID_XZ_TEST && sphere_is_buried(xz, r));
     // let escape_xz = (vec2<f32>(escape) + 0.5) * cell_size() + uniforms.hmap_min;
     // let p_xz = select(xz, escape_xz, !all(origin == escape));
-    let r = select(info.interval.x, 0.0, FLAT_GRID_XZ_TEST);
+    let r = select(info.interval.y, 0.0, FLAT_GRID_XZ_TEST);
     let p_xz = nudge_out_of_solid(xz, r).xz;
 
     let escape = texel_at(p_xz);
@@ -291,10 +291,10 @@ fn probe_normal_baked(c: u32, probe: vec2<u32>, layer: u32) -> vec3<f32> {
     // Same flat-grid guard as `probe_position_baked` (test point 4).
     const FLAT_GRID_XZ_TEST: bool = false;
     let xz = (vec2<f32>(probe) + 0.5) * s + uniforms.hmap_min;
-    // Same nudge as `probe_position_baked` (see there), by the interval's start
+    // Same nudge as `probe_position_baked` (see there), by the interval's end
     // radius. When it moved the probe, the direction it moved is the normal -
     // out of the wall, toward what the probe can see.
-    let r = select(info.interval.x, 0.0, FLAT_GRID_XZ_TEST);
+    let r = select(info.interval.y, 0.0, FLAT_GRID_XZ_TEST);
     let nudge = nudge_out_of_solid(xz, r);
     if any(nudge.dir != vec2<f32>(0.0)) {
         // Nudged: the direction of the sideways move, in world XZ.
@@ -363,10 +363,10 @@ struct Nudge {
 // than one place (a corner, a wall several texels thick), so the passes relax
 // them; three is enough that a fourth moved nothing on the room.
 //
-// `r` is the cascade interval's *start* (0/2/4/8 m): the near end of what the
-// probe's rays reach, so the probe only moves when geometry comes inside the
-// region it actually samples. `r <= 0` (cascade 0's interval starts at 0) means
-// no sphere, no move.
+// `r` is the cascade interval's end (2/4/8/16 m): the far end of what the
+// probe's rays reach, ensuring probes relax clear of solid geometry within
+// their sampling domain. Buried columns hop to the nearest open column first
+// regardless of `r`.
 //
 // This replaces the old nudge, which relocated a probe only when its *own*
 // column was solid (`escape_texel_xz` returns the origin for an open column),
@@ -376,9 +376,6 @@ fn nudge_out_of_solid(center: vec2<f32>, r: f32) -> Nudge {
     var out: Nudge;
     out.xz = center;
     out.dir = vec2<f32>(0.0);
-    if (r <= 0.0) {
-        return out;
-    }
     let cell = cell_size();
     let dims = vec2<i32>(uniforms.hmap_res);
     // A centre inside a solid column has no direction to push in, so hop to the
@@ -391,6 +388,9 @@ fn nudge_out_of_solid(center: vec2<f32>, r: f32) -> Nudge {
             out.dir = normalize(d);
         }
         out.xz = e_xz;
+    }
+    if (r <= 0.0) {
+        return out;
     }
     for (var iteration = 0u; iteration < 3u; iteration = iteration + 1u) {
         let lo = clamp(
