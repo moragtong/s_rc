@@ -119,6 +119,8 @@ fn init_shade_pipeline(
                     // Dual heightmap direct shadow visibility: radiance_min & radiance_max
                     texture_2d(TextureSampleType::Float { filterable: false }),
                     texture_2d(TextureSampleType::Float { filterable: false }),
+                    // Cascade 0 rays for Chebyshev probe visibility
+                    storage_buffer_read_only::<Vec4>(false),
                 ),
             ),
         ),
@@ -207,6 +209,7 @@ fn draw_shade(
             ao_view,
             rad_min_view,
             rad_max_view,
+            render_data.rays_buffer.as_entire_binding(),
         )),
     );
 

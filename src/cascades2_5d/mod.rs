@@ -381,6 +381,7 @@ fn setup_pipelines(
                 uniform_buffer::<LightUniforms>(false),  // light_info
                 storage_buffer_read_only::<Vec4>(false), // bounce_history_in
                 storage_buffer::<Vec4>(false),           // bounce_history_out
+                storage_buffer_read_only::<Vec4>(false), // rays
             ),
         ),
     );
@@ -904,6 +905,7 @@ fn prepare_buffers(
                             light_uniform_buffers[b].as_entire_binding(),
                             bounce_history_buffers[bh].as_entire_binding(),
                             bounce_history_buffers[1 - bh].as_entire_binding(),
+                            rays_buffer.as_entire_binding(),
                         )),
                     )
                 })
