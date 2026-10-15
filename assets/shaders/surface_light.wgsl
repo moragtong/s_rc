@@ -5,7 +5,7 @@
 
 #import s_rc::heightmap_trace::{
     heightmap, uniforms, trace, cell_size, MISS, PI, SH_STRIDE, PROBES_PER_CELL,
-    probe_visibility_mask, probe_is_visible, sh_basis, cell_direction,
+    probe_visibility_mask, probe_is_visible, sh_basis,
 }
 
 @group(1) @binding(0) var normal_min: texture_2d<f32>;
@@ -25,7 +25,6 @@ struct LightUniforms {
 @group(1) @binding(7) var<uniform> light_info: LightUniforms;
 @group(1) @binding(8) var<storage, read> bounce_history_in: array<vec4<f32>>;
 @group(1) @binding(9) var<storage, read_write> bounce_history_out: array<vec4<f32>>;
-@group(1) @binding(10) var<storage, read> rays: array<vec4<f32>>;
 
 // Shadow rays start this far off the surface, m.
 // Matches SHADOW_RAY_BIAS in heightmap_trace.wgsl.
@@ -63,65 +62,13 @@ fn sh_irradiance(base: u32, n: vec3<f32>) -> vec3<f32> {
     return max(e, vec3<f32>(0.0));
 }
 
-fn chebyshev_probe_visibility(p: vec3<f32>, c: vec3<f32>, probe_id: u32) -> f32 {
-    let to_pixel = p - c;
-    let dist_pixel = length(to_pixel);
-    if dist_pixel < 1e-4 {
-        return 1.0;
-    }
-    let dir = to_pixel / dist_pixel;
-
-    let info = uniforms.cascades[0];
-    let side = info.octa_side;
-    let rays_per_probe = side * side;
-    let ray_base = info.ray_base + probe_id * rays_per_probe;
-
-    var sum_w = 0.0;
-    var sum_d = 0.0;
-    var sum_d2 = 0.0;
-
-    for (var r = 0u; r < rays_per_probe; r++) {
-        let ray_dir = cell_direction(r, side);
-        let cos_theta = dot(dir, ray_dir);
-        if cos_theta > 0.0 {
-            let w = cos_theta * cos_theta;
-            let ray = rays[ray_base + r];
-            let hit_d = select(100.0, ray.a, ray.a >= 0.0);
-            sum_w += w;
-            sum_d += w * hit_d;
-            sum_d2 += w * hit_d * hit_d;
-        }
-    }
-
-    if sum_w < 1e-5 {
-        return 1.0;
-    }
-
-    let mean = sum_d / sum_w;
-    let mean_sq = sum_d2 / sum_w;
-    let variance = max(mean_sq - mean * mean, 0.001);
-
-    // 2cm depth bias to prevent surface acne
-    let test_dist = max(0.0, dist_pixel - 0.02);
-    if test_dist <= mean {
-        return 1.0;
-    }
-
-    let diff = test_dist - mean;
-    let p_unoccluded = variance / (variance + diff * diff);
-
-    // Standard DDGI bleed reduction
-    let bleed_bias = 0.2;
-    let vis = clamp((p_unoccluded - bleed_bias) / (1.0 - bleed_bias), 0.0, 1.0);
-    return vis * vis;
-}
-
 fn evaluate_probe_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let info = uniforms.cascades[0];
     let fetch = p + n * 0.2;
     let gu = (fetch.xz - uniforms.hmap_min) / info.spacing - 0.5;
     let cell = vec2<i32>(floor(gu));
     let frac = gu - vec2<f32>(cell);
+    let vis_mask = probe_visibility_mask(p, n);
 
     var e_blend = vec3<f32>(0.0);
     var w_sum = 0.0;
@@ -168,12 +115,9 @@ fn evaluate_probe_irradiance(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
             if layer == farthest {
                 continue;
             }
-            let probe_id = base_cell + layer;
-            let base = probe_id * SH_STRIDE;
-            let center = sh_probes[base + 4u].xyz;
-            let vis = chebyshev_probe_visibility(p, center, probe_id);
-            if vis > 0.0 {
-                let w = w_corner * (layer_w[layer] / layer_sum) * vis;
+            let base = (base_cell + layer) * SH_STRIDE;
+            if probe_is_visible(vis_mask, k, layer) {
+                let w = w_corner * (layer_w[layer] / layer_sum);
                 e_blend += w * sh_irradiance(base, n);
                 w_sum += w;
             }

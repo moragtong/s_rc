@@ -259,7 +259,7 @@ fn setup_ui(mut commands: Commands) {
                     ActionButton(Action::ToggleVisMask),
                 ))
                 .with_child((
-                    Text::new("Chebyshev Visibility (T)"),
+                    Text::new("Probe Visibility Mask (T)"),
                     TextColor(Color::WHITE),
                 ));
             parent
@@ -982,7 +982,7 @@ fn button_system(
         bevy::log::info!(
             "Probe visibility method: {}",
             if lighting_state.use_vis_mask {
-                "Chebyshev visibility (probe ray moments)"
+                "baked mask (probe_is_visible)"
             } else {
                 "dynamic ray march (probe_visible)"
             }
