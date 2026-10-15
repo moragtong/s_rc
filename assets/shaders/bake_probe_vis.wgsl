@@ -1,6 +1,6 @@
 #import s_rc::heightmap_trace::{
     uniforms, heightmap, ceiling_normal, floor_normal, winding,
-    is_solid, texel_at, probe_position, probe_visible, PROBES_PER_CELL
+    is_solid, probe_position, probe_visible, PROBES_PER_CELL
 }
 
 @group(1) @binding(0) var probe_vis_out: texture_storage_2d<r32uint, write>;
@@ -12,31 +12,29 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let half_spacing = uniforms.cascades[0].spacing * 0.5;
-    let uv = (vec2<f32>(t) + 0.5) / vec2<f32>(uniforms.hmap_res);
-    let xz = uniforms.hmap_min + uv * (uniforms.hmap_max - uniforms.hmap_min) + vec2<f32>(half_spacing, half_spacing);
-
-    let sample_t = texel_at(xz);
-    let solid = is_solid(sample_t);
+    let solid = is_solid(vec2<i32>(t));
     if solid {
         textureStore(probe_vis_out, vec2<u32>(t), vec4<u32>(0u));
         return;
     }
 
-    let h = textureLoad(heightmap, vec2<u32>(sample_t), 0).xy;
+    let h = textureLoad(heightmap, vec2<u32>(t), 0).xy;
     let has_floor = h.y > uniforms.split - 9.0;
     let has_ceil = h.x < 5000.0;
+
+    let uv = (vec2<f32>(t) + 0.5) / vec2<f32>(uniforms.hmap_res);
+    let xz = uniforms.hmap_min + uv * (uniforms.hmap_max - uniforms.hmap_min);
 
     let y_floor = select(uniforms.split - 0.5, h.y, has_floor);
     let y_ceil = select(uniforms.split + 0.5, h.x, has_ceil);
 
-    var n_floor = textureLoad(floor_normal, vec2<u32>(sample_t), 0).xyz;
+    var n_floor = textureLoad(floor_normal, vec2<u32>(t), 0).xyz;
     if dot(n_floor, n_floor) < 0.1 {
         n_floor = vec3<f32>(0.0, 1.0, 0.0);
     }
     let p_floor = vec3<f32>(xz.x, y_floor, xz.y);
 
-    var n_ceil = textureLoad(ceiling_normal, vec2<u32>(sample_t), 0).xyz;
+    var n_ceil = textureLoad(ceiling_normal, vec2<u32>(t), 0).xyz;
     if dot(n_ceil, n_ceil) < 0.1 {
         n_ceil = vec3<f32>(0.0, -1.0, 0.0);
     }
